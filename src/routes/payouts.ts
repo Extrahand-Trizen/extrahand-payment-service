@@ -1,0 +1,39 @@
+/**
+ * Payout Routes
+ * 
+ * API routes for payout operations
+ */
+
+import express from 'express';
+import { serviceAuthMiddleware } from '../middleware/serviceAuth';
+import { PayoutController } from '../controllers/PayoutController';
+import { asyncHandler } from '../middleware/errorHandler';
+
+const router = express.Router();
+
+// All payout routes require service authentication
+router.use(serviceAuthMiddleware);
+
+/**
+ * POST /api/v1/payouts/process
+ * Process a payout to performer
+ */
+router.post('/process', asyncHandler(PayoutController.processPayout));
+
+/**
+ * GET /api/v1/payouts/status/:payoutId
+ * Get payout status
+ */
+router.get('/status/:payoutId', asyncHandler(PayoutController.getPayoutStatus));
+
+/**
+ * GET /api/v1/payouts/escrow/:escrowId
+ * Get all payouts for an escrow
+ */
+router.get('/escrow/:escrowId', asyncHandler(PayoutController.getPayoutsByEscrowId));
+
+export default router;
+
+
+
+

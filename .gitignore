@@ -1,0 +1,11 @@
+node_modules/
+dist/
+logs/
+.env
+*.log
+.DS_Store
+*.md
+package-lock.json
+
+
+/src/generated/prisma

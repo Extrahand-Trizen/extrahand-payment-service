@@ -19,6 +19,8 @@ model Escrow {
   escrowId             String    @unique
   razorpayOrderId      String    @unique
   taskId               String
+  // NEW: category used for fee/tax resolution
+  taskCategory         String?   // e.g. "cleaning", "legal"; nullable for old escrows
   applicationId        String?
   posterUid            String
   performerUid         String
@@ -39,6 +41,11 @@ model Escrow {
   razorpayOrderData   Json? // Sanitized Razorpay order response
   razorpayPaymentData Json? // Sanitized Razorpay payment response
   metadata            Json? // Additional flexible metadata
+
+  // NEW: Snapshot of applied fees at creation time to preserve historical pricing
+  appliedGstPercent         Decimal? @db.Decimal(5, 4)
+  appliedPlatformFeePercent Decimal? @db.Decimal(5, 4)
+  appliedRazorpayGstPercent Decimal? @db.Decimal(5, 4)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -324,6 +331,43 @@ model SystemConfig {
 
   @@index([configKey])
   @@index([category])
+}
+
+// CategoryFeeConfig - Per-category fee overrides and optional guards
+model CategoryFeeConfig {
+  id                         String   @id @default(uuid())
+  categoryKey                String   @unique
+  displayName                String?
+
+  // Core knobs
+  gstPercentage              Decimal  @db.Decimal(5, 4)
+  platformFeePercentage      Decimal? @db.Decimal(5, 4)
+  razorpayFeeGstPercentage   Decimal? @db.Decimal(5, 4)
+
+  // Optional price guards
+  minPrice                   Decimal? @db.Decimal(12, 2)
+  maxPrice                   Decimal? @db.Decimal(12, 2)
+
+  // Optional scheduling / audit
+  effectiveFrom              DateTime?
+  effectiveTo                DateTime?
+  updatedBy                  String?
+  createdAt                  DateTime @default(now())
+  updatedAt                  DateTime @updatedAt
+
+  @@index([categoryKey])
+  @@index([effectiveFrom, effectiveTo])
+}
+
+// AdminUser - Minimal admin auth for internal portal
+model AdminUser {
+  id           String   @id @default(uuid())
+  username     String   @unique
+  passwordHash String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([username])
 }
 
 // ============================================================================

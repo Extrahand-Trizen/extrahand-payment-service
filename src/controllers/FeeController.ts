@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { getFeeStructure } from '../services/feeConfigService';
+import { getFeeStructure, listCategoryFeeConfigs, upsertCategoryFeeConfig, getFeeStructureForCategory } from '../services/feeConfigService';
 import { calculatePosterFees } from '../services/feeCalculationService';
 import { asyncHandler } from '../middleware/errorHandler';
 import logger from '../config/logger';
@@ -97,6 +97,38 @@ export class FeeController {
         success: false,
         error: error.message || 'Failed to calculate fees',
       });
+    }
+  });
+
+  /**
+   * GET /api/v1/fees/categories
+   * Returns all category fee configs (admin)
+   */
+  static listCategories = asyncHandler(async (req: Request, res: Response) => {
+    try {
+      const rows = await listCategoryFeeConfigs();
+      return res.status(200).json({ success: true, categories: rows });
+    } catch (error: any) {
+      logger.error('Error listing category fee configs:', error);
+      return res.status(500).json({ success: false, error: error.message || 'Failed to list categories' });
+    }
+  });
+
+  /**
+   * PUT /api/v1/fees/categories/:categoryKey
+   * Upsert a category fee config (admin)
+   */
+  static upsertCategory = asyncHandler(async (req: Request, res: Response) => {
+    try {
+      const { categoryKey } = req.params;
+      const payload = { ...req.body, categoryKey };
+
+      const updated = await upsertCategoryFeeConfig(payload, (req as any).user?.uid || 'system');
+
+      return res.status(200).json({ success: true, category: updated });
+    } catch (error: any) {
+      logger.error('Error upserting category fee config:', error);
+      return res.status(500).json({ success: false, error: error.message || 'Failed to upsert category' });
     }
   });
 }

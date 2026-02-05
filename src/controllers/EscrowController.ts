@@ -23,6 +23,7 @@ export class EscrowController {
       currency,
       autoReleaseAfterDays,
       metadata,
+      taskCategory,
     } = req.body;
 
     // Validation
@@ -42,6 +43,7 @@ export class EscrowController {
       amount,
       currency,
       autoReleaseAfterDays,
+      taskCategory,
       metadata,
     });
 

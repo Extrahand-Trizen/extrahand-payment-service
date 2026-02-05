@@ -7,6 +7,7 @@
     "build": "tsc",
     "start": "node dist/server.js",
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
+    "seed:categories": "ts-node src/scripts/seedCategoryFees.ts",
     "prod": "NODE_ENV=production node dist/server.js",
     "test": "echo \"No tests specified\" && exit 0",
     "lint": "eslint src --ext .ts",
@@ -30,9 +31,10 @@
     "morgan": "^1.10.0",
     "node-cron": "^4.2.1",
     "pg": "^8.16.3",
-    "prisma": "^7.1.0",
+    "prisma": "^7.3.0",
     "razorpay": "^2.9.2",
     "winston": "^3.11.0",
+    "xlsx": "^0.18.5",
     "zod": "^3.23.8"
   },
   "devDependencies": {

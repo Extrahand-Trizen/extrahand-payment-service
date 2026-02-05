@@ -17,5 +17,9 @@ router.get('/structure', FeeController.getFeeStructure);
  */
 router.get('/calculate', FeeController.calculateFees);
 
+/** Admin: list and upsert per-category fee configs */
+router.get('/categories', FeeController.listCategories);
+router.put('/categories/:categoryKey', FeeController.upsertCategory);
+
 export default router;
 

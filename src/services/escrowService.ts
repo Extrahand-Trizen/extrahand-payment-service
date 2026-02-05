@@ -5,6 +5,7 @@ import { isPostgresConnected } from '../config/database';
 import { createOrder } from './paymentService';
 import { sanitizeRazorpayOrderData, sanitizeRazorpayData, sanitizeRazorpayPaymentData } from '../utils/paymentSanitizer';
 import { prisma } from '../config/prisma';
+import { getFeeStructureForCategory } from './feeConfigService';
 import { createLedgerEntry, getEscrowBalance } from './ledgerService';
 import { Prisma } from '@prisma/client';
 import { EmailServiceClient } from '../clients/EmailServiceClient';
@@ -129,6 +130,7 @@ export async function createEscrow(params: {
   amount: number; // Amount in rupees
   currency?: string;
   autoReleaseAfterDays?: number;
+  taskCategory?: string;
   metadata?: Record<string, any>;
 }): Promise<{ success: boolean; escrow?: any; order?: any; error?: string }> {
   try {
@@ -140,6 +142,7 @@ export async function createEscrow(params: {
       amount,
       currency = 'INR',
       autoReleaseAfterDays,
+      taskCategory,
       metadata = {},
     } = params;
 
@@ -194,6 +197,21 @@ export async function createEscrow(params: {
     const amountInRupeesDecimal = new Prisma.Decimal(amount.toFixed(2));
 
     try {
+      // Resolve fee structure for this category and snapshot applied percentages
+      const feeForCategory = await getFeeStructureForCategory(taskCategory);
+
+      const appliedGstPercent = feeForCategory.platformFee.gstPercentage !== undefined
+        ? new Prisma.Decimal(feeForCategory.platformFee.gstPercentage.toString())
+        : undefined;
+
+      const appliedPlatformFeePercent = feeForCategory.platformFee.percentage !== undefined
+        ? new Prisma.Decimal(feeForCategory.platformFee.percentage.toString())
+        : undefined;
+
+      const appliedRazorpayGstPercent = feeForCategory.processingFees.razorpayFeeGstPercentage !== undefined
+        ? new Prisma.Decimal(feeForCategory.processingFees.razorpayFeeGstPercentage.toString())
+        : undefined;
+
       // Create escrow in Postgres (all data - financial + metadata)
       const postgresEscrow = await prisma.escrow.create({
         data: {
@@ -210,6 +228,10 @@ export async function createEscrow(params: {
           autoReleaseDate: autoReleaseDate,
           razorpayOrderData: sanitizedOrderData as any, // Store sanitized data in JSONB
           metadata: metadata as any, // Store metadata in JSONB
+          taskCategory: taskCategory ?? null,
+          appliedGstPercent: appliedGstPercent ?? null,
+          appliedPlatformFeePercent: appliedPlatformFeePercent ?? null,
+          appliedRazorpayGstPercent: appliedRazorpayGstPercent ?? null,
         },
       });
 

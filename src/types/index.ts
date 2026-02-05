@@ -48,6 +48,7 @@ export interface CreateEscrowRequest {
   amount: number;
   currency?: string;
   autoReleaseAfterDays?: number;
+  taskCategory?: string;
   metadata?: Record<string, any>;
 }
 

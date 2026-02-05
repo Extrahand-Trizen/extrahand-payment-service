@@ -7,6 +7,7 @@ import payoutRoutes from './payouts';
 import earningsRoutes from './earnings';
 import transactionRoutes from './transactions';
 import feesRoutes from './fees';
+import adminRoutes from './admin';
 import { validateEnv } from '../config/env';
 import { isDatabaseConnected, isPostgresConnected } from '../config/database';
 
@@ -50,6 +51,9 @@ router.use('/transactions', transactionRoutes);
 
 // Fee structure routes (public - returns percentages only)
 router.use('/fees', feesRoutes);
+
+// Admin auth routes
+router.use('/admin', adminRoutes);
 
 export default router;
 

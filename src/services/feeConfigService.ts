@@ -201,4 +201,103 @@ export async function initializeDefaultFeeStructure(): Promise<void> {
   }
 }
 
+/**
+ * Get fee structure merged with per-category overrides.
+ * Falls back to base getFeeStructure() when no category config is found.
+ */
+export async function getFeeStructureForCategory(categoryKey?: string): Promise<FeeStructure> {
+  const base = await getFeeStructure();
+
+  const key = categoryKey || 'default';
+
+  try {
+    const now = new Date();
+
+    const cfg = await prisma.categoryFeeConfig.findFirst({
+      where: {
+        categoryKey: key,
+        OR: [
+          { effectiveFrom: null, effectiveTo: null },
+          { effectiveFrom: { lte: now }, effectiveTo: null },
+          { effectiveFrom: { lte: now }, effectiveTo: { gte: now } },
+        ],
+      },
+      orderBy: { effectiveFrom: 'desc' },
+    }) as any;
+
+    // If not found, try to load the default row
+    const effectiveCfg = cfg ?? (await prisma.categoryFeeConfig.findUnique({ where: { categoryKey: 'default' } }) as any);
+
+    if (!effectiveCfg) return base;
+
+    // Convert Decimal fields (if present) to numbers
+    const cfgGst = effectiveCfg.gstPercentage !== null && effectiveCfg.gstPercentage !== undefined
+      ? Number(effectiveCfg.gstPercentage)
+      : undefined;
+
+    const cfgPlatform = effectiveCfg.platformFeePercentage !== null && effectiveCfg.platformFeePercentage !== undefined
+      ? Number(effectiveCfg.platformFeePercentage)
+      : undefined;
+
+    const cfgRazorpayGst = effectiveCfg.razorpayFeeGstPercentage !== null && effectiveCfg.razorpayFeeGstPercentage !== undefined
+      ? Number(effectiveCfg.razorpayFeeGstPercentage)
+      : undefined;
+
+    return {
+      ...base,
+      platformFee: {
+        ...base.platformFee,
+        percentage: cfgPlatform ?? base.platformFee.percentage,
+        gstPercentage: cfgGst ?? base.platformFee.gstPercentage,
+      },
+      processingFees: {
+        ...base.processingFees,
+        razorpayFeeGstPercentage: cfgRazorpayGst ?? base.processingFees.razorpayFeeGstPercentage,
+      },
+    };
+  } catch (error: any) {
+    logger.warn(`⚠️ Error loading CategoryFeeConfig for '${categoryKey}': ${error.message}`);
+    return base;
+  }
+}
+
+/**
+ * List all category fee configs (for admin UI)
+ */
+export async function listCategoryFeeConfigs(): Promise<any[]> {
+  return await prisma.categoryFeeConfig.findMany({ orderBy: { categoryKey: 'asc' } }) as any[];
+}
+
+/**
+ * Upsert category fee config row
+ */
+export async function upsertCategoryFeeConfig(payload: any, updatedBy?: string): Promise<any> {
+  const { categoryKey } = payload;
+  if (!categoryKey) throw new Error('categoryKey is required');
+
+  const data = {
+    categoryKey,
+    displayName: payload.displayName ?? null,
+    gstPercentage: payload.gstPercentage ?? undefined,
+    platformFeePercentage: payload.platformFeePercentage ?? undefined,
+    razorpayFeeGstPercentage: payload.razorpayFeeGstPercentage ?? undefined,
+    minPrice: payload.minPrice ?? undefined,
+    maxPrice: payload.maxPrice ?? undefined,
+    effectiveFrom: payload.effectiveFrom ? new Date(payload.effectiveFrom) : undefined,
+    effectiveTo: payload.effectiveTo ? new Date(payload.effectiveTo) : undefined,
+    updatedBy: updatedBy ?? payload.updatedBy ?? null,
+  } as any;
+
+  const result = await prisma.categoryFeeConfig.upsert({
+    where: { categoryKey },
+    create: { ...data },
+    update: { ...data },
+  });
+
+  // Clear fee structure cache so changes take effect immediately
+  clearFeeStructureCache();
+
+  return result;
+}
+
 

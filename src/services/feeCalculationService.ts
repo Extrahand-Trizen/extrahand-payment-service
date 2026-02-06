@@ -8,7 +8,7 @@
 
 import logger from '../config/logger';
 import { Prisma } from '@prisma/client';
-import { getFeeStructure } from './feeConfigService';
+import { getFeeStructure, getFeeStructureForCategory } from './feeConfigService';
 
 /**
  * Fee calculation result interface (for performer - legacy support)
@@ -141,12 +141,19 @@ function getFeePercentages() {
 
 /**
  * Calculate poster fees (what poster pays upfront)
- * 
+ * Uses category-specific fee structure when taskCategory is provided (CategoryFeeConfig).
+ *
  * @param taskAmount - Task amount in rupees
+ * @param taskCategory - Optional task category key for category-specific GST/fees (e.g. from CategoryFeeConfig)
  * @returns Poster fee breakdown
  */
-export async function calculatePosterFees(taskAmount: number | Prisma.Decimal): Promise<PosterFeeBreakdown> {
-  const feeStructure = await getFeeStructure();
+export async function calculatePosterFees(
+  taskAmount: number | Prisma.Decimal,
+  taskCategory?: string
+): Promise<PosterFeeBreakdown> {
+  const feeStructure = taskCategory
+    ? await getFeeStructureForCategory(taskCategory)
+    : await getFeeStructure();
   const taskAmountDecimal = new Prisma.Decimal(taskAmount.toString());
 
   // Calculate platform fee (10-15% of task amount)

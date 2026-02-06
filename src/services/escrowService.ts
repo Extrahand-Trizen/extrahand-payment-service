@@ -9,6 +9,7 @@ import { getFeeStructureForCategory } from './feeConfigService';
 import { createLedgerEntry, getEscrowBalance } from './ledgerService';
 import { Prisma } from '@prisma/client';
 import { EmailServiceClient } from '../clients/EmailServiceClient';
+import { logEscrowCreated, logPaymentCaptured, logPaymentFailed } from './auditLogService';
 
 /**
  * Generate unique escrow ID
@@ -257,6 +258,15 @@ export async function createEscrow(params: {
         amount,
       });
 
+      await logEscrowCreated({
+        escrowId: postgresEscrow.id,
+        razorpayOrderId: razorpayOrder.id,
+        taskId,
+        posterUid,
+        amountInRupees: amountInRupeesDecimal.toString(),
+        actorId: posterUid,
+      });
+
       // Convert to frontend format for backward compatibility
       const escrowForFrontend = await convertPostgresEscrowToFrontendFormat(postgresEscrow);
 
@@ -320,7 +330,8 @@ export async function updateEscrowOnPaymentCapture(
       // Auto-release should only happen after task completion approval, not when payment is captured
     } else if (paymentStatus === 'failed') {
       updateData.status = 'cancelled';
-      updateData.errorMessage = 'Payment failed';
+      updateData.errorMessage = (razorpayPaymentData as any)?.error_description || 'Payment failed';
+      updateData.errorCode = (razorpayPaymentData as any)?.error_code || null;
     }
 
     const updatedEscrow = await prisma.escrow.update({
@@ -374,6 +385,23 @@ export async function updateEscrowOnPaymentCapture(
       razorpayOrderId,
       paymentStatus,
     });
+
+    if (paymentStatus === 'captured') {
+      logPaymentCaptured({
+        escrowId: postgresEscrow.id,
+        razorpayOrderId,
+        razorpayPaymentId,
+        actorId: postgresEscrow.posterUid,
+      }).catch(() => {});
+    } else if (paymentStatus === 'failed') {
+      logPaymentFailed({
+        escrowId: postgresEscrow.id,
+        razorpayOrderId,
+        razorpayPaymentId,
+        errorCode: (razorpayPaymentData as any)?.error_code,
+        errorDescription: (razorpayPaymentData as any)?.error_description,
+      }).catch(() => {});
+    }
 
     // Convert to frontend format
     const escrowForFrontend = await convertPostgresEscrowToFrontendFormat(updatedEscrow);

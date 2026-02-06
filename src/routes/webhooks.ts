@@ -10,6 +10,7 @@ import logger from '../config/logger';
 import { RAZORPAY_CONFIG } from '../config/razorpay';
 import { updateEscrowOnPaymentCapture } from '../services/escrowService';
 import { handlePaymentFailure } from '../services/paymentFailureService';
+import { logWebhookReceived, markWebhookProcessed } from '../services/auditLogService';
 
 const router = express.Router();
 
@@ -44,6 +45,7 @@ function verifyWebhookSignature(
  * Note: Webhooks need raw body for signature verification
  */
 router.post('/razorpay', express.raw({ type: 'application/json' }), async (req, res) => {
+  let auditLogId: string | null = null;
   try {
     const signature = req.headers['x-razorpay-signature'] as string;
 
@@ -74,6 +76,15 @@ router.post('/razorpay', express.raw({ type: 'application/json' }), async (req, 
 
     // Parse JSON body
     const event = JSON.parse(rawBody);
+
+    // Persist webhook receipt for audit and idempotency (eventId when present)
+    const eventId = event.id ?? null;
+    auditLogId = await logWebhookReceived({
+      eventId,
+      eventType: event.event,
+      source: 'razorpay',
+      payload: event,
+    });
 
     logger.info('📥 Razorpay webhook received', {
       event: event.event,
@@ -109,10 +120,19 @@ router.post('/razorpay', express.raw({ type: 'application/json' }), async (req, 
         logger.info(`ℹ️ Unhandled webhook event: ${event.event}`);
     }
 
+    // Mark webhook as processed
+    if (auditLogId) {
+      await markWebhookProcessed(auditLogId, true);
+    }
+
     // Always return 200 to acknowledge receipt
     res.status(200).json({ received: true });
   } catch (error: any) {
     logger.error('❌ Error processing webhook:', error);
+    // Mark webhook as failed in audit log (auditLogId in closure)
+    if (auditLogId) {
+      await markWebhookProcessed(auditLogId, false, error?.message ?? 'Unknown error');
+    }
     // Still return 200 to prevent Razorpay from retrying
     res.status(200).json({ received: true, error: error.message });
   }
@@ -136,11 +156,12 @@ async function handlePaymentAuthorized(payload: any): Promise<void> {
       paymentId: payment.id,
     });
 
-    // Update escrow status to 'authorized'
+    // Update escrow with payment entity (sanitized) for audit
     await updateEscrowOnPaymentCapture(
       order.id,
       payment.id,
-      'authorized'
+      'authorized',
+      payment
     );
   } catch (error: any) {
     logger.error('❌ Error handling payment.authorized:', error);
@@ -166,11 +187,12 @@ async function handlePaymentCaptured(payload: any): Promise<void> {
       amount: payment.amount,
     });
 
-    // Update escrow status to 'captured' (held)
+    // Update escrow with payment entity so razorpayPaymentData is stored (sanitized)
     await updateEscrowOnPaymentCapture(
       order.id,
       payment.id,
-      'captured'
+      'captured',
+      payment
     );
   } catch (error: any) {
     logger.error('❌ Error handling payment.captured:', error);
@@ -200,12 +222,13 @@ async function handlePaymentFailed(payload: any): Promise<void> {
       errorCode,
     });
 
-    // Handle payment failure
+    // Handle payment failure (pass payment entity so razorpayPaymentData is stored)
     await handlePaymentFailure({
       razorpayOrderId: order.id,
       razorpayPaymentId: payment.id,
       failureReason: errorDescription,
       errorCode,
+      razorpayPaymentData: payment,
     });
   } catch (error: any) {
     logger.error('❌ Error handling payment.failed:', error);

@@ -54,13 +54,13 @@ export class FeeController {
   });
 
   /**
-   * GET /api/v1/fees/calculate?amount=:amount
-   * Calculate actual fee breakdown for a given task amount
-   * Returns calculated amounts for all fees
+   * GET /api/v1/fees/calculate?amount=:amount&taskCategory=:taskCategory
+   * Calculate actual fee breakdown for a given task amount.
+   * When taskCategory is provided, uses CategoryFeeConfig for category-specific GST and platform fee.
    */
   static calculateFees = asyncHandler(async (req: Request, res: Response) => {
     try {
-      const { amount } = req.query;
+      const { amount, taskCategory } = req.query;
 
       if (!amount || isNaN(Number(amount))) {
         return res.status(400).json({
@@ -70,9 +70,10 @@ export class FeeController {
       }
 
       const taskAmount = Number(amount);
-      
-      // Calculate fees for the poster (what they will pay)
-      const fees = await calculatePosterFees(taskAmount);
+      const categoryKey = typeof taskCategory === 'string' && taskCategory.trim() ? taskCategory.trim() : undefined;
+
+      // Calculate fees for the poster (category-aware when taskCategory provided)
+      const fees = await calculatePosterFees(taskAmount, categoryKey);
 
       return res.status(200).json({
         success: true,

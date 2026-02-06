@@ -41,6 +41,28 @@ export const verifyPaymentSignature = (orderId: string, paymentId: string, signa
   }
 };
     
+/**
+ * Fetch payment by ID from Razorpay (GET /v1/payments/:id).
+ * Used after verify-payment to store razorpayPaymentData on escrow.
+ */
+export const getPaymentDetails = async (paymentId: string): Promise<{ success: true; payment: any } | { success: false; error: string }> => {
+  try {
+    const payment = await razorpay.payments.fetch(paymentId);
+    return { success: true, payment };
+  } catch (error: any) {
+    logger.error('Error fetching payment:', { paymentId, error: error.message });
+    const isNotFound =
+      error.statusCode === 404 ||
+      error.status === 404 ||
+      error.message?.toLowerCase().includes('not found') ||
+      error.message?.toLowerCase().includes('does not exist');
+    if (isNotFound) {
+      return { success: false, error: 'Payment not found' };
+    }
+    return { success: false, error: error.message || 'Failed to fetch payment' };
+  }
+};
+
 export const getOrderDetails = async (orderId: string) => {
   try {
     // Handle test/mock order IDs - return mock data instead of querying Razorpay

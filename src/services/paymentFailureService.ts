@@ -26,9 +26,10 @@ export async function handlePaymentFailure(params: {
   razorpayPaymentId?: string;
   failureReason: string;
   errorCode?: string;
+  razorpayPaymentData?: any; // Optional: full payment entity for storing in escrow
 }): Promise<{ success: boolean; error?: string }> {
   try {
-    const { razorpayOrderId, razorpayPaymentId, failureReason, errorCode } = params;
+    const { razorpayOrderId, razorpayPaymentId, failureReason, errorCode, razorpayPaymentData } = params;
 
     logger.warn('⚠️ Payment failure detected', {
       razorpayOrderId,
@@ -37,11 +38,12 @@ export async function handlePaymentFailure(params: {
       errorCode,
     });
 
-    // Update escrow status to 'failed'
+    // Update escrow status to 'failed' (pass payment entity so razorpayPaymentData is stored)
     const updateResult = await updateEscrowOnPaymentCapture(
       razorpayOrderId,
       razorpayPaymentId || 'unknown',
-      'failed'
+      'failed',
+      razorpayPaymentData
     );
 
     if (!updateResult.success) {

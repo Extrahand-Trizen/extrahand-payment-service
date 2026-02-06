@@ -3,6 +3,7 @@ import {
   createOrder,
   verifyPaymentSignature,
   getOrderDetails,
+  getPaymentDetails,
   createRefund,
 } from '../services/paymentService';
 import { updateEscrowOnPaymentCapture } from '../services/escrowService';
@@ -50,13 +51,18 @@ export class PaymentController {
       throw new BadRequestError(result.message || result.error || 'Payment verification failed');
     }
 
-    // Update escrow status if this payment is for an escrow
-    // Payment is verified and captured, so update escrow to 'held' status
+    // Update escrow with payment entity so razorpayPaymentData is stored (sanitized)
     try {
-      await updateEscrowOnPaymentCapture(razorpay_order_id, razorpay_payment_id, 'captured');
+      const paymentResult = await getPaymentDetails(razorpay_payment_id);
+      const paymentEntity = paymentResult.success ? paymentResult.payment : undefined;
+      await updateEscrowOnPaymentCapture(
+        razorpay_order_id,
+        razorpay_payment_id,
+        'captured',
+        paymentEntity
+      );
     } catch (escrowError: any) {
       // Log error but don't fail the payment verification
-      // Escrow update is not critical for payment verification
       logger.warn('Failed to update escrow on payment capture:', escrowError);
     }
 

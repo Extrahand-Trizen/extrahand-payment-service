@@ -4,11 +4,11 @@ FROM node:18-alpine AS dependencies
 
 WORKDIR /app
 
-# Copy package files
-COPY package.json package-lock.json ./
+# Copy package file (no package-lock.json - see .gitignore)
+COPY package.json ./
 
 # Install dependencies (including devDependencies for build)
-RUN npm ci --include=dev
+RUN npm install --include=dev
 
 # Stage 2: Build
 FROM node:18-alpine AS build
@@ -19,7 +19,7 @@ WORKDIR /app
 COPY --from=dependencies /app/node_modules ./node_modules
 
 # Copy source code and config files
-COPY package.json package-lock.json tsconfig.json ./
+COPY package.json tsconfig.json ./
 COPY prisma ./prisma
 COPY src ./src
 
@@ -35,8 +35,8 @@ FROM node:18-alpine AS production
 WORKDIR /app
 
 # Install production dependencies only
-COPY package.json package-lock.json ./
-RUN npm ci --only=production && npm cache clean --force
+COPY package.json ./
+RUN npm install --omit=dev && npm cache clean --force
 
 # Copy Prisma files and generate client
 COPY prisma ./prisma

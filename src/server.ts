@@ -8,29 +8,29 @@ import { connectDatabase, disconnectDatabase } from './config/database';
 const env = validateEnv();
 
 async function startServer() {
+  logger.info('Starting payment service...');
   try {
-    // Connect to MongoDB (graceful fallback if not available)
-    await connectDatabase();
-
-    // Create Express app
+    // Create Express app first
     const app = createApp();
+    logger.info('Express app created, binding to 0.0.0.0');
 
-    // Start server
+    // Start server immediately so proxy gets a response (avoids 502 while DB connects)
     const port = env.PORT;
-    app.listen(port, () => {
-      logger.info(`🚀 Payment Service running on port ${port}`);
+    app.listen(port, '0.0.0.0', () => {
+      logger.info(`🚀 Payment Service running on 0.0.0.0:${port}`);
       logger.info(`📝 Environment: ${env.NODE_ENV}`);
       logger.info(`🔗 Health check: http://localhost:${port}/api/v1/health`);
       logger.info(`💳 Razorpay Key ID: ${env.RAZORPAY_KEY_ID.substring(0, 10)}...`);
     });
 
-    // Auto-release scheduler disabled - payouts/release handled elsewhere
-    // startAutoReleaseScheduler();
+    // Connect to DBs after listening (graceful fallback if unavailable)
+    connectDatabase().catch((err) => {
+      logger.error('Database connection failed (service will run with limited features):', err);
+    });
 
     // Graceful shutdown
     const gracefulShutdown = async (signal: string) => {
       logger.info(`${signal} signal received: starting graceful shutdown`);
-      // stopAutoReleaseScheduler();
       await disconnectDatabase();
       process.exit(0);
     };
@@ -40,7 +40,6 @@ async function startServer() {
 
   } catch (error) {
     logger.error('Failed to start server:', error);
-    await disconnectDatabase();
     process.exit(1);
   }
 }

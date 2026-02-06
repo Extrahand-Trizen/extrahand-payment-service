@@ -19,8 +19,11 @@ async function startServer() {
     app.listen(port, '0.0.0.0', () => {
       logger.info(`🚀 Payment Service running on 0.0.0.0:${port}`);
       logger.info(`📝 Environment: ${env.NODE_ENV}`);
-      logger.info(`🔗 Health check: http://localhost:${port}/api/v1/health`);
+      logger.info(`🔗 Health: http://localhost:${port}/api/v1/health`);
       logger.info(`💳 Razorpay Key ID: ${env.RAZORPAY_KEY_ID.substring(0, 10)}...`);
+      if (env.NODE_ENV === 'production') {
+        logger.info(`⚠️ CapRover: set "Container HTTP Port" to ${port} to avoid 502`);
+      }
     });
 
     // Connect to DBs after listening (graceful fallback if unavailable)

@@ -44,11 +44,19 @@ const logger = winston.createLogger({
   ]
 });
 
+// Always log to console (stdout) so CapRover / Docker show logs; in dev use pretty format
 if (process.env.NODE_ENV !== 'production') {
   logger.add(new winston.transports.Console({
     format: winston.format.combine(
       winston.format.colorize(),
       winston.format.simple()
+    )
+  }));
+} else {
+  logger.add(new winston.transports.Console({
+    format: winston.format.combine(
+      winston.format.timestamp(),
+      winston.format.json()
     )
   }));
 }

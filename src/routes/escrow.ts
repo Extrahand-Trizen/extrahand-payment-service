@@ -27,16 +27,13 @@ router.get('/status/:escrowId', asyncHandler(EscrowController.getEscrowStatus));
 router.get('/task/:taskId', asyncHandler(EscrowController.getEscrowByTaskId));
 
 /**
+ * Escrow release and auto-release disabled - handled elsewhere
  * POST /api/v1/escrow/release/:escrowId
- * Release escrow funds to performer
- */
-router.post('/release/:escrowId', asyncHandler(EscrowController.releaseEscrow));
-
-/**
+ * router.post('/release/:escrowId', asyncHandler(EscrowController.releaseEscrow));
+ *
  * PUT /api/v1/escrow/auto-release
- * Update escrow auto-release date (for revisions)
+ * router.put('/auto-release', asyncHandler(EscrowController.updateAutoRelease));
  */
-router.put('/auto-release', asyncHandler(EscrowController.updateAutoRelease));
 
 export default router;
 

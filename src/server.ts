@@ -2,7 +2,8 @@ import { createApp } from './app';
 import { validateEnv } from './config/env';
 import logger from './config/logger';
 import { connectDatabase, disconnectDatabase } from './config/database';
-import { startAutoReleaseScheduler, stopAutoReleaseScheduler } from './services/autoReleaseScheduler';
+// Payouts/escrow release/auto-release disabled - handled elsewhere
+// import { startAutoReleaseScheduler, stopAutoReleaseScheduler } from './services/autoReleaseScheduler';
 
 const env = validateEnv();
 
@@ -23,13 +24,13 @@ async function startServer() {
       logger.info(`💳 Razorpay Key ID: ${env.RAZORPAY_KEY_ID.substring(0, 10)}...`);
     });
 
-    // Start auto-release scheduler
-    startAutoReleaseScheduler();
+    // Auto-release scheduler disabled - payouts/release handled elsewhere
+    // startAutoReleaseScheduler();
 
     // Graceful shutdown
     const gracefulShutdown = async (signal: string) => {
       logger.info(`${signal} signal received: starting graceful shutdown`);
-      stopAutoReleaseScheduler();
+      // stopAutoReleaseScheduler();
       await disconnectDatabase();
       process.exit(0);
     };

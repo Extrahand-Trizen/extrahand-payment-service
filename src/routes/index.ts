@@ -3,7 +3,8 @@ import paymentRoutes from './payment';
 import escrowRoutes from './escrow';
 import webhookRoutes from './webhooks';
 import refundRoutes from './refunds';
-import payoutRoutes from './payouts';
+// Payouts disabled - handled elsewhere
+// import payoutRoutes from './payouts';
 import earningsRoutes from './earnings';
 import transactionRoutes from './transactions';
 import feesRoutes from './fees';
@@ -40,8 +41,8 @@ router.use('/webhooks', webhookRoutes);
 // Refund routes
 router.use('/refunds', refundRoutes);
 
-// Payout routes
-router.use('/payouts', payoutRoutes);
+// Payout routes disabled - handled elsewhere
+// router.use('/payouts', payoutRoutes);
 
 // Earnings routes
 router.use('/earnings', earningsRoutes);

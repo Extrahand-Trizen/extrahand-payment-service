@@ -56,12 +56,13 @@ RUN addgroup -g 1001 -S nodejs && \
 
 USER nodejs
 
-# Expose port (default 4003, can be overridden via env)
-EXPOSE 4003
+# Expose port (match PORT env in CapRover, e.g. 4009)
+EXPOSE 4009
 
-# Health check (uses PORT env var if set, otherwise defaults to 4003)
-HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-  CMD node -e "const port = process.env.PORT || 4003; require('http').get(`http://localhost:${port}/api/v1/health`, (r) => {process.exit(r.statusCode === 200 ? 0 : 1)}).on('error', () => process.exit(1))"
+# Lenient health check to avoid restart loops: long start-period, more retries
+# Uses PORT env (e.g. 4009); 127.0.0.1 to avoid DNS in container
+HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=5 \
+  CMD node -e "const port = process.env.PORT || 4009; require('http').get(\"http://127.0.0.1:\" + port + \"/api/v1/health\", (r) => { process.exit(r.statusCode === 200 ? 0 : 1); }).on('error', () => process.exit(1));"
 
 # Start the application
 CMD ["node", "dist/server.js"]

@@ -51,7 +51,13 @@ export function createApp(): Application {
     message: 'Too many requests from this IP, please try again later.',
   });
   // app.use('/api/', limiter);
-
+  app.get('/', (req, res) => {
+    res.status(200).json({
+      service: 'extrahand-payment-service',
+      status: 'ok',
+      health: '/api/v1/health',
+    });
+  });
   // Routes
   app.use('/api/v1', routes);
 

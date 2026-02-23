@@ -10,7 +10,11 @@ import logger from '../config/logger';
 import { RAZORPAY_CONFIG } from '../config/razorpay';
 import { updateEscrowOnPaymentCapture } from '../services/escrowService';
 import { handlePaymentFailure } from '../services/paymentFailureService';
-import { logWebhookReceived, markWebhookProcessed } from '../services/auditLogService';
+import {
+  getWebhookByEventId,
+  logWebhookReceived,
+  markWebhookProcessed,
+} from '../services/auditLogService';
 
 const router = express.Router();
 
@@ -76,9 +80,21 @@ router.post('/razorpay', express.raw({ type: 'application/json' }), async (req, 
 
     // Parse JSON body
     const event = JSON.parse(rawBody);
-
-    // Persist webhook receipt for audit and idempotency (eventId when present)
     const eventId = event.id ?? null;
+
+    // Dedup: if we already processed this event (by Razorpay event ID), return 200 and skip business logic
+    if (eventId) {
+      const existing = await getWebhookByEventId(eventId);
+      if (existing) {
+        logger.info('📥 Razorpay webhook already processed (idempotent)', {
+          eventId,
+          event: event.event,
+        });
+        return res.status(200).json({ received: true, message: 'Already processed' });
+      }
+    }
+
+    // Persist webhook receipt for audit (then process)
     auditLogId = await logWebhookReceived({
       eventId,
       eventType: event.event,

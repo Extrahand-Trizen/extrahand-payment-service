@@ -10,6 +10,7 @@ import { updateEscrowOnPaymentCapture } from '../services/escrowService';
 import { cancelPayment, cancelEscrow, cancelEscrowByTaskId } from '../services/cancellationService';
 import { BadRequestError, NotFoundError } from '../errors/AppError';
 import logger from '../config/logger';
+import { prisma } from '../config/prisma';
 
 export class PaymentController {
   /**
@@ -17,15 +18,52 @@ export class PaymentController {
    */
   static async createOrder(req: Request, res: Response): Promise<void> {
     const { amount, currency, metadata } = req.body;
+    const rawIdempotencyKey =
+      (req.headers['idempotency-key'] as string | undefined) ||
+      (req.headers['Idempotency-Key'] as string | undefined) ||
+      (req.body && typeof req.body.idempotencyKey === 'string'
+        ? (req.body.idempotencyKey as string)
+        : undefined);
+    const idempotencyKey = rawIdempotencyKey?.trim() || undefined;
 
     if (!amount || amount <= 0) {
       throw new BadRequestError('Invalid amount');
+    }
+
+    // If idempotency key is provided, check for existing order
+    if (idempotencyKey) {
+      const existing = await prisma.paymentOrderIdempotency.findUnique({
+        where: { idempotencyKey },
+      });
+      if (existing) {
+        logger.info('ℹ️ Returning existing order for idempotency key', {
+          idempotencyKey,
+          razorpayOrderId: existing.razorpayOrderId,
+        });
+        return res.json({ order: existing.orderPayload });
+      }
     }
 
     const result = await createOrder(amount, currency || 'INR', metadata || {});
 
     if (!result.success) {
       throw new Error(result.error || 'Failed to create order');
+    }
+
+    // Persist idempotency mapping if key provided
+    if (idempotencyKey && result.order) {
+      try {
+        await prisma.paymentOrderIdempotency.create({
+          data: {
+            idempotencyKey,
+            razorpayOrderId: result.order.id,
+            orderPayload: result.order as any,
+          },
+        });
+      } catch (error: any) {
+        // Unique constraint violations or DB errors should not break the request
+        logger.warn('Failed to persist payment order idempotency (non-critical):', error?.message);
+      }
     }
 
     res.json({ order: result.order });

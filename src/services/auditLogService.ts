@@ -127,6 +127,26 @@ export async function logPaymentFailed(params: {
 }
 
 /**
+ * Check if webhook event was already processed (by Razorpay event ID).
+ * Use before processing to deduplicate duplicate webhook deliveries.
+ */
+export async function getWebhookByEventId(
+  eventId: string
+): Promise<{ id: string; processed: boolean } | null> {
+  try {
+    if (!isPostgresConnected()) return null;
+    const row = await prisma.auditLog.findUnique({
+      where: { eventId },
+      select: { id: true, processed: true },
+    });
+    return row ? { id: row.id, processed: row.processed } : null;
+  } catch (err: any) {
+    logger.warn('Failed to lookup webhook by eventId (non-critical):', err?.message);
+    return null;
+  }
+}
+
+/**
  * Persist webhook receipt (before processing). Returns audit log id for later update.
  */
 export async function logWebhookReceived(params: {

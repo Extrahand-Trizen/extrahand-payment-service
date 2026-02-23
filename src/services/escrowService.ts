@@ -308,6 +308,20 @@ export async function updateEscrowOnPaymentCapture(
       return { success: false, error: 'Escrow not found' };
     }
 
+    // Idempotency: if this escrow is already captured for this payment, skip update and ledger
+    if (
+      paymentStatus === 'captured' &&
+      postgresEscrow.paymentStatus === 'captured' &&
+      postgresEscrow.razorpayPaymentId === razorpayPaymentId
+    ) {
+      logger.info('ℹ️ Escrow payment already captured (idempotent)', {
+        escrowId: postgresEscrow.escrowId,
+        razorpayOrderId,
+        razorpayPaymentId,
+      });
+      return { success: true, escrow: postgresEscrow };
+    }
+
     // Sanitize payment data if provided
     const sanitizedPaymentData = razorpayPaymentData 
       ? sanitizeRazorpayPaymentData(razorpayPaymentData)

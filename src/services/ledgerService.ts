@@ -59,6 +59,7 @@ export async function createLedgerEntry(params: {
       data: {
         transactionId,
         escrowId: escrowId || null,
+        razorpayPaymentId: (metadata as any)?.razorpayPaymentId ?? null,
         type,
         amount: amountDecimal,
         balanceBefore: balanceBeforeDecimal,

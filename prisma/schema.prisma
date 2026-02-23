@@ -70,6 +70,7 @@ model Ledger {
   id            String   @id @default(uuid())
   transactionId String   @unique
   escrowId      String?
+  razorpayPaymentId String?
   type          String // escrow, payment, refund, payout, razorpay_fee, platform_commission, gst, tds, cancellation_fee, platform_fee
   amount        Decimal  @db.Decimal(12, 2)
   balanceBefore Decimal  @db.Decimal(12, 2)
@@ -84,6 +85,7 @@ model Ledger {
   @@index([escrowId])
   @@index([type])
   @@index([createdAt])
+  @@unique([razorpayPaymentId, type])
 }
 
 // Refund - Refund tracking
@@ -331,6 +333,15 @@ model SystemConfig {
 
   @@index([configKey])
   @@index([category])
+}
+
+// Idempotency keys for Razorpay order creation (pay-in only)
+model PaymentOrderIdempotency {
+  id             String   @id @default(uuid())
+  idempotencyKey String   @unique
+  razorpayOrderId String
+  orderPayload   Json
+  createdAt      DateTime @default(now())
 }
 
 // CategoryFeeConfig - Per-category fee overrides and optional guards

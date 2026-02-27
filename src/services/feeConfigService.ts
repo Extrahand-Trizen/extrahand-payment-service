@@ -42,7 +42,7 @@ export interface FeeStructure {
  */
 const DEFAULT_FEE_STRUCTURE: FeeStructure = {
   platformFee: {
-    percentage: parseFloat(process.env.PLATFORM_FEE_PERCENTAGE || '0.10'), // 10%
+    percentage: parseFloat(process.env.PLATFORM_FEE_PERCENTAGE || '0.05'), // 5%
     gstPercentage: parseFloat(process.env.GST_PERCENTAGE || '0.18'), // 18%
   },
   processingFees: {

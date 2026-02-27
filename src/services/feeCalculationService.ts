@@ -129,7 +129,7 @@ export interface CancellationFeeResult {
 function getFeePercentages() {
   return {
     razorpayFee: parseFloat(process.env.RAZORPAY_FEE_PERCENTAGE || '0.02'), // 2%
-    platformCommission: parseFloat(process.env.PLATFORM_COMMISSION_PERCENTAGE || '0.10'), // 10%
+    platformCommission: parseFloat(process.env.PLATFORM_COMMISSION_PERCENTAGE || '0.05'), // 5%
     gst: parseFloat(process.env.GST_PERCENTAGE || '0.18'), // 18%
     tds: parseFloat(process.env.TDS_PERCENTAGE || '0.05'), // 5%
     cancellationFeeEarly: parseFloat(process.env.CANCELLATION_FEE_EARLY || '0.05'), // 5%

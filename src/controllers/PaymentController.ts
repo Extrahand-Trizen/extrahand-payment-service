@@ -40,7 +40,8 @@ export class PaymentController {
           idempotencyKey,
           razorpayOrderId: existing.razorpayOrderId,
         });
-        return res.json({ order: existing.orderPayload });
+        res.json({ order: existing.orderPayload });
+        return;
       }
     }
 

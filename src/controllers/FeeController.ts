@@ -75,6 +75,9 @@ export class FeeController {
       // Calculate fees for the poster (category-aware when taskCategory provided)
       const fees = await calculatePosterFees(taskAmount, categoryKey);
 
+      // Total = task amount + platform fee + GST on platform fee (no payment gateway fee)
+      const totalAmount = Number(fees.taskAmount) + Number(fees.platformFeeTotal);
+
       return res.status(200).json({
         success: true,
         fees: {
@@ -82,11 +85,10 @@ export class FeeController {
           platformFee: Number(fees.platformFee),
           platformFeeGst: Number(fees.platformFeeGst),
           platformFeeTotal: Number(fees.platformFeeTotal),
-          processingFeeShare: Number(fees.processingFeeShare),
-          processingFeeGst: Number(fees.processingFeeGst),
-          processingFeeTotal: Number(fees.processingFeeTotal),
-          totalAmount: Number(fees.totalAmount),
+          totalAmount,
           metadata: {
+            platformFeePercentage: fees.metadata.platformFeePercentage,
+            gstPercentage: fees.metadata.gstPercentage,
             calculatedAt: new Date().toISOString(),
             currency: 'INR',
           },

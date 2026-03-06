@@ -1,11 +1,13 @@
 import { Response, Request } from 'express';
 import { processPayout, getPayoutStatus, getPayoutsByEscrowId } from '../services/payoutService';
-import { BadRequestError, NotFoundError } from '../errors/AppError';
+import { BadRequestError, NotFoundError, ForbiddenError } from '../errors/AppError';
+import { getPaymentWithdrawalVerificationStatus } from '../lib/verificationGate';
 
 export class PayoutController {
   /**
    * POST /api/v1/payouts/process
    * Process a payout to performer
+   * STEP 5: Requires PAN + Bank verification
    */
   static async processPayout(req: Request, res: Response): Promise<void> {
     const {
@@ -17,11 +19,22 @@ export class PayoutController {
       accountHolderName,
       bankName,
       userId,
+      userProfile, // Profile should be passed from gateway after fetching
     } = req.body;
 
     // Validate required fields
     if (!razorpayOrderId || !performerUid) {
       throw new BadRequestError('razorpayOrderId and performerUid are required');
+    }
+
+    // STEP 5: Verify PAN and Bank verification before allowing withdrawal
+    const verificationStatus = getPaymentWithdrawalVerificationStatus(userProfile || null);
+    
+    if (!verificationStatus.allowed) {
+      throw new ForbiddenError(
+        verificationStatus.message || 
+        `Verification required for withdrawals. Please verify: ${verificationStatus.missing.join(", ")}`
+      );
     }
 
     // Bank account validation: either bankAccountId OR account details

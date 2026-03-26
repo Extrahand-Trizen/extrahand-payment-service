@@ -770,22 +770,22 @@ export async function processTaskCompletionPayout(params: {
       };
     }
 
-    const bankAccount = await prisma.bankAccount.findUnique({
+    const selectedBankAccount = await prisma.bankAccount.findUnique({
       where: { id: paymentProfile.defaultBankAccountId },
     });
 
-    if (!bankAccount) {
+    if (!selectedBankAccount) {
       if (enqueueOnMissingBank) {
         await enqueuePendingTaskCompletionPayout({ taskId, performerUid, amount, taskTitle });
       }
       return {
         success: false,
         requiresBankAccount: true,
-        error: 'Default bank account not found',
+        error: 'Selected default bank account not found',
       };
     }
 
-    const { fundAccountId } = parseVerificationRef(bankAccount.verificationRef);
+    const { fundAccountId } = parseVerificationRef(selectedBankAccount.verificationRef);
     if (!fundAccountId) {
       if (enqueueOnMissingBank) {
         await enqueuePendingTaskCompletionPayout({ taskId, performerUid, amount, taskTitle });
@@ -793,7 +793,7 @@ export async function processTaskCompletionPayout(params: {
       return {
         success: false,
         requiresBankAccount: true,
-        error: 'Bank account is not linked to RazorpayX fund account',
+        error: 'Selected bank account is not linked to RazorpayX fund account',
       };
     }
 

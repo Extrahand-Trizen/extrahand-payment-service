@@ -9,7 +9,7 @@ function maskAccountNumber(accountNumber: string): string {
 }
 
 async function processPendingPayoutsAfterBankAdd(userId: string): Promise<void> {
-  processPendingTaskCompletionPayouts(userId)
+  return processPendingTaskCompletionPayouts(userId)
     .then((result) => {
       if (result.processed > 0 || result.failed > 0) {
         logger.info('Processed pending task completion payouts after bank account add', {

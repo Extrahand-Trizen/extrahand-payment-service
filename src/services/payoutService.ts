@@ -13,7 +13,7 @@ import { transferToBank, getBankTransferStatus } from './mockBankTransferService
 import { prisma } from '../config/prisma';
 import { Prisma } from '@prisma/client';
 import { updateUserPaymentProfile } from './userPaymentProfileService';
-import { createRazorpayXPayout } from './razorpayxService';
+import { createRazorpayXPayout, getRazorpayXPayoutStatus } from './razorpayxService';
 
 /**
  * Generate unique payout ID
@@ -34,6 +34,21 @@ function parseVerificationRef(ref?: string | null): { fundAccountId?: string } {
 
 function pendingTaskPayoutJobId(taskId: string, performerUid: string): string {
   return `pending_task_payout_${taskId}_${performerUid}`;
+}
+
+function mapRazorpayPayoutStatusToInternal(razorpayStatus?: string | null): string {
+  const s = String(razorpayStatus || '').toLowerCase();
+
+  if (!s) return 'processing';
+
+  if (s === 'processed' || s === 'completed' || s === 'success') return 'completed';
+  if (s === 'failed' || s === 'failure') return 'failed';
+  if (s === 'reversed') return 'reversed';
+
+  // Common "still in progress" states returned by payout APIs.
+  if (s === 'processing' || s === 'created' || s === 'queued') return 'processing';
+
+  return 'processing';
 }
 
 async function enqueuePendingTaskCompletionPayout(params: {
@@ -808,7 +823,7 @@ export async function processTaskCompletionPayout(params: {
       narration: `Task payout ${taskId}`,
     });
 
-    const status = payoutResponse.status === 'processed' ? 'completed' : 'processing';
+    const status = mapRazorpayPayoutStatusToInternal(payoutResponse.status);
     const completedAt = status === 'completed' ? new Date() : null;
 
     await prisma.payout.create({
@@ -826,6 +841,10 @@ export async function processTaskCompletionPayout(params: {
         type: 'task_completion',
         description: duplicateDescription,
         completedAt: completedAt || undefined,
+        errorMessage:
+          status === 'failed' || status === 'reversed'
+            ? payoutResponse.failureReason || 'Payout failed'
+            : undefined,
       },
     });
 
@@ -892,30 +911,82 @@ export async function getPayoutStatus(payoutId: string): Promise<{
       return { success: false, error: 'Payout not found' };
     }
 
-    // Get bank transfer status if transaction ID exists
+    // If this is a RazorpayX task-completion payout, poll RazorpayX for latest status.
+    // This prevents "stuck processing" in the UI when the initial create call returns queued/processing.
+    if (payout.type === 'task_completion' && payout.status === 'processing') {
+      try {
+        const razorpayStatus = await getRazorpayXPayoutStatus(payout.payoutId);
+        const internalStatus = mapRazorpayPayoutStatusToInternal(razorpayStatus.status);
+
+        if (internalStatus !== payout.status) {
+          await prisma.payout.update({
+            where: { id: payout.id },
+            data: {
+              status: internalStatus,
+              errorMessage:
+                internalStatus === 'failed' || internalStatus === 'reversed'
+                  ? razorpayStatus.failureReason || 'Payout failed'
+                  : undefined,
+              completedAt:
+                internalStatus === 'completed'
+                  ? (payout.completedAt ?? new Date())
+                  : payout.completedAt,
+              updatedAt: new Date(),
+            },
+          });
+
+          // Keep cached earnings in sync once Razorpay indicates completion.
+          if (internalStatus === 'completed') {
+            updateUserPaymentProfile(payout.performerUid, {
+              type: 'payout',
+              amount: payout.netAmount,
+              payoutId: payout.payoutId,
+              escrowId: payout.escrowId || undefined,
+            }).catch((err) => {
+              logger.warn('Failed to update UserPaymentProfile after Razorpay payout status refresh', {
+                payoutId: payout.payoutId,
+                performerUid: payout.performerUid,
+                error: err?.message || 'Unknown error',
+              });
+            });
+          }
+        }
+      } catch (e: any) {
+        logger.warn('Could not refresh RazorpayX payout status', {
+          payoutId,
+          error: e?.message || 'Unknown error',
+        });
+      }
+    }
+
+    // Get mock bank transfer status if transaction ID exists
     let bankTransferStatus = null;
     if (payout.bankTransferId) {
       const transferStatus = await getBankTransferStatus(payout.bankTransferId);
       bankTransferStatus = transferStatus;
     }
 
+    // Refresh payout after possible Razorpay update.
+    const updatedPayout =
+      (payout.type === 'task_completion' ? await prisma.payout.findUnique({ where: { payoutId } }) : payout) || payout;
+
     return {
       success: true,
       payout: {
-        payoutId: payout.payoutId,
-        amount: payout.amount.toString(),
-        netAmount: payout.netAmount.toString(),
+        payoutId: updatedPayout.payoutId,
+        amount: updatedPayout.amount.toString(),
+        netAmount: updatedPayout.netAmount.toString(),
         fees: {
-          platformCommission: payout.platformCommission.toString(),
-          gstOnCommission: payout.gstOnCommission.toString(),
-          tds: payout.tds?.toString(),
+          platformCommission: updatedPayout.platformCommission.toString(),
+          gstOnCommission: updatedPayout.gstOnCommission.toString(),
+          tds: updatedPayout.tds?.toString(),
         },
-        bankTransferId: payout.bankTransferId,
-        status: payout.status,
-        type: payout.type,
-        description: payout.description,
-        createdAt: payout.createdAt,
-        completedAt: payout.completedAt,
+        bankTransferId: updatedPayout.bankTransferId,
+        status: updatedPayout.status,
+        type: updatedPayout.type,
+        description: updatedPayout.description,
+        createdAt: updatedPayout.createdAt,
+        completedAt: updatedPayout.completedAt,
         bankTransferStatus,
       },
     };

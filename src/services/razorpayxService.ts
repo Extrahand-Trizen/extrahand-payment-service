@@ -1,4 +1,5 @@
 import axios from 'axios';
+import crypto from 'crypto';
 import { validateEnv } from '../config/env';
 import logger from '../config/logger';
 
@@ -95,8 +96,23 @@ export async function createRazorpayXPayout(params: {
   status: string;
   amount: number;
   referenceId?: string;
+  failureReason?: string;
 }> {
   const auth = getRazorpayXAuth();
+
+  const idempotencyKey = crypto
+    .createHash('sha256')
+    .update(
+      JSON.stringify({
+        fundAccountId: params.fundAccountId,
+        amountInPaise: params.amountInPaise,
+        referenceId: params.referenceId,
+        narration: params.narration,
+        mode: params.mode || 'IMPS',
+      })
+    )
+    .digest('hex')
+    .slice(0, 32); // 4-36 chars, hex is allowed
 
   const response = await axios.post(
     'https://api.razorpay.com/v1/payouts',
@@ -116,6 +132,10 @@ export async function createRazorpayXPayout(params: {
         username: auth.username,
         password: auth.password,
       },
+      headers: {
+        // RazorpayX requires idempotency key for payout creation (avoids rejects on retries).
+        'X-Payout-Idempotency': idempotencyKey,
+      },
       timeout: 20000,
     }
   );
@@ -124,6 +144,7 @@ export async function createRazorpayXPayout(params: {
     payoutId: response.data.id,
     status: response.data.status,
     referenceId: response.data.reference_id,
+    mode: response.data.mode || params.mode || 'IMPS',
   });
 
   return {
@@ -131,5 +152,45 @@ export async function createRazorpayXPayout(params: {
     status: response.data.status,
     amount: response.data.amount,
     referenceId: response.data.reference_id,
+    failureReason:
+      response.data.failure_reason ||
+      response.data.error_description ||
+      response.data.error_reason ||
+      response.data.rejection_reason,
+  };
+}
+
+export async function getRazorpayXPayoutStatus(payoutId: string): Promise<{
+  id: string;
+  status: string;
+  amount?: number;
+  referenceId?: string;
+  failureReason?: string;
+  processedAt?: string;
+}> {
+  const auth = getRazorpayXAuth();
+
+  const response = await axios.get(`https://api.razorpay.com/v1/payouts/${payoutId}`, {
+    auth: {
+      username: auth.username,
+      password: auth.password,
+    },
+    timeout: 20000,
+    headers: {
+      'Content-Type': 'application/json',
+    },
+  });
+
+  return {
+    id: response.data.id || payoutId,
+    status: response.data.status,
+    amount: response.data.amount,
+    referenceId: response.data.reference_id,
+    failureReason:
+      response.data.failure_reason ||
+      response.data.error_description ||
+      response.data.error_reason ||
+      response.data.rejection_reason,
+    processedAt: response.data.processed_at || response.data.completed_at,
   };
 }

@@ -220,29 +220,37 @@ export async function processPayout(params: {
 
       // Optionally store the bank account for future use
       try {
-        await prisma.bankAccount.upsert({
+        const existingBankAccount = await prisma.bankAccount.findFirst({
           where: {
-            userId_accountNumber_ifscCode: {
-              userId: performerUid,
-              accountNumber,
-              ifscCode,
-            },
-          },
-          update: {
-            accountHolderName,
-            bankName: bankName || 'Unknown',
-            updatedAt: new Date(),
-          },
-          create: {
-            id: `bank_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
             userId: performerUid,
             accountNumber,
             ifscCode,
-            accountHolderName,
-            bankName: bankName || 'Unknown',
-            isVerified: false, // Would need verification in production
           },
+          select: { id: true },
         });
+
+        if (existingBankAccount) {
+          await prisma.bankAccount.update({
+            where: { id: existingBankAccount.id },
+            data: {
+              accountHolderName,
+              bankName: bankName || 'Unknown',
+              updatedAt: new Date(),
+            },
+          });
+        } else {
+          await prisma.bankAccount.create({
+            data: {
+              id: `bank_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
+              userId: performerUid,
+              accountNumber,
+              ifscCode,
+              accountHolderName,
+              bankName: bankName || 'Unknown',
+              isVerified: false, // Would need verification in production
+            },
+          });
+        }
       } catch (error: any) {
         // Log but don't fail - bank account storage is optional
         logger.warn('Could not store bank account:', error.message);

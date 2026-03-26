@@ -213,7 +213,9 @@ model BankAccount {
   createdAt         DateTime  @default(now())
   updatedAt         DateTime  @updatedAt
 
-  @@unique([userId, accountNumber, ifscCode]) // Prevent duplicate accounts
+  // Duplicates are allowed intentionally to support repeated account onboarding entries.
+  // The app layer can still apply business checks if needed.
+  @@index([userId, accountNumber, ifscCode])
   @@index([userId])
   @@index([userId, isDefault])
 }

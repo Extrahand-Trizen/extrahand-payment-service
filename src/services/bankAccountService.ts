@@ -8,6 +8,25 @@ function maskAccountNumber(accountNumber: string): string {
   return `XXXX${accountNumber.slice(-4)}`;
 }
 
+async function processPendingPayoutsAfterBankAdd(userId: string): Promise<void> {
+  processPendingTaskCompletionPayouts(userId)
+    .then((result) => {
+      if (result.processed > 0 || result.failed > 0) {
+        logger.info('Processed pending task completion payouts after bank account add', {
+          userId,
+          processed: result.processed,
+          failed: result.failed,
+        });
+      }
+    })
+    .catch((error: any) => {
+      logger.warn('Failed to process pending payouts after bank account add', {
+        userId,
+        error: error?.message || 'Unknown error',
+      });
+    });
+}
+
 export async function upsertTaskerBankAccount(params: {
   userId: string;
   accountNumber: string;
@@ -83,22 +102,7 @@ export async function upsertTaskerBankAccount(params: {
       });
     }
 
-    processPendingTaskCompletionPayouts(params.userId)
-      .then((result) => {
-        if (result.processed > 0 || result.failed > 0) {
-          logger.info('Processed pending task completion payouts after bank account add', {
-            userId: params.userId,
-            processed: result.processed,
-            failed: result.failed,
-          });
-        }
-      })
-      .catch((error: any) => {
-        logger.warn('Failed to process pending payouts after bank account add', {
-          userId: params.userId,
-          error: error?.message || 'Unknown error',
-        });
-      });
+    await processPendingPayoutsAfterBankAdd(params.userId);
 
     return {
       success: true,

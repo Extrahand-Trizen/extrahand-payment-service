@@ -213,6 +213,48 @@ export async function getUserTransactions(
       });
     });
 
+    // Include payouts that are not linked to an escrow (RazorpayX-only flow)
+    if (!typeFilter || typeFilter === 'payout') {
+      const standalonePayouts = await prisma.payout.findMany({
+        where: {
+          performerUid: userId,
+          escrowId: null,
+          ...(statusFilter ? { status: statusFilter } : {}),
+          ...(startDate || endDate
+            ? {
+                createdAt: {
+                  ...(startDate ? { gte: startDate } : {}),
+                  ...(endDate ? { lte: endDate } : {}),
+                },
+              }
+            : {}),
+        },
+        orderBy: { createdAt: 'desc' },
+        take: fetchLimit,
+      });
+
+      standalonePayouts.forEach((payout) => {
+        transactions.push({
+          id: payout.id,
+          transactionId: payout.payoutId,
+          type: 'payout',
+          amount: payout.netAmount.toString(),
+          status: payout.status,
+          description: payout.description || 'Task payout credited',
+          date: payout.createdAt.toISOString(),
+          relatedEntityId: payout.payoutId,
+          category: 'earnings',
+          metadata: {
+            grossAmount: payout.amount.toString(),
+            platformCommission: payout.platformCommission.toString(),
+            gstOnCommission: payout.gstOnCommission.toString(),
+            tds: payout.tds?.toString() || '0',
+            netAmount: payout.netAmount.toString(),
+          },
+        });
+      });
+    }
+
     // 2. Fees are now hidden - they're already deducted in netAmount
     // Individual fee entries are not shown to keep the UI clean
     // Fees are included in the payout metadata for detailed breakdown when needed

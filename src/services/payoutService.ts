@@ -13,12 +13,23 @@ import { transferToBank, getBankTransferStatus } from './mockBankTransferService
 import { prisma } from '../config/prisma';
 import { Prisma } from '@prisma/client';
 import { updateUserPaymentProfile } from './userPaymentProfileService';
+import { createRazorpayXPayout } from './razorpayxService';
 
 /**
  * Generate unique payout ID
  */
 function generatePayoutId(): string {
   return `payout_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+}
+
+function parseVerificationRef(ref?: string | null): { fundAccountId?: string } {
+  if (!ref) return {};
+  try {
+    const parsed = JSON.parse(ref);
+    return { fundAccountId: parsed.fundAccountId };
+  } catch {
+    return {};
+  }
 }
 
 /**
@@ -568,6 +579,154 @@ export async function processPayout(params: {
   } catch (error: any) {
     logger.error('❌ Error in payout service:', error);
     return { success: false, error: error.message || 'Failed to process payout' };
+  }
+}
+
+/**
+ * Process payout for task completion in RazorpayX-only mode
+ * This path does not depend on escrow/order IDs.
+ */
+export async function processTaskCompletionPayout(params: {
+  taskId: string;
+  performerUid: string;
+  amount: number;
+  taskTitle?: string;
+  userId?: string;
+}): Promise<{
+  success: boolean;
+  payout?: any;
+  requiresBankAccount?: boolean;
+  error?: string;
+}> {
+  try {
+    const { taskId, performerUid, amount, taskTitle } = params;
+
+    if (!isPostgresConnected()) {
+      return { success: false, error: 'Postgres not connected' };
+    }
+
+    const duplicateDescription = `Task completion payout for task ${taskId}`;
+
+    const existing = await prisma.payout.findFirst({
+      where: {
+        performerUid,
+        description: duplicateDescription,
+        status: { in: ['processing', 'completed'] },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    if (existing) {
+      return {
+        success: true,
+        payout: {
+          payoutId: existing.payoutId,
+          amount: existing.amount.toString(),
+          netAmount: existing.netAmount.toString(),
+          status: existing.status,
+          completedAt: existing.completedAt,
+        },
+      };
+    }
+
+    const paymentProfile = await prisma.userPaymentProfile.findUnique({
+      where: { userId: performerUid },
+    });
+
+    if (!paymentProfile?.defaultBankAccountId) {
+      return {
+        success: false,
+        requiresBankAccount: true,
+        error: 'No bank account added for this tasker',
+      };
+    }
+
+    const bankAccount = await prisma.bankAccount.findUnique({
+      where: { id: paymentProfile.defaultBankAccountId },
+    });
+
+    if (!bankAccount) {
+      return {
+        success: false,
+        requiresBankAccount: true,
+        error: 'Default bank account not found',
+      };
+    }
+
+    const { fundAccountId } = parseVerificationRef(bankAccount.verificationRef);
+    if (!fundAccountId) {
+      return {
+        success: false,
+        requiresBankAccount: true,
+        error: 'Bank account is not linked to RazorpayX fund account',
+      };
+    }
+
+    const grossAmount = new Prisma.Decimal(amount.toString());
+    const feeBreakdown = calculateFees(grossAmount);
+    const netAmount = feeBreakdown.netAmount;
+
+    const payoutResponse = await createRazorpayXPayout({
+      fundAccountId,
+      amountInPaise: Math.round(parseFloat(netAmount.toString()) * 100),
+      referenceId: `task_${taskId}`,
+      narration: `Task payout ${taskId}`,
+    });
+
+    const status = payoutResponse.status === 'processed' ? 'completed' : 'processing';
+    const completedAt = status === 'completed' ? new Date() : null;
+
+    await prisma.payout.create({
+      data: {
+        payoutId: payoutResponse.id,
+        escrowId: null,
+        performerUid,
+        amount: grossAmount,
+        netAmount,
+        platformCommission: feeBreakdown.platformCommission,
+        gstOnCommission: feeBreakdown.platformCommissionGst,
+        tds: feeBreakdown.tds,
+        bankTransferId: payoutResponse.id,
+        status,
+        type: 'task_completion',
+        description: duplicateDescription,
+        completedAt: completedAt || undefined,
+      },
+    });
+
+    if (status === 'completed') {
+      updateUserPaymentProfile(performerUid, {
+        type: 'payout',
+        amount: netAmount,
+        payoutId: payoutResponse.id,
+      }).catch((error) => {
+        logger.warn('Failed to update UserPaymentProfile after task completion payout', error);
+      });
+    }
+
+    return {
+      success: true,
+      payout: {
+        payoutId: payoutResponse.id,
+        taskId,
+        taskTitle,
+        amount: grossAmount.toString(),
+        netAmount: netAmount.toString(),
+        status,
+        fees: {
+          platformCommission: feeBreakdown.platformCommission.toString(),
+          gstOnCommission: feeBreakdown.platformCommissionGst.toString(),
+          tds: feeBreakdown.tds.toString(),
+          total: feeBreakdown.totalFees.toString(),
+        },
+      },
+    };
+  } catch (error: any) {
+    logger.error('Error processing task completion payout', error);
+    return {
+      success: false,
+      error: error.message || 'Failed to process task completion payout',
+    };
   }
 }
 

@@ -3,12 +3,12 @@ import paymentRoutes from './payment';
 import escrowRoutes from './escrow';
 import webhookRoutes from './webhooks';
 import refundRoutes from './refunds';
-// Payouts disabled - handled elsewhere
-// import payoutRoutes from './payouts';
+import payoutRoutes from './payouts';
 import earningsRoutes from './earnings';
 import transactionRoutes from './transactions';
 import feesRoutes from './fees';
 import adminRoutes from './admin';
+import bankAccountRoutes from './bankAccounts';
 import { validateEnv } from '../config/env';
 import { isDatabaseConnected, isPostgresConnected } from '../config/database';
 
@@ -41,8 +41,11 @@ router.use('/webhooks', webhookRoutes);
 // Refund routes
 router.use('/refunds', refundRoutes);
 
-// Payout routes disabled - handled elsewhere
-// router.use('/payouts', payoutRoutes);
+// Payout routes
+router.use('/payouts', payoutRoutes);
+
+// Bank account routes
+router.use('/bank-accounts', bankAccountRoutes);
 
 // Earnings routes
 router.use('/earnings', earningsRoutes);

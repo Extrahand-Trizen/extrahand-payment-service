@@ -1,5 +1,10 @@
 import { Response, Request } from 'express';
-import { processPayout, getPayoutStatus, getPayoutsByEscrowId } from '../services/payoutService';
+import {
+  processPayout,
+  getPayoutStatus,
+  getPayoutsByEscrowId,
+  processTaskCompletionPayout,
+} from '../services/payoutService';
 import { BadRequestError, NotFoundError } from '../errors/AppError';
 
 export class PayoutController {
@@ -49,6 +54,46 @@ export class PayoutController {
     res.json({
       success: true,
       payout: result.payout,
+    });
+  }
+
+  /**
+   * POST /api/v1/payouts/task-completion
+   * Process payout directly on task completion (without escrow dependency)
+   */
+  static async processTaskCompletionPayout(req: Request, res: Response): Promise<void> {
+    const { taskId, performerUid, amount, taskTitle, userId } = req.body;
+
+    if (!taskId || !performerUid || !amount) {
+      throw new BadRequestError('taskId, performerUid and amount are required');
+    }
+
+    const numericAmount = Number(amount);
+    if (Number.isNaN(numericAmount) || numericAmount <= 0) {
+      throw new BadRequestError('amount must be a valid number greater than 0');
+    }
+
+    const result = await processTaskCompletionPayout({
+      taskId,
+      performerUid,
+      amount: numericAmount,
+      taskTitle,
+      userId,
+    });
+
+    if (!result.success) {
+      res.status(result.requiresBankAccount ? 409 : 400).json({
+        success: false,
+        error: result.error || 'Failed to process task completion payout',
+        requiresBankAccount: result.requiresBankAccount || false,
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      payout: result.payout,
+      message: 'Payout processed for task completion',
     });
   }
 

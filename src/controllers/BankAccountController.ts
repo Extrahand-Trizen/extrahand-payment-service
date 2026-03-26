@@ -88,4 +88,97 @@ export class BankAccountController {
       })),
     });
   }
+
+  static async deleteBankAccount(req: Request, res: Response): Promise<void> {
+    const userId = (req.headers['x-user-id'] as string) || req.body.userId;
+    const bankAccountId = req.params.bankAccountId;
+
+    if (!userId) {
+      throw new BadRequestError('User id is required (x-user-id header)');
+    }
+
+    if (!bankAccountId) {
+      throw new BadRequestError('bankAccountId is required');
+    }
+
+    const bankAccount = await prisma.bankAccount.findUnique({
+      where: { id: bankAccountId },
+      select: { id: true, userId: true },
+    });
+
+    if (!bankAccount || bankAccount.userId !== userId) {
+      throw new BadRequestError('Bank account not found');
+    }
+
+    const profile = await prisma.userPaymentProfile.findUnique({
+      where: { userId },
+      select: { defaultBankAccountId: true },
+    });
+
+    await prisma.bankAccount.delete({
+      where: { id: bankAccountId },
+    });
+
+    if (profile?.defaultBankAccountId === bankAccountId) {
+      const latestAccount = await prisma.bankAccount.findFirst({
+        where: { userId },
+        orderBy: { createdAt: 'desc' },
+        select: { id: true },
+      });
+
+      await prisma.userPaymentProfile.upsert({
+        where: { userId },
+        update: { defaultBankAccountId: latestAccount?.id || null },
+        create: {
+          userId,
+          defaultBankAccountId: latestAccount?.id || null,
+        },
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Bank account deleted successfully',
+    });
+  }
+
+  static async setDefaultBankAccount(req: Request, res: Response): Promise<void> {
+    const userId = (req.headers['x-user-id'] as string) || req.body.userId;
+    const bankAccountId = req.params.bankAccountId;
+
+    if (!userId) {
+      throw new BadRequestError('User id is required (x-user-id header)');
+    }
+
+    if (!bankAccountId) {
+      throw new BadRequestError('bankAccountId is required');
+    }
+
+    const bankAccount = await prisma.bankAccount.findUnique({
+      where: { id: bankAccountId },
+      select: { id: true, userId: true },
+    });
+
+    if (!bankAccount || bankAccount.userId !== userId) {
+      throw new BadRequestError('Bank account not found');
+    }
+
+    await prisma.userPaymentProfile.upsert({
+      where: { userId },
+      update: {
+        defaultBankAccountId: bankAccountId,
+        updatedAt: new Date(),
+      },
+      create: {
+        userId,
+        defaultBankAccountId: bankAccountId,
+      },
+    });
+
+    res.json({
+      success: true,
+      data: { defaultBankAccountId: bankAccountId },
+      message: 'Default bank account updated',
+    });
+  }
 }

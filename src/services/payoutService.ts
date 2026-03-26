@@ -32,6 +32,123 @@ function parseVerificationRef(ref?: string | null): { fundAccountId?: string } {
   }
 }
 
+function pendingTaskPayoutJobId(taskId: string, performerUid: string): string {
+  return `pending_task_payout_${taskId}_${performerUid}`;
+}
+
+async function enqueuePendingTaskCompletionPayout(params: {
+  taskId: string;
+  performerUid: string;
+  amount: number;
+  taskTitle?: string;
+}): Promise<void> {
+  const { taskId, performerUid, amount, taskTitle } = params;
+
+  await prisma.jobQueue.upsert({
+    where: { jobId: pendingTaskPayoutJobId(taskId, performerUid) },
+    update: {
+      payload: {
+        taskId,
+        performerUid,
+        amount,
+        taskTitle,
+      },
+      status: 'pending',
+      nextRetryAt: new Date(),
+      updatedAt: new Date(),
+    },
+    create: {
+      jobId: pendingTaskPayoutJobId(taskId, performerUid),
+      jobType: 'task_completion_payout',
+      entityType: 'payout',
+      entityId: taskId,
+      payload: {
+        taskId,
+        performerUid,
+        amount,
+        taskTitle,
+      },
+      nextRetryAt: new Date(),
+      status: 'pending',
+      priority: 5,
+    },
+  });
+}
+
+export async function processPendingTaskCompletionPayouts(
+  performerUid: string
+): Promise<{ processed: number; failed: number }> {
+  const jobs = await prisma.jobQueue.findMany({
+    where: {
+      jobType: 'task_completion_payout',
+      status: 'pending',
+      payload: {
+        path: ['performerUid'],
+        equals: performerUid,
+      },
+    },
+    orderBy: { createdAt: 'asc' },
+    take: 20,
+  });
+
+  let processed = 0;
+  let failed = 0;
+
+  for (const job of jobs) {
+    const payload = (job.payload || {}) as {
+      taskId?: string;
+      performerUid?: string;
+      amount?: number;
+      taskTitle?: string;
+    };
+
+    if (!payload.taskId || !payload.performerUid || !payload.amount) {
+      await prisma.jobQueue.update({
+        where: { id: job.id },
+        data: {
+          status: 'failed',
+          lastError: 'Invalid payload for pending task payout',
+          completedAt: new Date(),
+        },
+      });
+      failed += 1;
+      continue;
+    }
+
+    const result = await processTaskCompletionPayout({
+      taskId: payload.taskId,
+      performerUid: payload.performerUid,
+      amount: Number(payload.amount),
+      taskTitle: payload.taskTitle,
+      enqueueOnMissingBank: false,
+    });
+
+    if (result.success) {
+      await prisma.jobQueue.update({
+        where: { id: job.id },
+        data: {
+          status: 'completed',
+          completedAt: new Date(),
+          lastError: null,
+        },
+      });
+      processed += 1;
+    } else {
+      await prisma.jobQueue.update({
+        where: { id: job.id },
+        data: {
+          attemptCount: { increment: 1 },
+          lastError: result.error || 'Failed to process pending task payout',
+          nextRetryAt: new Date(Date.now() + 5 * 60 * 1000),
+        },
+      });
+      failed += 1;
+    }
+  }
+
+  return { processed, failed };
+}
+
 /**
  * Process payout to performer
  * 
@@ -592,6 +709,7 @@ export async function processTaskCompletionPayout(params: {
   amount: number;
   taskTitle?: string;
   userId?: string;
+  enqueueOnMissingBank?: boolean;
 }): Promise<{
   success: boolean;
   payout?: any;
@@ -599,7 +717,7 @@ export async function processTaskCompletionPayout(params: {
   error?: string;
 }> {
   try {
-    const { taskId, performerUid, amount, taskTitle } = params;
+    const { taskId, performerUid, amount, taskTitle, enqueueOnMissingBank = true } = params;
 
     if (!isPostgresConnected()) {
       return { success: false, error: 'Postgres not connected' };
@@ -634,6 +752,9 @@ export async function processTaskCompletionPayout(params: {
     });
 
     if (!paymentProfile?.defaultBankAccountId) {
+      if (enqueueOnMissingBank) {
+        await enqueuePendingTaskCompletionPayout({ taskId, performerUid, amount, taskTitle });
+      }
       return {
         success: false,
         requiresBankAccount: true,
@@ -646,6 +767,9 @@ export async function processTaskCompletionPayout(params: {
     });
 
     if (!bankAccount) {
+      if (enqueueOnMissingBank) {
+        await enqueuePendingTaskCompletionPayout({ taskId, performerUid, amount, taskTitle });
+      }
       return {
         success: false,
         requiresBankAccount: true,
@@ -655,6 +779,9 @@ export async function processTaskCompletionPayout(params: {
 
     const { fundAccountId } = parseVerificationRef(bankAccount.verificationRef);
     if (!fundAccountId) {
+      if (enqueueOnMissingBank) {
+        await enqueuePendingTaskCompletionPayout({ taskId, performerUid, amount, taskTitle });
+      }
       return {
         success: false,
         requiresBankAccount: true,

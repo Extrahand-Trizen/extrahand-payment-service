@@ -18,9 +18,10 @@ const envSchema = z.object({
   RAZORPAY_KEY_ID: z.string().min(1, 'RAZORPAY_KEY_ID is required'),
   RAZORPAY_KEY_SECRET: z.string().min(1, 'RAZORPAY_KEY_SECRET is required'),
   RAZORPAY_WEBHOOK_SECRET: z.string().optional(), // Optional - only needed for webhook verification
-  RAZORPAYX_KEY_ID: z.string().min(1, 'RAZORPAYX_KEY_ID is required for payouts'),
-  RAZORPAYX_KEY_SECRET: z.string().min(1, 'RAZORPAYX_KEY_SECRET is required for payouts'),
-  RAZORPAYX_ACCOUNT_NUMBER: z.string().min(1, 'RAZORPAYX_ACCOUNT_NUMBER is required for payouts'),
+  RAZORPAYX_KEY_ID: z.string().optional(),
+  RAZORPAYX_KEY_SECRET: z.string().optional(),
+  RAZORPAYX_ACCOUNT_NUMBER: z.string().optional(),
+  RAZORPAY_ACCOUNT_NUMBER: z.string().optional(),
   
   // Service-to-Service
   SERVICE_AUTH_TOKEN: z.string().min(1, 'SERVICE_AUTH_TOKEN is required').optional(),
@@ -40,7 +41,24 @@ const envSchema = z.object({
 
 export function validateEnv() {
   try {
-    return envSchema.parse(process.env);
+    const env = envSchema.parse(process.env);
+
+    const payoutKeyId = env.RAZORPAYX_KEY_ID || env.RAZORPAY_KEY_ID;
+    const payoutKeySecret = env.RAZORPAYX_KEY_SECRET || env.RAZORPAY_KEY_SECRET;
+    const payoutAccountNumber = env.RAZORPAYX_ACCOUNT_NUMBER || env.RAZORPAY_ACCOUNT_NUMBER;
+
+    if (!payoutKeyId || !payoutKeySecret || !payoutAccountNumber) {
+      console.error('❌ Environment validation failed: Razorpay payout credentials missing');
+      console.error('  - Provide either RAZORPAYX_* values or RAZORPAY_* + RAZORPAY_ACCOUNT_NUMBER');
+      process.exit(1);
+    }
+
+    return {
+      ...env,
+      RAZORPAYX_KEY_ID: payoutKeyId,
+      RAZORPAYX_KEY_SECRET: payoutKeySecret,
+      RAZORPAYX_ACCOUNT_NUMBER: payoutAccountNumber,
+    };
   } catch (error) {
     if (error instanceof z.ZodError) {
       console.error('❌ Environment validation failed:');

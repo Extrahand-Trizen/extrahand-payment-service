@@ -13,7 +13,7 @@ function getRazorpayXAuth(): RazorpayXAuth {
 
   const username = env.RAZORPAYX_KEY_ID || env.RAZORPAY_KEY_ID;
   const password = env.RAZORPAYX_KEY_SECRET || env.RAZORPAY_KEY_SECRET;
-  const accountNumber = env.RAZORPAYX_ACCOUNT_NUMBER;
+  const accountNumber = env.RAZORPAYX_ACCOUNT_NUMBER || env.RAZORPAY_ACCOUNT_NUMBER;
 
   if (!username || !password || !accountNumber) {
     throw new Error('RazorpayX credentials are not configured correctly');

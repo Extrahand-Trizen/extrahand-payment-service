@@ -813,8 +813,11 @@ export async function processTaskCompletionPayout(params: {
     }
 
     const grossAmount = new Prisma.Decimal(amount.toString());
-    const feeBreakdown = calculateFees(grossAmount);
-    const netAmount = feeBreakdown.netAmount;
+    // For task-completion payouts, tasker must receive the exact task budget amount.
+    const netAmount = grossAmount;
+    const platformCommission = new Prisma.Decimal(0);
+    const gstOnCommission = new Prisma.Decimal(0);
+    const tds = new Prisma.Decimal(0);
 
     // RazorpayX narration max length is 30 chars.
     const payoutNarration = `Task ${taskId.slice(-8)} payout`;
@@ -836,9 +839,9 @@ export async function processTaskCompletionPayout(params: {
         performerUid,
         amount: grossAmount,
         netAmount,
-        platformCommission: feeBreakdown.platformCommission,
-        gstOnCommission: feeBreakdown.platformCommissionGst,
-        tds: feeBreakdown.tds,
+        platformCommission,
+        gstOnCommission,
+        tds,
         bankTransferId: payoutResponse.id,
         status,
         type: 'task_completion',
@@ -871,10 +874,10 @@ export async function processTaskCompletionPayout(params: {
         netAmount: netAmount.toString(),
         status,
         fees: {
-          platformCommission: feeBreakdown.platformCommission.toString(),
-          gstOnCommission: feeBreakdown.platformCommissionGst.toString(),
-          tds: feeBreakdown.tds.toString(),
-          total: feeBreakdown.totalFees.toString(),
+          platformCommission: platformCommission.toString(),
+          gstOnCommission: gstOnCommission.toString(),
+          tds: tds.toString(),
+          total: '0',
         },
       },
     };

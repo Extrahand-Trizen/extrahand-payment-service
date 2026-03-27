@@ -816,11 +816,14 @@ export async function processTaskCompletionPayout(params: {
     const feeBreakdown = calculateFees(grossAmount);
     const netAmount = feeBreakdown.netAmount;
 
+    // RazorpayX narration max length is 30 chars.
+    const payoutNarration = `Task ${taskId.slice(-8)} payout`;
+
     const payoutResponse = await createRazorpayXPayout({
       fundAccountId,
       amountInPaise: Math.round(parseFloat(netAmount.toString()) * 100),
       referenceId: `task_${taskId}`,
-      narration: `Task payout ${taskId}`,
+      narration: payoutNarration,
     });
 
     const status = mapRazorpayPayoutStatusToInternal(payoutResponse.status);

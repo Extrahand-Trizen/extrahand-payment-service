@@ -28,9 +28,12 @@ export async function cancelPayment(params: {
   userId?: string;
   cancelledBy?: 'poster' | 'performer';
   taskStartDate?: Date;
+  assignedAt?: Date;
+  /** Task budget (rupees) for %-fee base; aligns refund with pre-cancel UI */
+  feeBaseAmount?: number;
 }): Promise<{ success: boolean; cancelled?: boolean; refundRequired?: boolean; refund?: any; error?: string }> {
   try {
-    const { razorpayOrderId, reason, userId, cancelledBy, taskStartDate } = params;
+    const { razorpayOrderId, reason, userId, cancelledBy, taskStartDate, assignedAt, feeBaseAmount } = params;
 
     logger.info('🔄 Processing payment cancellation', {
       razorpayOrderId,
@@ -94,6 +97,8 @@ export async function cancelPayment(params: {
           taskStartDate: refundTaskStartDate,
           cancelledAt: new Date(),
           userId: userId,
+          assignedAt,
+          feeBaseAmount,
         });
 
         if (refundResult.success) {
@@ -207,9 +212,13 @@ export async function cancelEscrow(params: {
   escrowId: string;
   reason?: string;
   userId?: string;
+  cancelledBy?: 'poster' | 'performer';
+  taskStartDate?: Date;
+  assignedAt?: Date;
+  feeBaseAmount?: number;
 }): Promise<{ success: boolean; cancelled?: boolean; refundRequired?: boolean; error?: string }> {
   try {
-    const { escrowId, reason, userId } = params;
+    const { escrowId, reason, userId, cancelledBy, taskStartDate, assignedAt, feeBaseAmount } = params;
 
     // Get escrow from Postgres
     if (!isPostgresConnected()) {
@@ -229,6 +238,10 @@ export async function cancelEscrow(params: {
       razorpayOrderId: postgresEscrow.razorpayOrderId,
       reason,
       userId,
+      cancelledBy,
+      taskStartDate,
+      assignedAt,
+      feeBaseAmount,
     });
   } catch (error: any) {
     logger.error('❌ Error cancelling escrow:', error);
@@ -248,9 +261,13 @@ export async function cancelEscrowByTaskId(params: {
   taskId: string;
   reason?: string;
   userId?: string;
-}): Promise<{ success: boolean; cancelled?: boolean; refundRequired?: boolean; error?: string }> {
+  cancelledBy?: 'poster' | 'performer';
+  taskStartDate?: Date;
+  assignedAt?: Date;
+  feeBaseAmount?: number;
+}): Promise<{ success: boolean; cancelled?: boolean; refundRequired?: boolean; refund?: any; error?: string }> {
   try {
-    const { taskId, reason, userId } = params;
+    const { taskId, reason, userId, cancelledBy, taskStartDate, assignedAt, feeBaseAmount } = params;
 
     // Get escrow from Postgres
     if (!isPostgresConnected()) {
@@ -271,6 +288,10 @@ export async function cancelEscrowByTaskId(params: {
       razorpayOrderId: postgresEscrow.razorpayOrderId,
       reason,
       userId,
+      cancelledBy,
+      taskStartDate,
+      assignedAt,
+      feeBaseAmount,
     });
   } catch (error: any) {
     logger.error('❌ Error cancelling escrow by task ID:', error);

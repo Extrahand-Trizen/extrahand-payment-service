@@ -6,7 +6,6 @@
  */
 
 import logger from '../config/logger';
-import { razorpay } from '../config/razorpay';
 import { isPostgresConnected } from '../config/database';
 import { createLedgerEntry, getEscrowBalance } from './ledgerService';
 import { 
@@ -16,7 +15,7 @@ import {
 } from './feeCalculationService';
 import { prisma } from '../config/prisma';
 import { Prisma } from '@prisma/client';
-import { createRefund as createRazorpayRefund } from './paymentService';
+import { createRefundAmountPaise, getPaymentDetails } from './paymentService';
 import { sanitizeRazorpayRefundData } from '../utils/paymentSanitizer';
 import { EmailServiceClient } from '../clients/EmailServiceClient';
 
@@ -41,7 +40,12 @@ export async function processRefund(params: {
   taskStartDate: Date;
   cancelledAt: Date;
   userId?: string;
-  amount?: number; // Optional: for partial refunds (in rupees)
+  /** Optional: explicit refund in rupees (must match server rules if used) */
+  amount?: number;
+  /** When poster cancels within 15 minutes of assignment → no fee (matches app UI) */
+  assignedAt?: Date;
+  /** Task budget in rupees — % fee applies to this (matches "Task Amount" in cancel dialog) */
+  feeBaseAmount?: number;
 }): Promise<{
   success: boolean;
   refund?: any;
@@ -56,7 +60,9 @@ export async function processRefund(params: {
       taskStartDate,
       cancelledAt,
       userId,
-      amount, // Optional partial refund amount
+      amount,
+      assignedAt,
+      feeBaseAmount,
     } = params;
 
     logger.info('💰 Processing refund', {
@@ -169,6 +175,8 @@ export async function processRefund(params: {
         taskStartDate,
         cancelledAt,
         cancelledBy,
+        assignedAt,
+        feeBaseAmount,
       });
 
       refundAmount = cancellationFeeResult.refundAmount;
@@ -178,14 +186,46 @@ export async function processRefund(params: {
       cancellationFeePercentage = cancellationFeeResult.cancellationFeePercentage;
     }
 
-    // Convert refund amount to paise for Razorpay
-    const refundAmountInPaise = Math.round(parseFloat(refundAmount.toString()) * 100);
+    const paymentFetch = await getPaymentDetails(razorpayPaymentId);
+    if (!paymentFetch.success || !paymentFetch.payment) {
+      return {
+        success: false,
+        error:
+          ('error' in paymentFetch && paymentFetch.error) ||
+          'Could not load Razorpay payment to refund',
+      };
+    }
+    const pay = paymentFetch.payment;
+    const capturedPaise = Number(pay.amount);
+    const alreadyRefunded = Number(pay.amount_refunded ?? 0);
+    const maxRefundablePaise = capturedPaise - alreadyRefunded;
+    if (!Number.isFinite(maxRefundablePaise) || maxRefundablePaise <= 0) {
+      return { success: false, error: 'No capturable balance left to refund on this payment' };
+    }
 
-    // Create refund in Razorpay
-    const razorpayRefundResult = await createRazorpayRefund(
-      razorpayPaymentId,
-      amount ? amount : undefined // Pass amount only for partial refunds
-    );
+    let refundAmountInPaise = Math.round(parseFloat(refundAmount.toString()) * 100);
+    if (refundAmountInPaise <= 0) {
+      return {
+        success: false,
+        error: 'Calculated refund after cancellation fees is zero; nothing to return via Razorpay',
+      };
+    }
+    if (refundAmountInPaise > maxRefundablePaise) {
+      if (refundAmountInPaise - maxRefundablePaise > 1) {
+        logger.error('Refund amount exceeds Razorpay capturable amount', {
+          refundAmountInPaise,
+          maxRefundablePaise,
+          razorpayPaymentId,
+        });
+        return {
+          success: false,
+          error: 'Refund amount exceeds capturable payment amount; check fee policy vs payment total',
+        };
+      }
+      refundAmountInPaise = maxRefundablePaise;
+    }
+
+    const razorpayRefundResult = await createRefundAmountPaise(razorpayPaymentId, refundAmountInPaise);
 
     if (!razorpayRefundResult.success || !razorpayRefundResult.refund) {
       logger.error('❌ Failed to create Razorpay refund:', razorpayRefundResult.error);

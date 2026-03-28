@@ -119,7 +119,8 @@ export async function getUserTransactions(
             taskId: escrow.taskId,
             role: 'poster',
             razorpayOrderId: escrow.razorpayOrderId,
-            amountInRupees: escrow.amountInRupees.toString()
+            amountInRupees: escrow.amountInRupees.toString(),
+            escrowStatus: escrow.status,
           }
         });
       }
@@ -160,8 +161,12 @@ export async function getUserTransactions(
       // Refunds from this escrow
       escrow.refunds.forEach(refund => {
         if (!typeFilter || typeFilter === 'refund' || typeFilter === 'compensation') {
-          const isPosterRefund = escrow.posterUid === userId && refund.cancelledBy === 'poster';
-          const isPerformerCompensation = escrow.performerUid === userId && refund.cancelledBy === 'poster' && refund.toOtherParty;
+          // Any refund credited to the poster (regardless of who cancelled the task)
+          const isPosterRefund = escrow.posterUid === userId;
+          const isPerformerCompensation =
+            escrow.performerUid === userId &&
+            refund.cancelledBy === 'poster' &&
+            refund.toOtherParty;
 
           if (isPosterRefund) {
             // Poster gets refund (money back) - this is a payment-related transaction

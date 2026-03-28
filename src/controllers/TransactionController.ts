@@ -9,11 +9,19 @@ export class TransactionController {
    */
   static async getUserTransactions(req: Request, res: Response): Promise<void> {
     const { userId } = req.params;
-    const { limit, offset, startDate, endDate, type, status, category } = req.query;
+    const { limit, offset, startDate, endDate, type, status, category, linkedUserIds } = req.query;
 
     if (!userId) {
       throw new BadRequestError('User ID is required');
     }
+
+    const linkedParsed =
+      typeof linkedUserIds === 'string' && linkedUserIds.trim()
+        ? linkedUserIds
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : undefined;
 
     const options = {
       limit: limit ? parseInt(limit as string, 10) : undefined,
@@ -22,7 +30,8 @@ export class TransactionController {
       endDate: endDate ? new Date(endDate as string) : undefined,
       type: type as 'payment' | 'payout' | 'refund' | 'compensation' | 'fee' | 'escrow' | undefined,
       status: status as string | undefined,
-      category: category as 'earnings' | 'payments' | 'all' | undefined
+      category: category as 'earnings' | 'payments' | 'all' | undefined,
+      linkedUserIds: linkedParsed,
     };
 
     const result = await getUserTransactions(userId, options);

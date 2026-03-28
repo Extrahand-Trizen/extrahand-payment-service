@@ -179,7 +179,10 @@ export async function applyPenaltyLinesInTx(
   }
 }
 
-export async function getPendingPenaltySummary(performerUid: string): Promise<{
+export async function getPendingPenaltySummary(
+  performerUid: string,
+  linkedUids?: string[]
+): Promise<{
   success: boolean;
   totalRemaining?: string;
   items?: Array<{
@@ -198,9 +201,17 @@ export async function getPendingPenaltySummary(performerUid: string): Promise<{
       return { success: false, error: 'Postgres not connected' };
     }
 
+    const uidList = [
+      ...new Set(
+        [performerUid, ...(linkedUids || [])].filter(
+          (x): x is string => typeof x === 'string' && x.trim().length > 0
+        )
+      ),
+    ];
+
     const rows = await prisma.performerCancellationPenalty.findMany({
       where: {
-        performerUid,
+        performerUid: { in: uidList },
         status: 'pending',
         remainingAmount: { gt: new Prisma.Decimal(0) },
       },

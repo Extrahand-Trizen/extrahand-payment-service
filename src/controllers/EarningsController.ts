@@ -15,12 +15,21 @@ export class EarningsController {
    */
   static async getPendingCancellationPenalties(req: Request, res: Response): Promise<void> {
     const { userId } = req.params;
+    const linkedRaw = req.query.linkedUserIds;
 
     if (!userId) {
       throw new BadRequestError('User ID is required');
     }
 
-    const result = await getPendingPenaltySummary(userId);
+    const linkedParsed =
+      typeof linkedRaw === 'string' && linkedRaw.trim()
+        ? linkedRaw
+            .split(',')
+            .map((s) => s.trim())
+            .filter((s) => s.length > 0 && s !== userId)
+        : [];
+
+    const result = await getPendingPenaltySummary(userId, linkedParsed);
 
     if (!result.success) {
       logger.warn('[EarningsController] pending-cancellation-penalties fallback', {

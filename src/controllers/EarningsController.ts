@@ -53,12 +53,21 @@ export class EarningsController {
 
   static async getEarnings(req: Request, res: Response): Promise<void> {
     const { userId } = req.params;
+    const linkedRaw = req.query.linkedUserIds;
 
     if (!userId) {
       throw new BadRequestError('User ID is required');
     }
 
-    const result = await getUserEarnings(userId);
+    const linkedParsed =
+      typeof linkedRaw === 'string' && linkedRaw.trim()
+        ? linkedRaw
+            .split(',')
+            .map((s) => s.trim())
+            .filter((s) => s.length > 0 && s !== userId)
+        : [];
+
+    const result = await getUserEarnings(userId, linkedParsed);
 
     if (!result.success) {
       throw new Error(result.error || 'Failed to get earnings');

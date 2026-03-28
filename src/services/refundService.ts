@@ -151,40 +151,7 @@ export async function processRefund(params: {
       return { success: false, error: 'Refund already in progress' };
     }
 
-    // Get original amount
-    const originalAmount = postgresEscrow.amountInRupees;
-
-    // Calculate cancellation fee and refund amount
-    let cancellationFeeResult: CancellationFeeResult | null = null;
-    let refundAmount: Prisma.Decimal;
-    let cancellationFee: Prisma.Decimal;
-    let toOtherParty: Prisma.Decimal;
-    let toPlatform: Prisma.Decimal;
-    let cancellationFeePercentage: number = 0;
-
-    if (amount) {
-      // Partial refund - no cancellation fee
-      refundAmount = new Prisma.Decimal(amount.toString());
-      cancellationFee = new Prisma.Decimal('0.00');
-      toOtherParty = new Prisma.Decimal('0.00');
-      toPlatform = new Prisma.Decimal('0.00');
-    } else {
-      // Full refund with cancellation fee
-      cancellationFeeResult = await calculateRefundWithCancellationFee({
-        amount: originalAmount,
-        taskStartDate,
-        cancelledAt,
-        cancelledBy,
-        assignedAt,
-        feeBaseAmount,
-      });
-
-      refundAmount = cancellationFeeResult.refundAmount;
-      cancellationFee = cancellationFeeResult.cancellationFee;
-      toOtherParty = cancellationFeeResult.toOtherParty;
-      toPlatform = cancellationFeeResult.toPlatform;
-      cancellationFeePercentage = cancellationFeeResult.cancellationFeePercentage;
-    }
+    const escrowAmountRupees = postgresEscrow.amountInRupees;
 
     const paymentFetch = await getPaymentDetails(razorpayPaymentId);
     if (!paymentFetch.success || !paymentFetch.payment) {
@@ -201,6 +168,54 @@ export async function processRefund(params: {
     const maxRefundablePaise = capturedPaise - alreadyRefunded;
     if (!Number.isFinite(maxRefundablePaise) || maxRefundablePaise <= 0) {
       return { success: false, error: 'No capturable balance left to refund on this payment' };
+    }
+
+    /** Actual INR captured on Razorpay (task + platform fee + GST, etc.) */
+    const capturedRupees = new Prisma.Decimal((capturedPaise / 100).toFixed(2));
+
+    // Calculate cancellation fee and refund amount (use live capture, not only escrow row)
+    let cancellationFeeResult: CancellationFeeResult | null = null;
+    let refundAmount: Prisma.Decimal;
+    let cancellationFee: Prisma.Decimal;
+    let toOtherParty: Prisma.Decimal;
+    let toPlatform: Prisma.Decimal;
+    let cancellationFeePercentage: number = 0;
+
+    if (amount) {
+      // Partial refund - no cancellation fee
+      refundAmount = new Prisma.Decimal(amount.toString());
+      cancellationFee = new Prisma.Decimal('0.00');
+      toOtherParty = new Prisma.Decimal('0.00');
+      toPlatform = new Prisma.Decimal('0.00');
+    } else if (cancelledBy === 'performer') {
+      // Tasker cancel: poster gets the full Razorpay capture back. Policy fee is recovered via
+      // performer penalty (future payouts), not by withholding from the refund.
+      refundAmount = new Prisma.Decimal((maxRefundablePaise / 100).toFixed(2));
+      cancellationFee = new Prisma.Decimal('0.00');
+      toOtherParty = new Prisma.Decimal('0.00');
+      toPlatform = new Prisma.Decimal('0.00');
+      cancellationFeePercentage = 0;
+      logger.info('Performer cancel: full capturable refund to poster', {
+        razorpayPaymentId,
+        maxRefundablePaise,
+        refundAmount: refundAmount.toString(),
+      });
+    } else {
+      // Poster cancel: time-based cancellation fee may reduce refund
+      cancellationFeeResult = await calculateRefundWithCancellationFee({
+        amount: capturedRupees,
+        taskStartDate,
+        cancelledAt,
+        cancelledBy,
+        assignedAt,
+        feeBaseAmount,
+      });
+
+      refundAmount = cancellationFeeResult.refundAmount;
+      cancellationFee = cancellationFeeResult.cancellationFee;
+      toOtherParty = cancellationFeeResult.toOtherParty;
+      toPlatform = cancellationFeeResult.toPlatform;
+      cancellationFeePercentage = cancellationFeeResult.cancellationFeePercentage;
     }
 
     let refundAmountInPaise = Math.round(parseFloat(refundAmount.toString()) * 100);
@@ -310,7 +325,8 @@ export async function processRefund(params: {
             metadata: {
               refundId,
               razorpayRefundId: razorpayRefund.id,
-              originalAmount: originalAmount.toString(),
+              originalAmount: capturedRupees.toString(),
+              escrowAmountInRupees: escrowAmountRupees.toString(),
               refundAmount: refundAmount.toString(),
               cancellationFee: cancellationFee.toString(),
               toOtherParty: toOtherParty.toString(),

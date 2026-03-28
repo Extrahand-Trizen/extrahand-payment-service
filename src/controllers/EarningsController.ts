@@ -2,6 +2,7 @@ import { Response, Request } from 'express';
 import { getUserEarnings, getEarningsByPeriod, getEarningsStats } from '../services/earningsService';
 import { getPendingPenaltySummary } from '../services/performerPenaltyService';
 import { BadRequestError } from '../errors/AppError';
+import logger from '../config/logger';
 
 export class EarningsController {
   /**
@@ -10,6 +11,7 @@ export class EarningsController {
    */
   /**
    * GET /api/v1/earnings/:userId/pending-cancellation-penalties
+   * Always returns 200 on recoverable errors so clients (e.g. profile payments) can still load transactions.
    */
   static async getPendingCancellationPenalties(req: Request, res: Response): Promise<void> {
     const { userId } = req.params;
@@ -21,7 +23,16 @@ export class EarningsController {
     const result = await getPendingPenaltySummary(userId);
 
     if (!result.success) {
-      throw new Error(result.error || 'Failed to load penalties');
+      logger.warn('[EarningsController] pending-cancellation-penalties fallback', {
+        userId,
+        error: result.error,
+      });
+      res.status(200).json({
+        success: true,
+        totalRemaining: '0',
+        items: [],
+      });
+      return;
     }
 
     res.json({

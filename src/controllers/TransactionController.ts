@@ -55,7 +55,7 @@ export class TransactionController {
    */
   static async getTransactionSummary(req: Request, res: Response): Promise<void> {
     const { userId } = req.params;
-    const { startDate, endDate } = req.query;
+    const { startDate, endDate, linkedUserIds } = req.query;
 
     if (!userId) {
       throw new BadRequestError('User ID is required');
@@ -63,8 +63,15 @@ export class TransactionController {
 
     const start = startDate ? new Date(startDate as string) : undefined;
     const end = endDate ? new Date(endDate as string) : undefined;
+    const linkedParsed =
+      typeof linkedUserIds === 'string' && linkedUserIds.trim()
+        ? linkedUserIds
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : undefined;
 
-    const result = await getTransactionSummary(userId, start, end);
+    const result = await getTransactionSummary(userId, start, end, linkedParsed);
 
     if (!result.success) {
       throw new Error(result.error || 'Failed to get transaction summary');

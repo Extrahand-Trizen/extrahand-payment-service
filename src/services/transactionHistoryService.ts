@@ -397,7 +397,8 @@ export async function getUserTransactions(
 export async function getTransactionSummary(
   userId: string,
   startDate?: Date,
-  endDate?: Date
+  endDate?: Date,
+  linkedUserIds?: string[]
 ): Promise<{
   success: boolean;
   summary?: {
@@ -416,7 +417,8 @@ export async function getTransactionSummary(
     const transactionsResult = await getUserTransactions(userId, {
       limit: 10000, // Get all for summary
       startDate,
-      endDate
+      endDate,
+      linkedUserIds,
     });
 
     if (!transactionsResult.success || !transactionsResult.transactions) {

@@ -1,5 +1,6 @@
 import { Response, Request } from 'express';
 import { getUserEarnings, getEarningsByPeriod, getEarningsStats } from '../services/earningsService';
+import { getPendingPenaltySummary } from '../services/performerPenaltyService';
 import { BadRequestError } from '../errors/AppError';
 
 export class EarningsController {
@@ -7,6 +8,29 @@ export class EarningsController {
    * GET /api/v1/earnings/:userId
    * Get total earnings for a user
    */
+  /**
+   * GET /api/v1/earnings/:userId/pending-cancellation-penalties
+   */
+  static async getPendingCancellationPenalties(req: Request, res: Response): Promise<void> {
+    const { userId } = req.params;
+
+    if (!userId) {
+      throw new BadRequestError('User ID is required');
+    }
+
+    const result = await getPendingPenaltySummary(userId);
+
+    if (!result.success) {
+      throw new Error(result.error || 'Failed to load penalties');
+    }
+
+    res.json({
+      success: true,
+      totalRemaining: result.totalRemaining || '0',
+      items: result.items || [],
+    });
+  }
+
   static async getEarnings(req: Request, res: Response): Promise<void> {
     const { userId } = req.params;
 

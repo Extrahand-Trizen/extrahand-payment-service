@@ -170,6 +170,7 @@ export class PaymentController {
       taskStartDate,
       assignedAt,
       feeBaseAmount,
+      taskTitle,
     } = req.body;
 
     const taskStart = taskStartDate ? new Date(taskStartDate) : undefined;
@@ -189,6 +190,7 @@ export class PaymentController {
         taskStartDate: taskStart,
         assignedAt: assignedAtDate,
         feeBaseAmount: feeBaseToPass,
+        taskTitle: typeof taskTitle === 'string' ? taskTitle : undefined,
       });
     } else if (escrowId) {
       result = await cancelEscrow({
@@ -199,6 +201,7 @@ export class PaymentController {
         taskStartDate: taskStart,
         assignedAt: assignedAtDate,
         feeBaseAmount: feeBaseToPass,
+        taskTitle: typeof taskTitle === 'string' ? taskTitle : undefined,
       });
     } else if (taskId) {
       result = await cancelEscrowByTaskId({
@@ -209,6 +212,7 @@ export class PaymentController {
         taskStartDate: taskStart,
         assignedAt: assignedAtDate,
         feeBaseAmount: feeBaseToPass,
+        taskTitle: typeof taskTitle === 'string' ? taskTitle : undefined,
       });
     } else {
       throw new BadRequestError('Either razorpayOrderId, escrowId, or taskId is required');

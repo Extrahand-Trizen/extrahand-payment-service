@@ -15,6 +15,15 @@ const router = express.Router();
 router.use(serviceAuthMiddleware);
 
 /**
+ * GET /api/v1/earnings/:userId/pending-cancellation-penalties
+ * Pending tasker cancellation penalties (deducted from next payouts)
+ */
+router.get(
+  '/:userId/pending-cancellation-penalties',
+  asyncHandler(EarningsController.getPendingCancellationPenalties)
+);
+
+/**
  * GET /api/v1/earnings/:userId
  * Get total earnings for a user
  */

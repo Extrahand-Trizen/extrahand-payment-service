@@ -5,7 +5,7 @@ import { Prisma } from '@prisma/client';
 export interface Transaction {
   id: string;
   transactionId: string;
-  type: 'payment' | 'payout' | 'refund' | 'compensation' | 'fee' | 'escrow';
+  type: 'payment' | 'payout' | 'refund' | 'compensation' | 'fee' | 'escrow' | 'cancellation_penalty';
   amount: string;
   status: string;
   description?: string;
@@ -218,6 +218,45 @@ export async function getUserTransactions(
       });
     });
 
+    // Tasker cancellation penalties (pending recovery from future payouts)
+    if (!typeFilter || typeFilter === 'cancellation_penalty') {
+      const penalties = await prisma.performerCancellationPenalty.findMany({
+        where: {
+          performerUid: userId,
+          status: 'pending',
+          remainingAmount: { gt: new Prisma.Decimal(0) },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: fetchLimit,
+      });
+
+      penalties.forEach((pen) => {
+        transactions.push({
+          id: pen.id,
+          transactionId: pen.penaltyId,
+          type: 'cancellation_penalty',
+          amount: pen.remainingAmount.toString(),
+          status: 'pending',
+          description: pen.taskTitle
+            ? `Cancellation penalty — ${pen.taskTitle}`
+            : `Cancellation penalty for task ${pen.taskId}`,
+          date: pen.cancelledAt.toISOString(),
+          relatedEntityId: pen.penaltyId,
+          category: 'payments',
+          metadata: {
+            taskId: pen.taskId,
+            taskTitle: pen.taskTitle,
+            penaltyId: pen.penaltyId,
+            originalPenaltyAmount: pen.amount.toString(),
+            remainingAmount: pen.remainingAmount.toString(),
+            feePercentage: pen.feePercentage?.toString(),
+            reason: pen.reason,
+            escrowStatus: 'pending_penalty',
+          },
+        });
+      });
+    }
+
     // Include payouts that are not linked to an escrow (RazorpayX-only flow)
     if (!typeFilter || typeFilter === 'payout') {
       const standalonePayouts = await prisma.payout.findMany({
@@ -239,6 +278,10 @@ export async function getUserTransactions(
       });
 
       standalonePayouts.forEach((payout) => {
+        const pm =
+          payout.metadata && typeof payout.metadata === 'object' && !Array.isArray(payout.metadata)
+            ? (payout.metadata as Record<string, unknown>)
+            : {};
         transactions.push({
           id: payout.id,
           transactionId: payout.payoutId,
@@ -255,6 +298,7 @@ export async function getUserTransactions(
             gstOnCommission: payout.gstOnCommission.toString(),
             tds: payout.tds?.toString() || '0',
             netAmount: payout.netAmount.toString(),
+            ...pm,
           },
         });
       });

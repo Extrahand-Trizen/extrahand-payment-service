@@ -130,9 +130,10 @@ model Payout {
   netAmount          Decimal   @db.Decimal(12, 2) // Amount after all fees
   bankTransferId     String? // Mock bank transfer ID
   status             String // pending, processing, completed, failed
-  type               String // release, cancellation_compensation
+  type               String // release, cancellation_compensation, task_completion
   description        String?
   errorMessage       String?
+  metadata           Json? // penalty deductions, gross vs net, etc.
   createdAt          DateTime  @default(now())
   updatedAt          DateTime  @updatedAt
   completedAt        DateTime?
@@ -143,6 +144,29 @@ model Payout {
   @@index([escrowId])
   @@index([performerUid])
   @@index([status])
+  @@index([createdAt])
+}
+
+// Tasker cancellation penalty — recovered from future RazorpayX payouts
+model PerformerCancellationPenalty {
+  id               String   @id @default(uuid())
+  penaltyId        String   @unique
+  performerUid     String
+  taskId           String
+  escrowId         String?
+  amount           Decimal  @db.Decimal(12, 2)
+  remainingAmount  Decimal  @db.Decimal(12, 2)
+  status           String // pending, applied
+  feePercentage    Decimal? @db.Decimal(8, 6)
+  cancelledAt      DateTime
+  reason           String?
+  taskTitle        String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+  appliedAt        DateTime?
+
+  @@index([performerUid, status])
+  @@index([taskId])
   @@index([createdAt])
 }
 

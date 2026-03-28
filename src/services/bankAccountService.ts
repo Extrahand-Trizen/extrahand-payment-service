@@ -8,6 +8,16 @@ function maskAccountNumber(accountNumber: string): string {
   return `XXXX${accountNumber.slice(-4)}`;
 }
 
+function maskAccountHolderName(name: string): string {
+  const v = (name || '').trim();
+  if (!v) return v;
+  const parts = v.split(/\s+/).filter(Boolean);
+  const first = parts[0] || '';
+  const lastInitial = parts.length > 1 ? parts[parts.length - 1]?.[0] : '';
+  const firstMasked = first.length <= 2 ? first[0] + '*' : first.slice(0, 2) + '*'.repeat(Math.min(6, first.length - 2));
+  return lastInitial ? `${firstMasked} ${lastInitial}.` : firstMasked;
+}
+
 async function processPendingPayoutsAfterBankAdd(userId: string): Promise<void> {
   return processPendingTaskCompletionPayouts(userId)
     .then((result) => {
@@ -48,6 +58,7 @@ export async function upsertTaskerBankAccount(params: {
     const maskedAccountNumber = maskAccountNumber(accountNumber);
     const ifscCode = params.ifscCode.trim().toUpperCase();
     const accountHolderName = params.accountHolderName.trim();
+    const maskedAccountHolderName = maskAccountHolderName(accountHolderName);
 
     if (!accountNumber || !ifscCode || !accountHolderName) {
       return { success: false, error: 'accountNumber, ifscCode and accountHolderName are required' };
@@ -73,11 +84,12 @@ export async function upsertTaskerBankAccount(params: {
     const created = await prisma.bankAccount.create({
       data: {
         userId: params.userId,
-        // Store only masked account number; never persist full account number.
+        // Tokenization-first: never persist raw bank details. Store only masked display values + Razorpay tokens.
         accountNumber: maskedAccountNumber,
+        // IFSC is intentionally stored fully (industry-standard display/operational format).
         ifscCode,
-        accountHolderName,
-        bankName: 'Unknown Bank',
+        accountHolderName: maskedAccountHolderName,
+        bankName: params.bankName?.trim() || 'Unknown Bank',
         isVerified: true,
         verifiedAt: new Date(),
         verificationRef,

@@ -224,6 +224,14 @@ export async function getUserTransactions(
       escrow.payouts.forEach((payout) => {
         if ((!typeFilter || typeFilter === 'payout') && uidList.includes(payout.performerUid)) {
           // Always add payout transactions when user is the performer (they earned)
+          
+          // Extract penalty information from payout metadata
+          const payoutMetadata = payout.metadata && typeof payout.metadata === 'object' && !Array.isArray(payout.metadata)
+            ? (payout.metadata as Record<string, any>)
+            : {};
+          const penaltyDeducted = payoutMetadata.penaltyDeducted || '0.00';
+          const penaltyLines = Array.isArray(payoutMetadata.penaltyLines) ? payoutMetadata.penaltyLines : [];
+          
           transactions.push({
             id: payout.id,
             transactionId: payout.payoutId,
@@ -241,6 +249,9 @@ export async function getUserTransactions(
               gstOnCommission: payout.gstOnCommission.toString(),
               tds: payout.tds?.toString() || '0',
               netAmount: payout.netAmount.toString(),
+              penaltyDeducted: penaltyDeducted,
+              penaltyLines: penaltyLines,
+              penaltiesAppliedAt: payoutMetadata.penaltiesAppliedAt || null,
               // Add task-related info if available (metadata is JSON, so we need to check type)
               ...(escrow.metadata && typeof escrow.metadata === 'object' && !Array.isArray(escrow.metadata)
                 ? {

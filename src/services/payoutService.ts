@@ -1146,12 +1146,23 @@ export async function getPayoutStatus(payoutId: string): Promise<{
     const updatedPayout =
       (payout.type === 'task_completion' ? await prisma.payout.findUnique({ where: { payoutId } }) : payout) || payout;
 
+    // Extract penalty information from metadata
+    const metadata = updatedPayout.metadata && typeof updatedPayout.metadata === 'object' && !Array.isArray(updatedPayout.metadata)
+      ? (updatedPayout.metadata as Record<string, unknown>)
+      : {};
+    const penaltyDeducted = typeof metadata.penaltyDeducted === 'string' ? metadata.penaltyDeducted : '0.00';
+    const penaltyLines = Array.isArray(metadata.penaltyLines) ? metadata.penaltyLines : [];
+    const penaltiesAppliedAt = typeof metadata.penaltiesAppliedAt === 'string' ? metadata.penaltiesAppliedAt : null;
+
     return {
       success: true,
       payout: {
         payoutId: updatedPayout.payoutId,
         amount: updatedPayout.amount.toString(),
         netAmount: updatedPayout.netAmount.toString(),
+        penaltyDeducted: penaltyDeducted,
+        penaltyLines: penaltyLines,
+        penaltiesAppliedAt: penaltiesAppliedAt,
         fees: {
           platformCommission: updatedPayout.platformCommission.toString(),
           gstOnCommission: updatedPayout.gstOnCommission.toString(),

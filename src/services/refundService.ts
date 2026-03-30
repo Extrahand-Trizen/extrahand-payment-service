@@ -207,19 +207,19 @@ export async function processRefund(params: {
       toOtherParty = new Prisma.Decimal('0.00');
       toPlatform = new Prisma.Decimal('0.00');
     } else if (cancelledBy === 'performer') {
-      // Tasker cancel: poster gets the task amount back (not platform fee or GST)
-      // Platform fee and GST are retained; performer penalty handles policy enforcement
-      const performerRefundAmount = refundTaskBase;
+      // Tasker cancel: poster gets full captured amount back (includes platform fee + GST)
+      // Policy penalty is recovered from performer's future payouts.
+      const performerRefundAmount = new Prisma.Decimal((maxRefundablePaise / 100).toFixed(2));
       
       refundAmount = performerRefundAmount;
       cancellationFee = new Prisma.Decimal('0.00');
       toOtherParty = new Prisma.Decimal('0.00');
       toPlatform = new Prisma.Decimal('0.00');
       cancellationFeePercentage = 0;
-      logger.info('Performer cancel: task amount refund to poster', {
+      logger.info('Performer cancel: full captured refund to poster', {
         razorpayPaymentId,
-        taskAmount: performerRefundAmount.toString(),
-        platformFeeRetained: capturedRupees.sub(performerRefundAmount).toString(),
+        refundAmount: performerRefundAmount.toString(),
+        includesPlatformFeeAndGst: true,
       });
     } else {
       // Poster cancel: time-based cancellation fee may reduce refund

@@ -496,9 +496,6 @@ export async function getEscrowByTaskId(taskId: string): Promise<any | null> {
     const postgresEscrow = await prisma.escrow.findFirst({
       where: {
         taskId,
-        status: {
-          in: ['pending', 'held'],
-        },
       },
       orderBy: {
         createdAt: 'desc', // Get most recent escrow for the task

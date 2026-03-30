@@ -14,6 +14,7 @@ import { prisma } from '../config/prisma';
 import { Prisma } from '@prisma/client';
 import { updateUserPaymentProfile } from './userPaymentProfileService';
 import { createRazorpayXPayout, getRazorpayXPayoutStatus } from './razorpayxService';
+import { applyPenaltyLinesInTx, planPenaltyDeductionsFromGross } from './performerPenaltyService';
 
 /**
  * Generate unique payout ID
@@ -813,52 +814,149 @@ export async function processTaskCompletionPayout(params: {
     }
 
     const grossAmount = new Prisma.Decimal(amount.toString());
-    // For task-completion payouts, tasker must receive the exact task budget amount.
-    const netAmount = grossAmount;
+    const penaltyPlan = await planPenaltyDeductionsFromGross(performerUid, grossAmount);
+    const netAmount = penaltyPlan.netTransfer;
+    const totalPenaltyDeducted = penaltyPlan.totalDeducted;
     const platformCommission = new Prisma.Decimal(0);
     const gstOnCommission = new Prisma.Decimal(0);
     const tds = new Prisma.Decimal(0);
+    const penaltyLinesMetadata = penaltyPlan.lines.map((line) => ({
+      penaltyDbId: line.penaltyDbId,
+      penaltyId: line.penaltyId,
+      taskId: line.taskId,
+      applied: line.applied.toString(),
+      remainingAfter: line.remainingAfter.toString(),
+    }));
+
+    if (totalPenaltyDeducted.gt(0)) {
+      logger.info('Applying pending cancellation penalties to task completion payout', {
+        performerUid,
+        taskId,
+        grossAmount: grossAmount.toString(),
+        deducted: totalPenaltyDeducted.toString(),
+        netTransfer: netAmount.toString(),
+        deductionCount: penaltyPlan.lines.length,
+      });
+    }
 
     // RazorpayX narration max length is 30 chars.
     const payoutNarration = `Task ${taskId.slice(-8)} payout`;
 
-    const payoutResponse = await createRazorpayXPayout({
-      fundAccountId,
-      amountInPaise: Math.round(parseFloat(netAmount.toString()) * 100),
-      referenceId: `task_${taskId}`,
-      narration: payoutNarration,
-    });
+    const metadataPayload = {
+      taskId,
+      taskTitle,
+      grossAmount: grossAmount.toString(),
+      penaltyDeducted: totalPenaltyDeducted.toString(),
+      penaltyLines: penaltyLinesMetadata,
+      penaltiesAppliedAt: null as string | null,
+    };
 
-    const status = mapRazorpayPayoutStatusToInternal(payoutResponse.status);
-    const completedAt = status === 'completed' ? new Date() : null;
+    let payoutId = '';
+    let status: string = 'completed';
 
-    await prisma.payout.create({
-      data: {
-        payoutId: payoutResponse.id,
-        escrowId: null,
-        performerUid,
-        amount: grossAmount,
-        netAmount,
-        platformCommission,
-        gstOnCommission,
-        tds,
-        bankTransferId: payoutResponse.id,
-        status,
-        type: 'task_completion',
-        description: duplicateDescription,
-        completedAt: completedAt || undefined,
-        errorMessage:
-          status === 'failed' || status === 'reversed'
-            ? payoutResponse.failureReason || 'Payout failed'
-            : undefined,
-      },
-    });
+    if (netAmount.lte(0)) {
+      payoutId = `payout_penalty_only_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+      status = 'completed';
+
+      await prisma.$transaction(async (tx) => {
+        await tx.payout.create({
+          data: {
+            payoutId,
+            escrowId: null,
+            performerUid,
+            amount: grossAmount,
+            netAmount,
+            platformCommission,
+            gstOnCommission,
+            tds,
+            bankTransferId: null,
+            status,
+            type: 'task_completion',
+            description: `${duplicateDescription} (fully adjusted against pending cancellation penalties)`,
+            completedAt: new Date(),
+            metadata: {
+              ...metadataPayload,
+              penaltiesAppliedAt: new Date().toISOString(),
+              noBankTransfer: true,
+            } as any,
+          },
+        });
+        if (penaltyPlan.lines.length > 0) {
+          await applyPenaltyLinesInTx(tx, penaltyPlan.lines);
+        }
+      });
+    } else {
+      const payoutResponse = await createRazorpayXPayout({
+        fundAccountId,
+        amountInPaise: Math.round(parseFloat(netAmount.toString()) * 100),
+        referenceId: `task_${taskId}`,
+        narration: payoutNarration,
+      });
+
+      payoutId = payoutResponse.id;
+      status = mapRazorpayPayoutStatusToInternal(payoutResponse.status);
+      const completedAt = status === 'completed' ? new Date() : null;
+
+      if (status === 'completed' && penaltyPlan.lines.length > 0) {
+        await prisma.$transaction(async (tx) => {
+          await tx.payout.create({
+            data: {
+              payoutId,
+              escrowId: null,
+              performerUid,
+              amount: grossAmount,
+              netAmount,
+              platformCommission,
+              gstOnCommission,
+              tds,
+              bankTransferId: payoutResponse.id,
+              status,
+              type: 'task_completion',
+              description: duplicateDescription,
+              completedAt: completedAt || undefined,
+              errorMessage:
+                status === 'failed' || status === 'reversed'
+                  ? payoutResponse.failureReason || 'Payout failed'
+                  : undefined,
+              metadata: {
+                ...metadataPayload,
+                penaltiesAppliedAt: new Date().toISOString(),
+              } as any,
+            },
+          });
+          await applyPenaltyLinesInTx(tx, penaltyPlan.lines);
+        });
+      } else {
+        await prisma.payout.create({
+          data: {
+            payoutId,
+            escrowId: null,
+            performerUid,
+            amount: grossAmount,
+            netAmount,
+            platformCommission,
+            gstOnCommission,
+            tds,
+            bankTransferId: payoutResponse.id,
+            status,
+            type: 'task_completion',
+            description: duplicateDescription,
+            completedAt: completedAt || undefined,
+            errorMessage:
+              status === 'failed' || status === 'reversed'
+                ? payoutResponse.failureReason || 'Payout failed'
+                : undefined,
+            metadata: metadataPayload as any,
+          },
+        });
+      }
+    }
 
     if (status === 'completed') {
       updateUserPaymentProfile(performerUid, {
         type: 'payout',
         amount: netAmount,
-        payoutId: payoutResponse.id,
+        payoutId,
       }).catch((error) => {
         logger.warn('Failed to update UserPaymentProfile after task completion payout', error);
       });
@@ -867,12 +965,14 @@ export async function processTaskCompletionPayout(params: {
     return {
       success: true,
       payout: {
-        payoutId: payoutResponse.id,
+        payoutId,
         taskId,
         taskTitle,
         amount: grossAmount.toString(),
         netAmount: netAmount.toString(),
         status,
+        penaltyDeducted: totalPenaltyDeducted.toString(),
+        penaltyLines: penaltyLinesMetadata,
         fees: {
           platformCommission: platformCommission.toString(),
           gstOnCommission: gstOnCommission.toString(),
@@ -943,6 +1043,52 @@ export async function getPayoutStatus(payoutId: string): Promise<{
 
           // Keep cached earnings in sync once Razorpay indicates completion.
           if (internalStatus === 'completed') {
+            const md =
+              payout.metadata && typeof payout.metadata === 'object' && !Array.isArray(payout.metadata)
+                ? (payout.metadata as Record<string, unknown>)
+                : {};
+            const penaltiesAppliedAt =
+              typeof md.penaltiesAppliedAt === 'string' ? md.penaltiesAppliedAt : null;
+            const penaltyLinesRaw = Array.isArray(md.penaltyLines) ? md.penaltyLines : [];
+
+            if (!penaltiesAppliedAt && penaltyLinesRaw.length > 0) {
+              const txLines = penaltyLinesRaw
+                .map((line) => {
+                  if (!line || typeof line !== 'object') return null;
+                  const row = line as Record<string, unknown>;
+                  if (
+                    typeof row.penaltyDbId !== 'string' ||
+                    typeof row.penaltyId !== 'string' ||
+                    typeof row.taskId !== 'string'
+                  ) {
+                    return null;
+                  }
+                  return {
+                    penaltyDbId: row.penaltyDbId,
+                    penaltyId: row.penaltyId,
+                    taskId: row.taskId,
+                    applied: new Prisma.Decimal(String(row.applied || '0')),
+                    remainingAfter: new Prisma.Decimal(String(row.remainingAfter || '0')),
+                  };
+                })
+                .filter((x): x is { penaltyDbId: string; penaltyId: string; taskId: string; applied: Prisma.Decimal; remainingAfter: Prisma.Decimal } => Boolean(x));
+
+              if (txLines.length > 0) {
+                await prisma.$transaction(async (tx) => {
+                  await applyPenaltyLinesInTx(tx, txLines);
+                  await tx.payout.update({
+                    where: { id: payout.id },
+                    data: {
+                      metadata: {
+                        ...md,
+                        penaltiesAppliedAt: new Date().toISOString(),
+                      } as any,
+                    },
+                  });
+                });
+              }
+            }
+
             updateUserPaymentProfile(payout.performerUid, {
               type: 'payout',
               amount: payout.netAmount,

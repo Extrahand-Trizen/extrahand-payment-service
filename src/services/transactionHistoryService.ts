@@ -213,6 +213,7 @@ export async function getUserTransactions(
             latestRefundAmount: latestRefund?.refundAmount?.toString() || '0',
             latestRefundStatus: latestRefund?.status || null,
             latestCancellationFee: latestRefund?.cancellationFee?.toString() || '0',
+            latestCancelledBy: latestRefund?.cancelledBy || null,
             appliedPlatformFeePercent: configuredPlatformPct?.toString() || null,
             appliedGstPercent: configuredGstPct?.toString() || null,
           }

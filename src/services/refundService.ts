@@ -188,27 +188,34 @@ export async function processRefund(params: {
       toOtherParty = new Prisma.Decimal('0.00');
       toPlatform = new Prisma.Decimal('0.00');
     } else if (cancelledBy === 'performer') {
-      // Tasker cancel: poster gets the full Razorpay capture back. Policy fee is recovered via
-      // performer penalty (future payouts), not by withholding from the refund.
-      refundAmount = new Prisma.Decimal((maxRefundablePaise / 100).toFixed(2));
+      // Tasker cancel: poster gets the task amount back (not platform fee or GST)
+      // Platform fee and GST are retained; performer penalty handles policy enforcement
+      const performerRefundAmount = postgresEscrow.taskAmount 
+        ? new Prisma.Decimal(postgresEscrow.taskAmount.toString())
+        : capturedRupees; // Fallback to full capture if taskAmount not stored (legacy)
+      
+      refundAmount = performerRefundAmount;
       cancellationFee = new Prisma.Decimal('0.00');
       toOtherParty = new Prisma.Decimal('0.00');
       toPlatform = new Prisma.Decimal('0.00');
       cancellationFeePercentage = 0;
-      logger.info('Performer cancel: full capturable refund to poster', {
+      logger.info('Performer cancel: task amount refund to poster', {
         razorpayPaymentId,
-        maxRefundablePaise,
-        refundAmount: refundAmount.toString(),
+        taskAmount: performerRefundAmount.toString(),
+        platformFeeRetained: capturedRupees.sub(performerRefundAmount).toString(),
       });
     } else {
       // Poster cancel: time-based cancellation fee may reduce refund
+      // Use taskAmount as feeBaseAmount if available (for refund calculation on task amount only, not fees/GST)
+      const refundFeeBase = feeBaseAmount || (postgresEscrow.taskAmount ? new Prisma.Decimal(postgresEscrow.taskAmount.toString()) : capturedRupees);
+      
       cancellationFeeResult = await calculateRefundWithCancellationFee({
-        amount: capturedRupees,
+        amount: refundFeeBase,  // Calculate fees on task amount, not full capture
         taskStartDate,
         cancelledAt,
         cancelledBy,
         assignedAt,
-        feeBaseAmount,
+        feeBaseAmount: refundFeeBase,
       });
 
       refundAmount = cancellationFeeResult.refundAmount;

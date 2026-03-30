@@ -26,7 +26,8 @@ model Escrow {
   performerUid         String
   amount               Decimal   @db.Decimal(12, 2) // Amount in paise
   currency             String    @default("INR")
-  amountInRupees       Decimal   @db.Decimal(12, 2) // Amount in rupees
+  amountInRupees       Decimal   @db.Decimal(12, 2) // Amount in rupees (task + platform fee + GST)
+  taskAmount           Decimal?  @db.Decimal(12, 2) // Base task amount in rupees (excluding platform fee and GST) - for refund calculation
   status               String // pending, held, released, refunded, cancelled
   razorpayPaymentId    String?
   paymentStatus        String? // pending, authorized, captured, failed

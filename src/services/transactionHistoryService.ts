@@ -179,6 +179,8 @@ export async function getUserTransactions(
       const finalGst = feesAndTaxes.greaterThan(0)
         ? gstAmount
         : new Prisma.Decimal('0');
+      const latestRefund = escrow.refunds
+        .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0];
       const latestCompletedRefund = escrow.refunds
         .filter((refund) => refund.status === 'completed')
         .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0];
@@ -208,6 +210,9 @@ export async function getUserTransactions(
             gstAmount: finalGst.toString(),
             totalPaid: totalPaid.toString(),
             refundedAmount: latestCompletedRefund?.refundAmount?.toString() || '0',
+            latestRefundAmount: latestRefund?.refundAmount?.toString() || '0',
+            latestRefundStatus: latestRefund?.status || null,
+            latestCancellationFee: latestRefund?.cancellationFee?.toString() || '0',
             appliedPlatformFeePercent: configuredPlatformPct?.toString() || null,
             appliedGstPercent: configuredGstPct?.toString() || null,
           }

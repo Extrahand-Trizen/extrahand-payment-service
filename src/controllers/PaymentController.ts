@@ -211,6 +211,18 @@ export class PaymentController {
       taskTitle,
     } = req.body;
 
+    logger.info('[PaymentController.cancelPayment] Request received', {
+      razorpayOrderId,
+      escrowId,
+      taskId,
+      cancelledBy,
+      taskStartDate,
+      assignedAt,
+      feeBaseAmount,
+      hasReason: Boolean(reason),
+      userId,
+    });
+
     const taskStart = taskStartDate ? new Date(taskStartDate) : undefined;
     const assignedAtDate = assignedAt ? new Date(assignedAt) : undefined;
     const feeBaseParsed =
@@ -257,6 +269,13 @@ export class PaymentController {
     }
 
     if (!result.success) {
+      logger.error('[PaymentController.cancelPayment] Cancel/refund failed', {
+        razorpayOrderId,
+        escrowId,
+        taskId,
+        cancelledBy,
+        error: result.error,
+      });
       throw new Error(result.error || 'Failed to cancel payment');
     }
 
@@ -270,6 +289,16 @@ export class PaymentController {
     if ('refund' in result && result.refund) {
       response.refund = result.refund;
     }
+
+    logger.info('[PaymentController.cancelPayment] Cancel/refund completed', {
+      razorpayOrderId,
+      escrowId,
+      taskId,
+      cancelledBy,
+      cancelled: result.cancelled,
+      refundRequired: result.refundRequired,
+      refund: 'refund' in result ? result.refund : undefined,
+    });
 
     res.json(response);
   }

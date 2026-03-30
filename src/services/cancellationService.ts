@@ -78,19 +78,20 @@ export async function cancelPayment(params: {
       return { success: false, error: 'Cannot cancel - escrow already released' };
     }
 
-    // Check if payment was captured
-    const paymentCaptured = 
-      postgresEscrow.paymentStatus === 'captured' || 
-      postgresEscrow.status === 'held';
+    // Attempt refund whenever a Razorpay payment exists.
+    // Capture/status flags can be stale; refund service validates capturable amount safely.
+    const canAttemptRefund = Boolean(postgresEscrow.razorpayPaymentId);
 
     let razorpayCancelled = false;
     let refundRequired = false;
 
-    // If payment was captured, we need to process a refund
-    if (paymentCaptured && postgresEscrow.razorpayPaymentId) {
-      logger.info('💰 Payment was captured - processing refund automatically', {
+    // If a payment exists, try refund automatically
+    if (canAttemptRefund && postgresEscrow.razorpayPaymentId) {
+      logger.info('💰 Payment exists - attempting refund automatically', {
         razorpayOrderId,
         razorpayPaymentId: postgresEscrow.razorpayPaymentId,
+        paymentStatus: postgresEscrow.paymentStatus,
+        escrowStatus: postgresEscrow.status,
       });
       refundRequired = true;
       
@@ -149,6 +150,9 @@ export async function cancelPayment(params: {
             razorpayOrderId,
             error: refundResult.error,
           });
+          if ((refundResult.error || '').toLowerCase().includes('no capturable balance')) {
+            refundRequired = false;
+          }
           // Continue with cancellation even if refund fails
           // The escrow will be marked as cancelled, and refund can be processed manually later
         }

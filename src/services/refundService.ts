@@ -264,14 +264,36 @@ export async function processRefund(params: {
       refundAmountInPaise = maxRefundablePaise;
     }
 
+    logger.info('[RefundService.processRefund] Calling Razorpay refund API', {
+      razorpayOrderId,
+      razorpayPaymentId,
+      refundAmountInPaise,
+      refundAmountRupees: (refundAmountInPaise / 100).toFixed(2),
+      maxRefundablePaise,
+      cancelledBy,
+    });
+
     const razorpayRefundResult = await createRefundAmountPaise(razorpayPaymentId, refundAmountInPaise);
 
     if (!razorpayRefundResult.success || !razorpayRefundResult.refund) {
-      logger.error('❌ Failed to create Razorpay refund:', razorpayRefundResult.error);
+      logger.error('❌ Failed to create Razorpay refund:', {
+        razorpayOrderId,
+        razorpayPaymentId,
+        refundAmountInPaise,
+        error: razorpayRefundResult.error,
+      });
       return { success: false, error: razorpayRefundResult.error || 'Failed to create Razorpay refund' };
     }
 
     const razorpayRefund = razorpayRefundResult.refund;
+    logger.info('[RefundService.processRefund] Razorpay refund API success', {
+      razorpayOrderId,
+      razorpayPaymentId,
+      razorpayRefundId: razorpayRefund.id,
+      razorpayRefundStatus: razorpayRefund.status,
+      razorpayRefundAmountPaise: razorpayRefund.amount,
+      razorpayRefundSpeed: razorpayRefund.speed_processed || razorpayRefund.speed_requested,
+    });
 
     // Sanitize Razorpay refund data
     const sanitizedRefundData = sanitizeRazorpayRefundData(razorpayRefund);

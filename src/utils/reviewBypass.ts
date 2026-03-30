@@ -3,7 +3,7 @@
  * verify-payment accepts synthetic ids for orders flagged reviewBypass (see PaymentController).
  *
  * Configure (payment-service env):
- *   PLAY_REVIEW_BYPASS_PHONES=comma,separated (+919876543210 or 9876543210) — primary for Play review
+ *   PLAY_REVIEW_BYPASS_PHONES=comma,separated — e.g. +919999999999,+918888888888 (poster + tasker test lines)
  *   PLAY_REVIEW_BYPASS_UIDS=comma,separated,firebase_uids — optional legacy
  *
  * Phone bypass: client must pass `posterPhone` in escrow `metadata` (last 10 digits are matched).

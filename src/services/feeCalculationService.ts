@@ -350,16 +350,16 @@ export async function calculateCancellationFee(params: {
       } else if (hoursUntilStart > 24) {
         cancellationFeePercentage = 0;
       } else if (hoursUntilStart > 1) {
-        cancellationFeePercentage = feeStructure.cancellationFees.medium;
+        cancellationFeePercentage = 0.10;
       } else {
-        cancellationFeePercentage = feeStructure.cancellationFees.late;
+        cancellationFeePercentage = 0.20;
       }
     } else if (hoursUntilStart > 24) {
       cancellationFeePercentage = 0;
     } else if (hoursUntilStart > 1) {
-      cancellationFeePercentage = feeStructure.cancellationFees.medium;
+      cancellationFeePercentage = 0.10;
     } else {
-      cancellationFeePercentage = feeStructure.cancellationFees.late;
+      cancellationFeePercentage = 0.20;
     }
   } else {
     // Performer cancel: refund to poster; bands mirror tasker tracking UI

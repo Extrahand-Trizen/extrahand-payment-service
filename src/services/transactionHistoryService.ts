@@ -113,6 +113,53 @@ export async function getUserTransactions(
     escrows.forEach((escrow) => {
       const isPoster = uidList.includes(escrow.posterUid);
       const isPerformer = uidList.includes(escrow.performerUid);
+      const escrowMeta =
+        escrow.metadata && typeof escrow.metadata === 'object' && !Array.isArray(escrow.metadata)
+          ? (escrow.metadata as Record<string, unknown>)
+          : {};
+      const amountBreakdown =
+        escrowMeta.amountBreakdown &&
+        typeof escrowMeta.amountBreakdown === 'object' &&
+        !Array.isArray(escrowMeta.amountBreakdown)
+          ? (escrowMeta.amountBreakdown as Record<string, unknown>)
+          : {};
+      const toDecimal = (value: unknown): Prisma.Decimal | null => {
+        if (value == null) return null;
+        try {
+          return new Prisma.Decimal(String(value));
+        } catch {
+          return null;
+        }
+      };
+      const totalPaid = new Prisma.Decimal(escrow.amountInRupees.toString());
+      const taskAmount =
+        toDecimal(escrow.taskAmount) ||
+        toDecimal(amountBreakdown.taskAmount) ||
+        toDecimal(escrowMeta.taskAmount) ||
+        totalPaid;
+      const platformFee =
+        toDecimal(amountBreakdown.platformFee) ||
+        toDecimal(escrowMeta.platformFee) ||
+        new Prisma.Decimal('0');
+      const gstAmount =
+        toDecimal(amountBreakdown.gst) ||
+        toDecimal(escrowMeta.gstAmount) ||
+        toDecimal(escrowMeta.platformFeeGst) ||
+        new Prisma.Decimal('0');
+      const feesAndTaxes = platformFee.plus(gstAmount);
+      const inferredFeesAndTaxes = totalPaid.minus(taskAmount);
+      const normalizedFeesAndTaxes = inferredFeesAndTaxes.greaterThan(0)
+        ? inferredFeesAndTaxes
+        : new Prisma.Decimal('0');
+      const finalPlatformFee = feesAndTaxes.greaterThan(0)
+        ? platformFee
+        : normalizedFeesAndTaxes;
+      const finalGst = feesAndTaxes.greaterThan(0)
+        ? gstAmount
+        : new Prisma.Decimal('0');
+      const latestCompletedRefund = escrow.refunds
+        .filter((refund) => refund.status === 'completed')
+        .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0];
 
       // Escrow creation (payment) - only show if user is poster (money paid)
       // If user is performer, they'll see the payout instead
@@ -134,6 +181,11 @@ export async function getUserTransactions(
             razorpayOrderId: escrow.razorpayOrderId,
             amountInRupees: escrow.amountInRupees.toString(),
             escrowStatus: escrow.status,
+            taskAmount: taskAmount.toString(),
+            platformFee: finalPlatformFee.toString(),
+            gstAmount: finalGst.toString(),
+            totalPaid: totalPaid.toString(),
+            refundedAmount: latestCompletedRefund?.refundAmount?.toString() || '0',
           }
         });
       }
@@ -201,7 +253,11 @@ export async function getUserTransactions(
                 toPlatform: refund.toPlatform?.toString() || '0',
                 cancelledBy: refund.cancelledBy,
                 reason: refund.reason,
-                originalAmount: escrow.amountInRupees.toString()
+                originalAmount: escrow.amountInRupees.toString(),
+                taskAmount: taskAmount.toString(),
+                platformFee: finalPlatformFee.toString(),
+                gstAmount: finalGst.toString(),
+                totalPaid: totalPaid.toString(),
               }
             });
           } else if (isPerformerCompensation) {
@@ -445,7 +501,9 @@ export async function getTransactionSummary(
           totalPayouts = totalPayouts.plus(amount);
           break;
         case 'refund':
-          totalRefunds = totalRefunds.plus(amount);
+          if (tx.status === 'completed') {
+            totalRefunds = totalRefunds.plus(amount);
+          }
           break;
         case 'compensation':
           totalCompensation = totalCompensation.plus(amount);

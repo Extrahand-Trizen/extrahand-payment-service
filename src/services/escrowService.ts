@@ -129,7 +129,8 @@ export async function createEscrow(params: {
   applicationId?: string;
   posterUid: string;
   performerUid: string;
-  amount: number; // Amount in rupees
+  amount: number; // Amount in rupees (full amount including fees)
+  taskAmount?: number; // Base task amount in rupees (excluding platform fee and GST)
   currency?: string;
   autoReleaseAfterDays?: number;
   taskCategory?: string;
@@ -142,6 +143,7 @@ export async function createEscrow(params: {
       posterUid,
       performerUid,
       amount,
+      taskAmount,
       currency = 'INR',
       autoReleaseAfterDays,
       taskCategory,
@@ -204,6 +206,9 @@ export async function createEscrow(params: {
     // Convert amounts to Prisma Decimal
     const amountDecimal = new Prisma.Decimal(amountInPaise.toString());
     const amountInRupeesDecimal = new Prisma.Decimal(amount.toFixed(2));
+    const taskAmountDecimal = taskAmount 
+      ? new Prisma.Decimal(taskAmount.toFixed(2))
+      : null;
 
     try {
       // Resolve fee structure for this category and snapshot applied percentages
@@ -233,6 +238,7 @@ export async function createEscrow(params: {
           amount: amountDecimal,
           currency,
           amountInRupees: amountInRupeesDecimal,
+          taskAmount: taskAmountDecimal,
           status: 'pending',
           autoReleaseDate: autoReleaseDate,
           razorpayOrderData: sanitizedOrderData as any, // Store sanitized data in JSONB

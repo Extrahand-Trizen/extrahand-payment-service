@@ -46,6 +46,7 @@ export interface CreateEscrowRequest {
   posterUid: string;
   performerUid: string;
   amount: number;
+  taskAmount?: number; // Base task amount for refund calculation
   currency?: string;
   autoReleaseAfterDays?: number;
   taskCategory?: string;

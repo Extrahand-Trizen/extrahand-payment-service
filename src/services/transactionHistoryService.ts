@@ -5,7 +5,7 @@ import { Prisma } from '@prisma/client';
 export interface Transaction {
   id: string;
   transactionId: string;
-  type: 'payment' | 'payout' | 'refund' | 'compensation' | 'fee' | 'escrow';
+  type: 'payment' | 'payout' | 'refund' | 'compensation' | 'fee' | 'escrow' | 'cancellation_penalty';
   amount: string;
   status: string;
   description?: string;
@@ -34,6 +34,8 @@ export async function getUserTransactions(
     type?: Transaction['type'];
     status?: string;
     category?: 'earnings' | 'payments' | 'all'; // Simple filter: earnings (money received) or payments (money spent)
+    /** Extra profile identifiers (e.g. Mongo _id + Firebase uid) so legacy escrows still match */
+    linkedUserIds?: string[];
   }
 ): Promise<{
   success: boolean;
@@ -49,18 +51,28 @@ export async function getUserTransactions(
     const typeFilter = options?.type;
     const statusFilter = options?.status;
     const categoryFilter = options?.category; // New: earnings or payments filter
-    
-    logger.info(`[TransactionHistory] Fetching transactions for user ${userId} with category filter: ${categoryFilter || 'all'}`);
+    const uidList = [
+      ...new Set(
+        [userId, ...(options?.linkedUserIds || [])].filter(
+          (x): x is string => typeof x === 'string' && x.trim().length > 0
+        )
+      ),
+    ];
+
+    logger.info(
+      `[TransactionHistory] Fetching transactions for userIds ${uidList.join(',')} category: ${categoryFilter || 'all'}`
+    );
 
     const transactions: Transaction[] = [];
+
+    if (uidList.length === 0) {
+      return { success: false, error: 'User ID is required' };
+    }
 
     // 1. Get escrows where user is poster or performer
     // Apply database-level filtering for better performance
     const escrowWhere: Prisma.EscrowWhereInput = {
-      OR: [
-        { posterUid: userId },
-        { performerUid: userId }
-      ]
+      OR: [{ posterUid: { in: uidList } }, { performerUid: { in: uidList } }],
     };
 
     if (startDate || endDate) {
@@ -82,9 +94,10 @@ export async function getUserTransactions(
       where: escrowWhere,
       include: {
         payouts: {
-          where: categoryFilter === 'earnings' 
-            ? { performerUid: userId, status: statusFilter || undefined }
-            : undefined,
+          where:
+            categoryFilter === 'earnings'
+              ? { performerUid: { in: uidList }, status: statusFilter || undefined }
+              : undefined,
         },
         refunds: {
           where: statusFilter ? { status: statusFilter } : undefined,
@@ -97,9 +110,9 @@ export async function getUserTransactions(
 
     // Convert escrows to transactions
     // IMPORTANT: Always add all transactions with their correct category, then filter after
-    escrows.forEach(escrow => {
-      const isPoster = escrow.posterUid === userId;
-      const isPerformer = escrow.performerUid === userId;
+    escrows.forEach((escrow) => {
+      const isPoster = uidList.includes(escrow.posterUid);
+      const isPerformer = uidList.includes(escrow.performerUid);
 
       // Escrow creation (payment) - only show if user is poster (money paid)
       // If user is performer, they'll see the payout instead
@@ -119,14 +132,15 @@ export async function getUserTransactions(
             taskId: escrow.taskId,
             role: 'poster',
             razorpayOrderId: escrow.razorpayOrderId,
-            amountInRupees: escrow.amountInRupees.toString()
+            amountInRupees: escrow.amountInRupees.toString(),
+            escrowStatus: escrow.status,
           }
         });
       }
 
       // Payouts from this escrow (money earned)
-      escrow.payouts.forEach(payout => {
-        if ((!typeFilter || typeFilter === 'payout') && payout.performerUid === userId) {
+      escrow.payouts.forEach((payout) => {
+        if ((!typeFilter || typeFilter === 'payout') && uidList.includes(payout.performerUid)) {
           // Always add payout transactions when user is the performer (they earned)
           transactions.push({
             id: payout.id,
@@ -158,10 +172,14 @@ export async function getUserTransactions(
       });
 
       // Refunds from this escrow
-      escrow.refunds.forEach(refund => {
+      escrow.refunds.forEach((refund) => {
         if (!typeFilter || typeFilter === 'refund' || typeFilter === 'compensation') {
-          const isPosterRefund = escrow.posterUid === userId && refund.cancelledBy === 'poster';
-          const isPerformerCompensation = escrow.performerUid === userId && refund.cancelledBy === 'poster' && refund.toOtherParty;
+          // Any refund credited to the poster (regardless of who cancelled the task)
+          const isPosterRefund = uidList.includes(escrow.posterUid);
+          const isPerformerCompensation =
+            uidList.includes(escrow.performerUid) &&
+            refund.cancelledBy === 'poster' &&
+            refund.toOtherParty;
 
           if (isPosterRefund) {
             // Poster gets refund (money back) - this is a payment-related transaction
@@ -212,6 +230,104 @@ export async function getUserTransactions(
         }
       });
     });
+
+    // Tasker cancellation penalties — optional DB features must not break core history
+    if (!typeFilter || typeFilter === 'cancellation_penalty') {
+      try {
+        const penalties = await prisma.performerCancellationPenalty.findMany({
+          where: {
+            performerUid: { in: uidList },
+            status: 'pending',
+            remainingAmount: { gt: new Prisma.Decimal(0) },
+          },
+          orderBy: { createdAt: 'desc' },
+          take: fetchLimit,
+        });
+
+        penalties.forEach((pen) => {
+          transactions.push({
+            id: pen.id,
+            transactionId: pen.penaltyId,
+            type: 'cancellation_penalty',
+            amount: pen.remainingAmount.toString(),
+            status: 'pending',
+            description: pen.taskTitle
+              ? `Cancellation penalty — ${pen.taskTitle}`
+              : `Cancellation penalty for task ${pen.taskId}`,
+            date: pen.cancelledAt.toISOString(),
+            relatedEntityId: pen.penaltyId,
+            category: 'payments',
+            metadata: {
+              taskId: pen.taskId,
+              taskTitle: pen.taskTitle,
+              penaltyId: pen.penaltyId,
+              originalPenaltyAmount: pen.amount.toString(),
+              remainingAmount: pen.remainingAmount.toString(),
+              feePercentage: pen.feePercentage?.toString(),
+              reason: pen.reason,
+              escrowStatus: 'pending_penalty',
+            },
+          });
+        });
+      } catch (penErr: any) {
+        logger.warn('[TransactionHistory] Skipping cancellation_penalty rows', {
+          message: penErr?.message,
+        });
+      }
+    }
+
+    // Include payouts that are not linked to an escrow (RazorpayX-only flow)
+    if (!typeFilter || typeFilter === 'payout') {
+      try {
+        const standalonePayouts = await prisma.payout.findMany({
+          where: {
+            performerUid: { in: uidList },
+            escrowId: null,
+            ...(statusFilter ? { status: statusFilter } : {}),
+            ...(startDate || endDate
+              ? {
+                  createdAt: {
+                    ...(startDate ? { gte: startDate } : {}),
+                    ...(endDate ? { lte: endDate } : {}),
+                  },
+                }
+              : {}),
+          },
+          orderBy: { createdAt: 'desc' },
+          take: fetchLimit,
+        });
+
+        standalonePayouts.forEach((payout) => {
+          const pm =
+            payout.metadata && typeof payout.metadata === 'object' && !Array.isArray(payout.metadata)
+              ? (payout.metadata as Record<string, unknown>)
+              : {};
+          transactions.push({
+            id: payout.id,
+            transactionId: payout.payoutId,
+            type: 'payout',
+            amount: payout.netAmount.toString(),
+            status: payout.status,
+            description: payout.description || 'Task payout credited',
+            date: payout.createdAt.toISOString(),
+            relatedEntityId: payout.payoutId,
+            category: 'earnings',
+            metadata: {
+              grossAmount: payout.amount.toString(),
+              platformCommission: payout.platformCommission.toString(),
+              gstOnCommission: payout.gstOnCommission.toString(),
+              tds: payout.tds?.toString() || '0',
+              netAmount: payout.netAmount.toString(),
+              ...pm,
+            },
+          });
+        });
+      } catch (payoutErr: any) {
+        logger.warn('[TransactionHistory] Skipping standalone payout rows', {
+          message: payoutErr?.message,
+        });
+      }
+    }
 
     // 2. Fees are now hidden - they're already deducted in netAmount
     // Individual fee entries are not shown to keep the UI clean
@@ -281,7 +397,8 @@ export async function getUserTransactions(
 export async function getTransactionSummary(
   userId: string,
   startDate?: Date,
-  endDate?: Date
+  endDate?: Date,
+  linkedUserIds?: string[]
 ): Promise<{
   success: boolean;
   summary?: {
@@ -300,7 +417,8 @@ export async function getTransactionSummary(
     const transactionsResult = await getUserTransactions(userId, {
       limit: 10000, // Get all for summary
       startDate,
-      endDate
+      endDate,
+      linkedUserIds,
     });
 
     if (!transactionsResult.success || !transactionsResult.transactions) {

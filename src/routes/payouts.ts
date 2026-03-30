@@ -21,6 +21,12 @@ router.use(serviceAuthMiddleware);
 router.post('/process', asyncHandler(PayoutController.processPayout));
 
 /**
+ * POST /api/v1/payouts/task-completion
+ * Process payout directly on task completion (non-escrow flow)
+ */
+router.post('/task-completion', asyncHandler(PayoutController.processTaskCompletionPayout));
+
+/**
  * GET /api/v1/payouts/status/:payoutId
  * Get payout status
  */

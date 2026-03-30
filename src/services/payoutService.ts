@@ -13,12 +13,155 @@ import { transferToBank, getBankTransferStatus } from './mockBankTransferService
 import { prisma } from '../config/prisma';
 import { Prisma } from '@prisma/client';
 import { updateUserPaymentProfile } from './userPaymentProfileService';
+import { createRazorpayXPayout, getRazorpayXPayoutStatus } from './razorpayxService';
 
 /**
  * Generate unique payout ID
  */
 function generatePayoutId(): string {
   return `payout_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+}
+
+function parseVerificationRef(ref?: string | null): { fundAccountId?: string } {
+  if (!ref) return {};
+  try {
+    const parsed = JSON.parse(ref);
+    return { fundAccountId: parsed.fundAccountId };
+  } catch {
+    return {};
+  }
+}
+
+function pendingTaskPayoutJobId(taskId: string, performerUid: string): string {
+  return `pending_task_payout_${taskId}_${performerUid}`;
+}
+
+function mapRazorpayPayoutStatusToInternal(razorpayStatus?: string | null): string {
+  const s = String(razorpayStatus || '').toLowerCase();
+
+  if (!s) return 'processing';
+
+  if (s === 'processed' || s === 'completed' || s === 'success') return 'completed';
+  if (s === 'failed' || s === 'failure') return 'failed';
+  if (s === 'reversed') return 'reversed';
+
+  // Common "still in progress" states returned by payout APIs.
+  if (s === 'processing' || s === 'created' || s === 'queued') return 'processing';
+
+  return 'processing';
+}
+
+async function enqueuePendingTaskCompletionPayout(params: {
+  taskId: string;
+  performerUid: string;
+  amount: number;
+  taskTitle?: string;
+}): Promise<void> {
+  const { taskId, performerUid, amount, taskTitle } = params;
+
+  await prisma.jobQueue.upsert({
+    where: { jobId: pendingTaskPayoutJobId(taskId, performerUid) },
+    update: {
+      payload: {
+        taskId,
+        performerUid,
+        amount,
+        taskTitle,
+      },
+      status: 'pending',
+      nextRetryAt: new Date(),
+      updatedAt: new Date(),
+    },
+    create: {
+      jobId: pendingTaskPayoutJobId(taskId, performerUid),
+      jobType: 'task_completion_payout',
+      entityType: 'payout',
+      entityId: taskId,
+      payload: {
+        taskId,
+        performerUid,
+        amount,
+        taskTitle,
+      },
+      nextRetryAt: new Date(),
+      status: 'pending',
+      priority: 5,
+    },
+  });
+}
+
+export async function processPendingTaskCompletionPayouts(
+  performerUid: string
+): Promise<{ processed: number; failed: number }> {
+  const jobs = await prisma.jobQueue.findMany({
+    where: {
+      jobType: 'task_completion_payout',
+      status: 'pending',
+      payload: {
+        path: ['performerUid'],
+        equals: performerUid,
+      },
+    },
+    orderBy: { createdAt: 'asc' },
+    take: 20,
+  });
+
+  let processed = 0;
+  let failed = 0;
+
+  for (const job of jobs) {
+    const payload = (job.payload || {}) as {
+      taskId?: string;
+      performerUid?: string;
+      amount?: number;
+      taskTitle?: string;
+    };
+
+    if (!payload.taskId || !payload.performerUid || !payload.amount) {
+      await prisma.jobQueue.update({
+        where: { id: job.id },
+        data: {
+          status: 'failed',
+          lastError: 'Invalid payload for pending task payout',
+          completedAt: new Date(),
+        },
+      });
+      failed += 1;
+      continue;
+    }
+
+    const result = await processTaskCompletionPayout({
+      taskId: payload.taskId,
+      performerUid: payload.performerUid,
+      amount: Number(payload.amount),
+      taskTitle: payload.taskTitle,
+      enqueueOnMissingBank: false,
+    });
+
+    if (result.success) {
+      await prisma.jobQueue.update({
+        where: { id: job.id },
+        data: {
+          status: 'completed',
+          completedAt: new Date(),
+          lastError: null,
+        },
+      });
+      processed += 1;
+    } else {
+      await prisma.jobQueue.update({
+        where: { id: job.id },
+        data: {
+          attemptCount: { increment: 1 },
+          lastError: result.error || 'Failed to process pending task payout',
+          nextRetryAt: new Date(Date.now() + 5 * 60 * 1000),
+        },
+      });
+      failed += 1;
+    }
+  }
+
+  return { processed, failed };
 }
 
 /**
@@ -92,29 +235,37 @@ export async function processPayout(params: {
 
       // Optionally store the bank account for future use
       try {
-        await prisma.bankAccount.upsert({
+        const existingBankAccount = await prisma.bankAccount.findFirst({
           where: {
-            userId_accountNumber_ifscCode: {
-              userId: performerUid,
-              accountNumber,
-              ifscCode,
-            },
-          },
-          update: {
-            accountHolderName,
-            bankName: bankName || 'Unknown',
-            updatedAt: new Date(),
-          },
-          create: {
-            id: `bank_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
             userId: performerUid,
             accountNumber,
             ifscCode,
-            accountHolderName,
-            bankName: bankName || 'Unknown',
-            isVerified: false, // Would need verification in production
           },
+          select: { id: true },
         });
+
+        if (existingBankAccount) {
+          await prisma.bankAccount.update({
+            where: { id: existingBankAccount.id },
+            data: {
+              accountHolderName,
+              bankName: bankName || 'Unknown',
+              updatedAt: new Date(),
+            },
+          });
+        } else {
+          await prisma.bankAccount.create({
+            data: {
+              id: `bank_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
+              userId: performerUid,
+              accountNumber,
+              ifscCode,
+              accountHolderName,
+              bankName: bankName || 'Unknown',
+              isVerified: false, // Would need verification in production
+            },
+          });
+        }
       } catch (error: any) {
         // Log but don't fail - bank account storage is optional
         logger.warn('Could not store bank account:', error.message);
@@ -572,6 +723,174 @@ export async function processPayout(params: {
 }
 
 /**
+ * Process payout for task completion in RazorpayX-only mode
+ * This path does not depend on escrow/order IDs.
+ */
+export async function processTaskCompletionPayout(params: {
+  taskId: string;
+  performerUid: string;
+  amount: number;
+  taskTitle?: string;
+  userId?: string;
+  enqueueOnMissingBank?: boolean;
+}): Promise<{
+  success: boolean;
+  payout?: any;
+  requiresBankAccount?: boolean;
+  error?: string;
+}> {
+  try {
+    const { taskId, performerUid, amount, taskTitle, enqueueOnMissingBank = true } = params;
+
+    if (!isPostgresConnected()) {
+      return { success: false, error: 'Postgres not connected' };
+    }
+
+    const duplicateDescription = `Task completion payout for task ${taskId}`;
+
+    const existing = await prisma.payout.findFirst({
+      where: {
+        performerUid,
+        description: duplicateDescription,
+        status: { in: ['processing', 'completed'] },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    if (existing) {
+      return {
+        success: true,
+        payout: {
+          payoutId: existing.payoutId,
+          amount: existing.amount.toString(),
+          netAmount: existing.netAmount.toString(),
+          status: existing.status,
+          completedAt: existing.completedAt,
+        },
+      };
+    }
+
+    const paymentProfile = await prisma.userPaymentProfile.findUnique({
+      where: { userId: performerUid },
+    });
+
+    if (!paymentProfile?.defaultBankAccountId) {
+      if (enqueueOnMissingBank) {
+        await enqueuePendingTaskCompletionPayout({ taskId, performerUid, amount, taskTitle });
+      }
+      return {
+        success: false,
+        requiresBankAccount: true,
+        error: 'No bank account added for this tasker',
+      };
+    }
+
+    const selectedBankAccount = await prisma.bankAccount.findUnique({
+      where: { id: paymentProfile.defaultBankAccountId },
+    });
+
+    if (!selectedBankAccount) {
+      if (enqueueOnMissingBank) {
+        await enqueuePendingTaskCompletionPayout({ taskId, performerUid, amount, taskTitle });
+      }
+      return {
+        success: false,
+        requiresBankAccount: true,
+        error: 'Selected default bank account not found',
+      };
+    }
+
+    const { fundAccountId } = parseVerificationRef(selectedBankAccount.verificationRef);
+    if (!fundAccountId) {
+      if (enqueueOnMissingBank) {
+        await enqueuePendingTaskCompletionPayout({ taskId, performerUid, amount, taskTitle });
+      }
+      return {
+        success: false,
+        requiresBankAccount: true,
+        error: 'Selected bank account is not linked to RazorpayX fund account',
+      };
+    }
+
+    const grossAmount = new Prisma.Decimal(amount.toString());
+    // For task-completion payouts, tasker must receive the exact task budget amount.
+    const netAmount = grossAmount;
+    const platformCommission = new Prisma.Decimal(0);
+    const gstOnCommission = new Prisma.Decimal(0);
+    const tds = new Prisma.Decimal(0);
+
+    // RazorpayX narration max length is 30 chars.
+    const payoutNarration = `Task ${taskId.slice(-8)} payout`;
+
+    const payoutResponse = await createRazorpayXPayout({
+      fundAccountId,
+      amountInPaise: Math.round(parseFloat(netAmount.toString()) * 100),
+      referenceId: `task_${taskId}`,
+      narration: payoutNarration,
+    });
+
+    const status = mapRazorpayPayoutStatusToInternal(payoutResponse.status);
+    const completedAt = status === 'completed' ? new Date() : null;
+
+    await prisma.payout.create({
+      data: {
+        payoutId: payoutResponse.id,
+        escrowId: null,
+        performerUid,
+        amount: grossAmount,
+        netAmount,
+        platformCommission,
+        gstOnCommission,
+        tds,
+        bankTransferId: payoutResponse.id,
+        status,
+        type: 'task_completion',
+        description: duplicateDescription,
+        completedAt: completedAt || undefined,
+        errorMessage:
+          status === 'failed' || status === 'reversed'
+            ? payoutResponse.failureReason || 'Payout failed'
+            : undefined,
+      },
+    });
+
+    if (status === 'completed') {
+      updateUserPaymentProfile(performerUid, {
+        type: 'payout',
+        amount: netAmount,
+        payoutId: payoutResponse.id,
+      }).catch((error) => {
+        logger.warn('Failed to update UserPaymentProfile after task completion payout', error);
+      });
+    }
+
+    return {
+      success: true,
+      payout: {
+        payoutId: payoutResponse.id,
+        taskId,
+        taskTitle,
+        amount: grossAmount.toString(),
+        netAmount: netAmount.toString(),
+        status,
+        fees: {
+          platformCommission: platformCommission.toString(),
+          gstOnCommission: gstOnCommission.toString(),
+          tds: tds.toString(),
+          total: '0',
+        },
+      },
+    };
+  } catch (error: any) {
+    logger.error('Error processing task completion payout', error);
+    return {
+      success: false,
+      error: error.message || 'Failed to process task completion payout',
+    };
+  }
+}
+
+/**
  * Get payout status
  * 
  * @param payoutId - Payout ID
@@ -598,30 +917,82 @@ export async function getPayoutStatus(payoutId: string): Promise<{
       return { success: false, error: 'Payout not found' };
     }
 
-    // Get bank transfer status if transaction ID exists
+    // If this is a RazorpayX task-completion payout, poll RazorpayX for latest status.
+    // This prevents "stuck processing" in the UI when the initial create call returns queued/processing.
+    if (payout.type === 'task_completion' && payout.status === 'processing') {
+      try {
+        const razorpayStatus = await getRazorpayXPayoutStatus(payout.payoutId);
+        const internalStatus = mapRazorpayPayoutStatusToInternal(razorpayStatus.status);
+
+        if (internalStatus !== payout.status) {
+          await prisma.payout.update({
+            where: { id: payout.id },
+            data: {
+              status: internalStatus,
+              errorMessage:
+                internalStatus === 'failed' || internalStatus === 'reversed'
+                  ? razorpayStatus.failureReason || 'Payout failed'
+                  : undefined,
+              completedAt:
+                internalStatus === 'completed'
+                  ? (payout.completedAt ?? new Date())
+                  : payout.completedAt,
+              updatedAt: new Date(),
+            },
+          });
+
+          // Keep cached earnings in sync once Razorpay indicates completion.
+          if (internalStatus === 'completed') {
+            updateUserPaymentProfile(payout.performerUid, {
+              type: 'payout',
+              amount: payout.netAmount,
+              payoutId: payout.payoutId,
+              escrowId: payout.escrowId || undefined,
+            }).catch((err) => {
+              logger.warn('Failed to update UserPaymentProfile after Razorpay payout status refresh', {
+                payoutId: payout.payoutId,
+                performerUid: payout.performerUid,
+                error: err?.message || 'Unknown error',
+              });
+            });
+          }
+        }
+      } catch (e: any) {
+        logger.warn('Could not refresh RazorpayX payout status', {
+          payoutId,
+          error: e?.message || 'Unknown error',
+        });
+      }
+    }
+
+    // Get mock bank transfer status if transaction ID exists
     let bankTransferStatus = null;
     if (payout.bankTransferId) {
       const transferStatus = await getBankTransferStatus(payout.bankTransferId);
       bankTransferStatus = transferStatus;
     }
 
+    // Refresh payout after possible Razorpay update.
+    const updatedPayout =
+      (payout.type === 'task_completion' ? await prisma.payout.findUnique({ where: { payoutId } }) : payout) || payout;
+
     return {
       success: true,
       payout: {
-        payoutId: payout.payoutId,
-        amount: payout.amount.toString(),
-        netAmount: payout.netAmount.toString(),
+        payoutId: updatedPayout.payoutId,
+        amount: updatedPayout.amount.toString(),
+        netAmount: updatedPayout.netAmount.toString(),
         fees: {
-          platformCommission: payout.platformCommission.toString(),
-          gstOnCommission: payout.gstOnCommission.toString(),
-          tds: payout.tds?.toString(),
+          platformCommission: updatedPayout.platformCommission.toString(),
+          gstOnCommission: updatedPayout.gstOnCommission.toString(),
+          tds: updatedPayout.tds?.toString(),
         },
-        bankTransferId: payout.bankTransferId,
-        status: payout.status,
-        type: payout.type,
-        description: payout.description,
-        createdAt: payout.createdAt,
-        completedAt: payout.completedAt,
+        bankTransferId: updatedPayout.bankTransferId,
+        status: updatedPayout.status,
+        type: updatedPayout.type,
+        description: updatedPayout.description,
+        createdAt: updatedPayout.createdAt,
+        completedAt: updatedPayout.completedAt,
         bankTransferStatus,
       },
     };

@@ -1,20 +1,73 @@
 import { Response, Request } from 'express';
 import { getUserEarnings, getEarningsByPeriod, getEarningsStats } from '../services/earningsService';
+import { getPendingPenaltySummary } from '../services/performerPenaltyService';
 import { BadRequestError } from '../errors/AppError';
+import logger from '../config/logger';
 
 export class EarningsController {
   /**
    * GET /api/v1/earnings/:userId
    * Get total earnings for a user
    */
-  static async getEarnings(req: Request, res: Response): Promise<void> {
+  /**
+   * GET /api/v1/earnings/:userId/pending-cancellation-penalties
+   * Always returns 200 on recoverable errors so clients (e.g. profile payments) can still load transactions.
+   */
+  static async getPendingCancellationPenalties(req: Request, res: Response): Promise<void> {
     const { userId } = req.params;
+    const linkedRaw = req.query.linkedUserIds;
 
     if (!userId) {
       throw new BadRequestError('User ID is required');
     }
 
-    const result = await getUserEarnings(userId);
+    const linkedParsed =
+      typeof linkedRaw === 'string' && linkedRaw.trim()
+        ? linkedRaw
+            .split(',')
+            .map((s) => s.trim())
+            .filter((s) => s.length > 0 && s !== userId)
+        : [];
+
+    const result = await getPendingPenaltySummary(userId, linkedParsed);
+
+    if (!result.success) {
+      logger.warn('[EarningsController] pending-cancellation-penalties fallback', {
+        userId,
+        error: result.error,
+      });
+      res.status(200).json({
+        success: true,
+        totalRemaining: '0',
+        items: [],
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      totalRemaining: result.totalRemaining || '0',
+      items: result.items || [],
+    });
+  }
+
+  static async getEarnings(req: Request, res: Response): Promise<void> {
+    const { userId } = req.params;
+    const linkedRaw = req.query.linkedUserIds;
+
+    if (!userId) {
+      throw new BadRequestError('User ID is required');
+    }
+
+    const linkedParsed =
+      typeof linkedRaw === 'string' && linkedRaw.trim()
+        ? linkedRaw
+            .split(',')
+            .map((s) => s.trim())
+            .filter((s) => s.length > 0 && s !== userId)
+        : [];
+
+    const result = await getUserEarnings(userId, linkedParsed);
 
     if (!result.success) {
       throw new Error(result.error || 'Failed to get earnings');

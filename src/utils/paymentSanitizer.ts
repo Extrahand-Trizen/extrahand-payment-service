@@ -38,6 +38,22 @@ export interface SanitizedPaymentData {
   [key: string]: any;
 }
 
+function maskUpiId(upiId: string | undefined): string | undefined {
+  const value = (upiId || '').trim();
+  if (!value.includes('@')) {
+    return value || undefined;
+  }
+
+  const [localPart, handle] = value.split('@');
+  if (!localPart || !handle) {
+    return value;
+  }
+
+  const visiblePrefix = localPart.slice(0, Math.min(3, localPart.length));
+  const maskedLocal = `${visiblePrefix}${'*'.repeat(Math.max(4, localPart.length - visiblePrefix.length))}`;
+  return `${maskedLocal}@${handle}`;
+}
+
 /**
  * Sanitize Razorpay payment data - removes sensitive card information
  * 
@@ -80,6 +96,33 @@ export function sanitizeRazorpayPaymentData(paymentData: any): SanitizedPaymentD
     });
   }
 
+  // Mask UPI identifiers (VPA) when present.
+  if (typeof sanitized.vpa === 'string') {
+    sanitized.vpa = maskUpiId(sanitized.vpa);
+  }
+
+  if (typeof sanitized.upi_id === 'string') {
+    sanitized.upi_id = maskUpiId(sanitized.upi_id);
+  }
+
+  if (typeof sanitized.upiId === 'string') {
+    sanitized.upiId = maskUpiId(sanitized.upiId);
+  }
+
+  if (sanitized.upi && typeof sanitized.upi === 'object') {
+    const upiObj: any = { ...sanitized.upi };
+    if (typeof upiObj.vpa === 'string') {
+      upiObj.vpa = maskUpiId(upiObj.vpa);
+    }
+    if (typeof upiObj.upi_id === 'string') {
+      upiObj.upi_id = maskUpiId(upiObj.upi_id);
+    }
+    if (typeof upiObj.upiId === 'string') {
+      upiObj.upiId = maskUpiId(upiObj.upiId);
+    }
+    sanitized.upi = upiObj;
+  }
+
   // Remove any potentially sensitive fields from notes or other locations
   if (sanitized.notes) {
     const safeNotes = { ...sanitized.notes };
@@ -88,6 +131,15 @@ export function sanitizeRazorpayPaymentData(paymentData: any): SanitizedPaymentD
     delete safeNotes.expiry;
     delete safeNotes.expiry_month;
     delete safeNotes.expiry_year;
+    if (typeof safeNotes.vpa === 'string') {
+      safeNotes.vpa = maskUpiId(safeNotes.vpa);
+    }
+    if (typeof safeNotes.upiId === 'string') {
+      safeNotes.upiId = maskUpiId(safeNotes.upiId);
+    }
+    if (typeof safeNotes.upi_id === 'string') {
+      safeNotes.upi_id = maskUpiId(safeNotes.upi_id);
+    }
     sanitized.notes = safeNotes;
   }
 
@@ -170,19 +222,19 @@ export function sanitizeRazorpayRefundData(refundData: any): any | null {
  * Create a masked card fingerprint for display purposes
  * 
  * @param cardData - Card data (can be sanitized or raw)
- * @returns Masked card fingerprint string (e.g., "XXXX XXXX 1234")
+ * @returns Masked card fingerprint string (e.g., "XXXX XXXX XXXX 1234")
  */
 export function createCardFingerprint(cardData: any): string {
   if (!cardData) {
-    return 'XXXX XXXX XXXX';
+    return 'XXXX XXXX XXXX XXXX';
   }
 
   const last4 = cardData.last4 || cardData.number?.slice(-4);
   if (!last4) {
-    return 'XXXX XXXX XXXX';
+    return 'XXXX XXXX XXXX XXXX';
   }
 
-  return `XXXX XXXX ${last4}`;
+  return `XXXX XXXX XXXX ${last4}`;
 }
 
 /**

@@ -111,15 +111,39 @@ export const getOrderDetails = async (orderId: string) => {
   }
 };
 
-export const createRefund = async (paymentId: string, amount?: number) => {
+/**
+ * Razorpay Payments API refund (money returns to the customer's original payment method).
+ * `amountInRupees` is optional: omit for a full refund of the remaining capturable amount.
+ * Amount sent to Razorpay is always in paise (integer).
+ */
+export const createRefund = async (paymentId: string, amountInRupees?: number) => {
   try {
-    const options = amount ? { amount: amount * 100 } : {};
+    const options: { amount?: number } = {};
+    if (amountInRupees != null && amountInRupees > 0) {
+      options.amount = Math.round(Number(amountInRupees) * 100);
+    }
     const refund = await razorpay.payments.refund(paymentId, options);
-    logger.info('Refund created', { refundId: refund.id, paymentId });
+    logger.info('Refund created', { refundId: refund.id, paymentId, amountPaise: options.amount });
     return { success: true, refund };
   } catch (error: any) {
     logger.error('Error creating refund:', error);
     return { success: false, error: error.message };
+  }
+};
+
+/** Internal: refund an exact amount in paise (partial or full capture). */
+export const createRefundAmountPaise = async (paymentId: string, amountInPaise: number) => {
+  try {
+    const paise = Math.round(amountInPaise);
+    if (!Number.isFinite(paise) || paise <= 0) {
+      return { success: false as const, error: 'Invalid refund amount (paise)' };
+    }
+    const refund = await razorpay.payments.refund(paymentId, { amount: paise });
+    logger.info('Refund created (paise)', { refundId: refund.id, paymentId, amountPaise: paise });
+    return { success: true as const, refund };
+  } catch (error: any) {
+    logger.error('Error creating refund:', error);
+    return { success: false as const, error: error.message };
   }
 };
 

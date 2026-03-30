@@ -16,7 +16,9 @@ export class RefundController {
       taskStartDate,
       cancelledAt,
       userId,
-      amount, // Optional: for partial refunds
+      amount,
+      assignedAt,
+      feeBaseAmount,
     } = req.body;
 
     // Validate required fields
@@ -40,6 +42,9 @@ export class RefundController {
       throw new BadRequestError('Invalid date format for taskStartDate or cancelledAt');
     }
 
+    const feeBaseParsed =
+      feeBaseAmount != null && feeBaseAmount !== '' ? Number(feeBaseAmount) : NaN;
+
     const result = await processRefund({
       razorpayOrderId,
       razorpayPaymentId,
@@ -49,6 +54,8 @@ export class RefundController {
       cancelledAt: cancelled,
       userId,
       amount,
+      assignedAt: assignedAt ? new Date(assignedAt) : undefined,
+      feeBaseAmount: Number.isFinite(feeBaseParsed) ? feeBaseParsed : undefined,
     });
 
     if (!result.success) {

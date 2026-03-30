@@ -13,6 +13,7 @@ import { prisma } from '../config/prisma';
 import { Prisma } from '@prisma/client';
 import { sanitizeRazorpayData } from '../utils/paymentSanitizer';
 import { processRefund } from './refundService';
+import { createPerformerCancellationPenalty } from './performerPenaltyService';
 
 /**
  * Cancel payment order
@@ -28,9 +29,23 @@ export async function cancelPayment(params: {
   userId?: string;
   cancelledBy?: 'poster' | 'performer';
   taskStartDate?: Date;
+  assignedAt?: Date;
+  /** Task budget (rupees) for %-fee base; aligns refund with pre-cancel UI */
+  feeBaseAmount?: number;
+  taskTitle?: string;
 }): Promise<{ success: boolean; cancelled?: boolean; refundRequired?: boolean; refund?: any; error?: string }> {
   try {
-    const { razorpayOrderId, reason, userId, cancelledBy, taskStartDate } = params;
+    const {
+      razorpayOrderId,
+      reason,
+      userId,
+      cancelledBy,
+      taskStartDate,
+      assignedAt,
+      feeBaseAmount,
+      taskTitle,
+    } = params;
+    const cancelledAtTs = new Date();
 
     logger.info('🔄 Processing payment cancellation', {
       razorpayOrderId,
@@ -92,8 +107,10 @@ export async function cancelPayment(params: {
           reason: reason || 'Payment cancelled',
           cancelledBy: refundCancelledBy,
           taskStartDate: refundTaskStartDate,
-          cancelledAt: new Date(),
+          cancelledAt: cancelledAtTs,
           userId: userId,
+          assignedAt,
+          feeBaseAmount,
         });
 
         if (refundResult.success) {
@@ -101,6 +118,25 @@ export async function cancelPayment(params: {
             razorpayOrderId,
             refundId: refundResult.refund?.refundId,
           });
+          if (refundCancelledBy === 'performer') {
+            const latest = await prisma.escrow.findUnique({ where: { id: postgresEscrow.id } });
+            if (latest?.status === 'refunded') {
+              const feeBase =
+                feeBaseAmount != null && Number.isFinite(feeBaseAmount)
+                  ? feeBaseAmount
+                  : parseFloat(latest.amountInRupees.toString());
+              await createPerformerCancellationPenalty({
+                performerUid: latest.performerUid,
+                taskId: latest.taskId,
+                escrowId: latest.id,
+                taskStartDate: refundTaskStartDate,
+                cancelledAt: cancelledAtTs,
+                feeBaseAmount: feeBase,
+                reason,
+                taskTitle,
+              }).catch((e) => logger.error('Performer penalty record failed', e));
+            }
+          }
           // Escrow status is already updated to 'refunded' by processRefund
           return {
             success: true,
@@ -183,6 +219,27 @@ export async function cancelPayment(params: {
       razorpayCancelled,
     });
 
+    if ((cancelledBy || '') === 'performer') {
+      const latest = await prisma.escrow.findUnique({ where: { id: postgresEscrow.id } });
+      if (latest && (latest.status === 'refunded' || latest.status === 'cancelled')) {
+        const feeBase =
+          feeBaseAmount != null && Number.isFinite(feeBaseAmount)
+            ? feeBaseAmount
+            : parseFloat(latest.amountInRupees.toString());
+        const tStart = taskStartDate || latest.createdAt;
+        await createPerformerCancellationPenalty({
+          performerUid: latest.performerUid,
+          taskId: latest.taskId,
+          escrowId: latest.id,
+          taskStartDate: tStart,
+          cancelledAt: cancelledAtTs,
+          feeBaseAmount: feeBase,
+          reason,
+          taskTitle,
+        }).catch((e) => logger.error('Performer penalty record failed', e));
+      }
+    }
+
     return {
       success: true,
       cancelled: true,
@@ -207,9 +264,15 @@ export async function cancelEscrow(params: {
   escrowId: string;
   reason?: string;
   userId?: string;
+  cancelledBy?: 'poster' | 'performer';
+  taskStartDate?: Date;
+  assignedAt?: Date;
+  feeBaseAmount?: number;
+  taskTitle?: string;
 }): Promise<{ success: boolean; cancelled?: boolean; refundRequired?: boolean; error?: string }> {
   try {
-    const { escrowId, reason, userId } = params;
+    const { escrowId, reason, userId, cancelledBy, taskStartDate, assignedAt, feeBaseAmount, taskTitle } =
+      params;
 
     // Get escrow from Postgres
     if (!isPostgresConnected()) {
@@ -229,6 +292,11 @@ export async function cancelEscrow(params: {
       razorpayOrderId: postgresEscrow.razorpayOrderId,
       reason,
       userId,
+      cancelledBy,
+      taskStartDate,
+      assignedAt,
+      feeBaseAmount,
+      taskTitle,
     });
   } catch (error: any) {
     logger.error('❌ Error cancelling escrow:', error);
@@ -248,9 +316,15 @@ export async function cancelEscrowByTaskId(params: {
   taskId: string;
   reason?: string;
   userId?: string;
-}): Promise<{ success: boolean; cancelled?: boolean; refundRequired?: boolean; error?: string }> {
+  cancelledBy?: 'poster' | 'performer';
+  taskStartDate?: Date;
+  assignedAt?: Date;
+  feeBaseAmount?: number;
+  taskTitle?: string;
+}): Promise<{ success: boolean; cancelled?: boolean; refundRequired?: boolean; refund?: any; error?: string }> {
   try {
-    const { taskId, reason, userId } = params;
+    const { taskId, reason, userId, cancelledBy, taskStartDate, assignedAt, feeBaseAmount, taskTitle } =
+      params;
 
     // Get escrow from Postgres
     if (!isPostgresConnected()) {
@@ -271,6 +345,11 @@ export async function cancelEscrowByTaskId(params: {
       razorpayOrderId: postgresEscrow.razorpayOrderId,
       reason,
       userId,
+      cancelledBy,
+      taskStartDate,
+      assignedAt,
+      feeBaseAmount,
+      taskTitle,
     });
   } catch (error: any) {
     logger.error('❌ Error cancelling escrow by task ID:', error);

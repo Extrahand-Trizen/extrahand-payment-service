@@ -13,7 +13,7 @@ import {
  * - Completed payouts (netAmount after fees)
  * - Cancellation compensation (toOtherParty when poster cancels)
  */
-export async function getUserEarnings(userId: string): Promise<{
+export async function getUserEarnings(userId: string, linkedUserIds?: string[]): Promise<{
   success: boolean;
   earnings?: {
     totalEarnings: string;
@@ -29,6 +29,59 @@ export async function getUserEarnings(userId: string): Promise<{
   error?: string;
 }> {
   try {
+    const uidList = [
+      ...new Set(
+        [userId, ...(linkedUserIds || [])].filter(
+          (x): x is string => typeof x === 'string' && x.trim().length > 0
+        )
+      ),
+    ];
+
+    // When linked IDs are supplied, aggregate directly across all IDs.
+    // This is used for legacy UID/_id migrations where cache rows may exist under different identifiers.
+    if (uidList.length > 1) {
+      const payoutsAgg = await prisma.payout.aggregate({
+        where: {
+          performerUid: { in: uidList },
+          status: 'completed',
+        },
+        _sum: { netAmount: true },
+        _count: { _all: true },
+      });
+
+      const compensationsAgg = await prisma.refund.aggregate({
+        where: {
+          escrow: {
+            performerUid: { in: uidList },
+          },
+          cancelledBy: 'poster',
+          toOtherParty: { not: null },
+          status: 'completed',
+        },
+        _sum: { toOtherParty: true },
+        _count: { _all: true },
+      });
+
+      const fromPayouts = payoutsAgg._sum.netAmount || new Prisma.Decimal('0');
+      const fromCompensation = compensationsAgg._sum.toOtherParty || new Prisma.Decimal('0');
+      const totalEarnings = fromPayouts.plus(fromCompensation);
+
+      return {
+        success: true,
+        earnings: {
+          totalEarnings: totalEarnings.toString(),
+          fromPayouts: fromPayouts.toString(),
+          fromCompensation: fromCompensation.toString(),
+          totalPayouts: payoutsAgg._count._all || 0,
+          totalCompensations: compensationsAgg._count._all || 0,
+          labels: {
+            fromPayouts: 'From Completed Tasks',
+            fromCompensation: 'From Cancellations',
+          },
+        },
+      };
+    }
+
     // Try cache first
     let profile = await prisma.userPaymentProfile.findUnique({
       where: { userId },

@@ -317,54 +317,67 @@ export function calculateFees(amount: number | Prisma.Decimal): FeeBreakdown {
  * @returns Cancellation fee result
  */
 export async function calculateCancellationFee(params: {
+  /** Total captured / escrow amount in rupees (what Razorpay can refund from) */
   amount: number | Prisma.Decimal;
   taskStartDate: Date;
   cancelledAt: Date;
   cancelledBy: 'poster' | 'performer';
+  /** Poster: free cancel within 15 minutes of assignment (matches tracking UI) */
+  assignedAt?: Date;
+  /**
+   * Base used for % cancellation fee (task budget in UI). Defaults to `amount` when omitted.
+   */
+  feeBaseAmount?: number | Prisma.Decimal;
 }): Promise<CancellationFeeResult> {
-  const { amount, taskStartDate, cancelledAt, cancelledBy } = params;
+  const { amount, taskStartDate, cancelledAt, cancelledBy, assignedAt, feeBaseAmount } = params;
   const feeStructure = await getFeeStructure();
   const originalAmount = new Prisma.Decimal(amount.toString());
+  const feeBase =
+    feeBaseAmount != null
+      ? new Prisma.Decimal(feeBaseAmount.toString())
+      : originalAmount;
 
-  // Calculate time difference
-  const timeDiff = cancelledAt.getTime() - taskStartDate.getTime();
-  const hoursDiff = timeDiff / (1000 * 60 * 60);
-  const daysDiff = hoursDiff / 24;
+  // Hours until scheduled start (positive = before start). Matches StatusUpdateSection logic.
+  const hoursUntilStart = (taskStartDate.getTime() - cancelledAt.getTime()) / (1000 * 60 * 60);
 
-  // Grace period for free cancellation (from config)
-  const gracePeriodHours = feeStructure.cancellationFees.gracePeriodHours;
-  const isWithinGracePeriod = hoursDiff >= 0 && hoursDiff <= gracePeriodHours;
-
-  // Determine cancellation fee percentage based on timing
   let cancellationFeePercentage: number;
 
-  if (isWithinGracePeriod) {
-    // Cancelled within grace period - NO FEE (free cancellation)
-    cancellationFeePercentage = 0;
-  } else if (daysDiff < 0) {
-    // Cancelled before task start (early cancellation, but after grace period)
-    cancellationFeePercentage = feeStructure.cancellationFees.early;
-  } else if (hoursDiff < 24) {
-    // Cancelled within 24 hours of task start (but after grace period)
-    cancellationFeePercentage = feeStructure.cancellationFees.medium;
-  } else if (daysDiff < 7) {
-    // Cancelled within 7 days
-    cancellationFeePercentage = feeStructure.cancellationFees.late;
+  if (cancelledBy === 'poster') {
+    if (assignedAt) {
+      const minutesSinceAssigned = (cancelledAt.getTime() - assignedAt.getTime()) / (1000 * 60);
+      if (minutesSinceAssigned <= 15) {
+        cancellationFeePercentage = 0;
+      } else if (hoursUntilStart > 24) {
+        cancellationFeePercentage = 0;
+      } else if (hoursUntilStart > 1) {
+        cancellationFeePercentage = feeStructure.cancellationFees.medium;
+      } else {
+        cancellationFeePercentage = feeStructure.cancellationFees.late;
+      }
+    } else if (hoursUntilStart > 24) {
+      cancellationFeePercentage = 0;
+    } else if (hoursUntilStart > 1) {
+      cancellationFeePercentage = feeStructure.cancellationFees.medium;
+    } else {
+      cancellationFeePercentage = feeStructure.cancellationFees.late;
+    }
   } else {
-    // Cancelled after 7 days (very late)
-    cancellationFeePercentage = feeStructure.cancellationFees.veryLate;
+    // Performer cancel: refund to poster; bands mirror tasker tracking UI
+    if (hoursUntilStart > 24) {
+      cancellationFeePercentage = 0;
+    } else if (hoursUntilStart > 1) {
+      cancellationFeePercentage = feeStructure.cancellationFees.medium;
+    } else {
+      cancellationFeePercentage = 0.15;
+    }
   }
 
-  // If performer cancels, they get less/no compensation
-  // If poster cancels, performer gets more compensation
-  // For now, we'll use the same fee structure for both
-  // In production, you might want different logic
-
-  // Calculate cancellation fee
-  const cancellationFee = originalAmount.mul(cancellationFeePercentage).toDecimalPlaces(2);
-
-  // Calculate refund amount (original amount - cancellation fee)
-  const refundAmount = originalAmount.sub(cancellationFee).toDecimalPlaces(2);
+  // Fee % applies to task budget (UI); refund cannot exceed what was captured
+  const cancellationFee = feeBase.mul(cancellationFeePercentage).toDecimalPlaces(2);
+  let refundAmount = originalAmount.sub(cancellationFee).toDecimalPlaces(2);
+  if (refundAmount.lessThan(0)) {
+    refundAmount = new Prisma.Decimal('0.00');
+  }
 
   // Distribute cancellation fee (from config)
   const toOtherParty = cancellationFee.mul(feeStructure.cancellationFees.distribution.toOtherParty).toDecimalPlaces(2);
@@ -411,6 +424,8 @@ export async function calculateRefundWithCancellationFee(params: {
   taskStartDate: Date;
   cancelledAt: Date;
   cancelledBy: 'poster' | 'performer';
+  assignedAt?: Date;
+  feeBaseAmount?: number | Prisma.Decimal;
 }): Promise<CancellationFeeResult> {
   return await calculateCancellationFee(params);
 }

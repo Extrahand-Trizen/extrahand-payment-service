@@ -7,7 +7,11 @@ import {
   createRefund,
 } from '../services/paymentService';
 import { updateEscrowOnPaymentCapture } from '../services/escrowService';
-import { cancelPayment, cancelEscrow, cancelEscrowByTaskId } from '../services/cancellationService';
+import {
+  cancelPayment as cancelPaymentOrder,
+  cancelEscrow,
+  cancelEscrowByTaskId,
+} from '../services/cancellationService';
 import { BadRequestError, NotFoundError } from '../errors/AppError';
 import logger from '../config/logger';
 import { prisma } from '../config/prisma';
@@ -157,22 +161,60 @@ export class PaymentController {
    * POST /api/v1/payment/cancel
    */
   static async cancelPayment(req: Request, res: Response): Promise<void> {
-    const { razorpayOrderId, escrowId, taskId, reason, userId, cancelledBy, taskStartDate } = req.body;
+    const {
+      razorpayOrderId,
+      escrowId,
+      taskId,
+      reason,
+      userId,
+      cancelledBy,
+      taskStartDate,
+      assignedAt,
+      feeBaseAmount,
+      taskTitle,
+    } = req.body;
+
+    const taskStart = taskStartDate ? new Date(taskStartDate) : undefined;
+    const assignedAtDate = assignedAt ? new Date(assignedAt) : undefined;
+    const feeBaseParsed =
+      feeBaseAmount != null && feeBaseAmount !== '' ? Number(feeBaseAmount) : NaN;
+    const feeBaseToPass = Number.isFinite(feeBaseParsed) ? feeBaseParsed : undefined;
 
     let result;
 
     if (razorpayOrderId) {
-      result = await cancelPayment({
+      result = await cancelPaymentOrder({
         razorpayOrderId,
         reason,
         userId,
         cancelledBy,
-        taskStartDate: taskStartDate ? new Date(taskStartDate) : undefined
+        taskStartDate: taskStart,
+        assignedAt: assignedAtDate,
+        feeBaseAmount: feeBaseToPass,
+        taskTitle: typeof taskTitle === 'string' ? taskTitle : undefined,
       });
     } else if (escrowId) {
-      result = await cancelEscrow({ escrowId, reason, userId });
+      result = await cancelEscrow({
+        escrowId,
+        reason,
+        userId,
+        cancelledBy,
+        taskStartDate: taskStart,
+        assignedAt: assignedAtDate,
+        feeBaseAmount: feeBaseToPass,
+        taskTitle: typeof taskTitle === 'string' ? taskTitle : undefined,
+      });
     } else if (taskId) {
-      result = await cancelEscrowByTaskId({ taskId, reason, userId });
+      result = await cancelEscrowByTaskId({
+        taskId,
+        reason,
+        userId,
+        cancelledBy,
+        taskStartDate: taskStart,
+        assignedAt: assignedAtDate,
+        feeBaseAmount: feeBaseToPass,
+        taskTitle: typeof taskTitle === 'string' ? taskTitle : undefined,
+      });
     } else {
       throw new BadRequestError('Either razorpayOrderId, escrowId, or taskId is required');
     }

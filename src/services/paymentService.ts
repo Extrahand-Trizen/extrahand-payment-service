@@ -5,6 +5,7 @@ import logger from '../config/logger';
 import { prisma } from '../config/prisma';
 import { isPostgresConnected } from '../config/database';
 import {
+  isReviewBypassPhone,
   isReviewBypassUid,
   REVIEW_ORDER_ID_PREFIX,
 } from '../utils/reviewBypass';
@@ -13,7 +14,13 @@ export const createOrder = async (amount: number, currency: string = 'INR', meta
   try {
     const posterUid =
       typeof metadata.posterUid === 'string' ? metadata.posterUid.trim() : '';
-    if (posterUid && isReviewBypassUid(posterUid)) {
+    const posterPhoneRaw = metadata.posterPhone;
+    const posterPhone =
+      typeof posterPhoneRaw === 'string' ? posterPhoneRaw.trim() : '';
+    if (
+      posterUid &&
+      (isReviewBypassUid(posterUid) || isReviewBypassPhone(posterPhone))
+    ) {
       const id = `${REVIEW_ORDER_ID_PREFIX}${crypto.randomBytes(12).toString('hex')}`;
       logger.info('Review bypass: skipped Razorpay order create', {
         orderId: id,

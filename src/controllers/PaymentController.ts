@@ -16,7 +16,7 @@ import { BadRequestError, NotFoundError } from '../errors/AppError';
 import logger from '../config/logger';
 import { prisma } from '../config/prisma';
 import { RAZORPAY_CONFIG } from '../config/razorpay';
-import { isReviewBypassOrderId, isReviewBypassUid } from '../utils/reviewBypass';
+import { isReviewBypassOrderId } from '../utils/reviewBypass';
 
 export class PaymentController {
   /**
@@ -88,8 +88,8 @@ export class PaymentController {
     }
 
     if (isReviewBypassOrderId(razorpay_order_id)) {
-      if (!isReviewBypassUid(uid)) {
-        throw new BadRequestError('Review payment verification not allowed for this user');
+      if (!uid) {
+        throw new BadRequestError('Missing user context');
       }
       const escrowRow = await prisma.escrow.findUnique({
         where: { razorpayOrderId: razorpay_order_id },

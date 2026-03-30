@@ -17,6 +17,11 @@ export class EarningsController {
     const { userId } = req.params;
     const linkedRaw = req.query.linkedUserIds;
 
+    logger.debug('[EarningsController.getPendingCancellationPenalties] Received request', {
+      userId,
+      linkedUserIds: linkedRaw,
+    });
+
     if (!userId) {
       throw new BadRequestError('User ID is required');
     }
@@ -29,11 +34,18 @@ export class EarningsController {
             .filter((s) => s.length > 0 && s !== userId)
         : [];
 
+    logger.debug('[EarningsController.getPendingCancellationPenalties] Parsed linked users', {
+      userId,
+      linkedUserCount: linkedParsed.length,
+      allUserIds: [userId, ...linkedParsed],
+    });
+
     const result = await getPendingPenaltySummary(userId, linkedParsed);
 
     if (!result.success) {
-      logger.warn('[EarningsController] pending-cancellation-penalties fallback', {
+      logger.warn('[EarningsController.getPendingCancellationPenalties] Service failed, returning fallback', {
         userId,
+        linkedUserCount: linkedParsed.length,
         error: result.error,
       });
       res.status(200).json({
@@ -43,6 +55,13 @@ export class EarningsController {
       });
       return;
     }
+
+    logger.info('[EarningsController.getPendingCancellationPenalties] Successfully fetched penalties', {
+      userId,
+      linkedUserCount: linkedParsed.length,
+      totalRemaining: result.totalRemaining,
+      penaltyCount: (result.items || []).length,
+    });
 
     res.json({
       success: true,

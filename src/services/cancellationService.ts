@@ -126,7 +126,13 @@ export async function cancelPayment(params: {
                 feeBaseAmount != null && Number.isFinite(feeBaseAmount)
                   ? feeBaseAmount
                   : parseFloat(latest.amountInRupees.toString());
-              await createPerformerCancellationPenalty({
+              logger.info('[cancellationService] Creating performer penalty after tasker refund', {
+                performerUid: latest.performerUid,
+                taskId: latest.taskId,
+                feeBaseAmount: feeBase,
+                cancelledBy: refundCancelledBy,
+              });
+              const penaltyResult = await createPerformerCancellationPenalty({
                 performerUid: latest.performerUid,
                 taskId: latest.taskId,
                 escrowId: latest.id,
@@ -135,8 +141,32 @@ export async function cancelPayment(params: {
                 feeBaseAmount: feeBase,
                 reason,
                 taskTitle,
-              }).catch((e) => logger.error('Performer penalty record failed', e));
+              });
+              if (penaltyResult.success) {
+                logger.info('[cancellationService] Performer penalty created successfully', {
+                  performerUid: latest.performerUid,
+                  taskId: latest.taskId,
+                  penaltyId: penaltyResult.penalty?.penaltyId,
+                  amount: penaltyResult.penalty?.amount,
+                  skipped: penaltyResult.skipped,
+                });
+              } else {
+                logger.error('[cancellationService] Failed to create performer penalty', {
+                  performerUid: latest.performerUid,
+                  taskId: latest.taskId,
+                  error: penaltyResult.error,
+                });
+              }
+            } else {
+              logger.warn('[cancellationService] Not creating penalty - escrow not in refunded state', {
+                escrowId: postgresEscrow.id,
+                status: latest?.status,
+              });
             }
+          } else {
+            logger.debug('[cancellationService] Not performer cancellation, skipping penalty creation', {
+              cancelledBy: refundCancelledBy,
+            });
           }
           // Escrow status is already updated to 'refunded' by processRefund
           return {
@@ -231,7 +261,14 @@ export async function cancelPayment(params: {
             ? feeBaseAmount
             : parseFloat(latest.amountInRupees.toString());
         const tStart = taskStartDate || latest.createdAt;
-        await createPerformerCancellationPenalty({
+        logger.info('[cancellationService] Creating performer penalty after tasker cancellation', {
+          performerUid: latest.performerUid,
+          taskId: latest.taskId,
+          escrowStatus: latest.status,
+          feeBaseAmount: feeBase,
+          cancelledBy,
+        });
+        const penaltyResult = await createPerformerCancellationPenalty({
           performerUid: latest.performerUid,
           taskId: latest.taskId,
           escrowId: latest.id,
@@ -240,8 +277,33 @@ export async function cancelPayment(params: {
           feeBaseAmount: feeBase,
           reason,
           taskTitle,
-        }).catch((e) => logger.error('Performer penalty record failed', e));
+        });
+        if (penaltyResult.success) {
+          logger.info('[cancellationService] Performer penalty created successfully', {
+            performerUid: latest.performerUid,
+            taskId: latest.taskId,
+            penaltyId: penaltyResult.penalty?.penaltyId,
+            amount: penaltyResult.penalty?.amount,
+            skipped: penaltyResult.skipped,
+          });
+        } else {
+          logger.error('[cancellationService] Failed to create performer penalty', {
+            performerUid: latest.performerUid,
+            taskId: latest.taskId,
+            error: penaltyResult.error,
+          });
+        }
+      } else {
+        logger.debug('[cancellationService] Escrow not found or not in refunded/cancelled state for penalty', {
+          escrowId: postgresEscrow.id,
+          escrowExists: !!latest,
+          status: latest?.status,
+        });
       }
+    } else {
+      logger.debug('[cancellationService] Not performer cancellation, skipping penalty creation', {
+        cancelledBy,
+      });
     }
 
     return {

@@ -123,11 +123,20 @@ export async function planPenaltyDeductionsFromGross(
   totalDeducted: Prisma.Decimal;
   lines: PenaltyDeductionLine[];
 }> {
+  logger.debug('[planPenaltyDeductionsFromGross] Starting penalty deduction planning', {
+    performerUid,
+    grossAmount: grossAmount.toString(),
+  });
+
   const lines: PenaltyDeductionLine[] = [];
   let pool = grossAmount;
   let totalDeducted = new Prisma.Decimal(0);
 
   if (pool.lte(0)) {
+    logger.debug('[planPenaltyDeductionsFromGross] Gross amount <= 0, no deductions', {
+      performerUid,
+      grossAmount: grossAmount.toString(),
+    });
     return { netTransfer: new Prisma.Decimal(0), totalDeducted, lines };
   }
 
@@ -138,6 +147,12 @@ export async function planPenaltyDeductionsFromGross(
       remainingAmount: { gt: new Prisma.Decimal(0) },
     },
     orderBy: { createdAt: 'asc' },
+  });
+
+  logger.info('[planPenaltyDeductionsFromGross] Found pending penalties', {
+    performerUid,
+    penaltyCount: pending.length,
+    totalPendingAmount: pending.reduce((sum, p) => sum.add(p.remainingAmount), new Prisma.Decimal(0)).toString(),
   });
 
   for (const p of pending) {
@@ -156,7 +171,24 @@ export async function planPenaltyDeductionsFromGross(
       applied: take,
       remainingAfter,
     });
+
+    logger.debug('[planPenaltyDeductionsFromGross] Deducting penalty from pool', {
+      penaltyId: p.penaltyId,
+      taskId: p.taskId,
+      penaltyRemaining: rem.toString(),
+      deductedFromPool: take.toString(),
+      remainingAfter: remainingAfter.toString(),
+      poolRemaining: pool.toString(),
+    });
   }
+
+  logger.info('[planPenaltyDeductionsFromGross] Completed penalty deduction plan', {
+    performerUid,
+    grossAmount: grossAmount.toString(),
+    totalDeducted: totalDeducted.toString(),
+    netTransfer: pool.toString(),
+    deductionLineCount: lines.length,
+  });
 
   return { netTransfer: pool, totalDeducted, lines };
 }
@@ -166,6 +198,10 @@ export async function applyPenaltyLinesInTx(
   tx: Prisma.TransactionClient,
   lines: PenaltyDeductionLine[]
 ): Promise<void> {
+  logger.info('[applyPenaltyLinesInTx] Applying penalty deductions inside transaction', {
+    lineCount: lines.length,
+  });
+
   for (const line of lines) {
     const fullyApplied = line.remainingAfter.lte(0);
     await tx.performerCancellationPenalty.update({
@@ -176,7 +212,21 @@ export async function applyPenaltyLinesInTx(
         ...(fullyApplied ? { appliedAt: new Date() } : {}),
       },
     });
+
+    logger.debug('[applyPenaltyLinesInTx] Applied penalty deduction', {
+      penaltyId: line.penaltyId,
+      penaltyDbId: line.penaltyDbId,
+      taskId: line.taskId,
+      applied: line.applied.toString(),
+      remainingAfter: line.remainingAfter.toString(),
+      fullyApplied,
+      newStatus: fullyApplied ? 'applied' : 'pending',
+    });
   }
+
+  logger.info('[applyPenaltyLinesInTx] Completed applying all penalty deductions', {
+    lineCount: lines.length,
+  });
 }
 
 export async function getPendingPenaltySummary(
@@ -198,6 +248,7 @@ export async function getPendingPenaltySummary(
 }> {
   try {
     if (!isPostgresConnected()) {
+      logger.warn('[getPendingPenaltySummary] Postgres not connected', { performerUid });
       return { success: false, error: 'Postgres not connected' };
     }
 
@@ -208,6 +259,12 @@ export async function getPendingPenaltySummary(
         )
       ),
     ];
+
+    logger.debug('[getPendingPenaltySummary] Fetching pending penalties', {
+      performerUid,
+      uidCount: uidList.length,
+      allUids: uidList,
+    });
 
     const rows = await prisma.performerCancellationPenalty.findMany({
       where: {
@@ -223,6 +280,19 @@ export async function getPendingPenaltySummary(
       sum = sum.add(r.remainingAmount);
     }
 
+    logger.info('[getPendingPenaltySummary] Fetched pending penalties', {
+      performerUid,
+      penaltyCount: rows.length,
+      totalRemaining: sum.toString(),
+      penalties: rows.map((r) => ({
+        penaltyId: r.penaltyId,
+        taskId: r.taskId,
+        taskTitle: r.taskTitle,
+        amount: r.amount.toString(),
+        remainingAmount: r.remainingAmount.toString(),
+      })),
+    });
+
     return {
       success: true,
       totalRemaining: sum.toString(),
@@ -237,6 +307,11 @@ export async function getPendingPenaltySummary(
       })),
     };
   } catch (error: any) {
+    logger.error('[getPendingPenaltySummary] Error fetching pending penalties', {
+      performerUid,
+      error: error.message,
+      stack: error.stack,
+    });
     return { success: false, error: error.message };
   }
 }

@@ -814,6 +814,12 @@ export async function processTaskCompletionPayout(params: {
     }
 
     const grossAmount = new Prisma.Decimal(amount.toString());
+    logger.debug('[payoutService] Starting penalty planning for task completion payout', {
+      performerUid,
+      taskId,
+      grossAmount: grossAmount.toString(),
+    });
+
     const penaltyPlan = await planPenaltyDeductionsFromGross(performerUid, grossAmount);
     const netAmount = penaltyPlan.netTransfer;
     const totalPenaltyDeducted = penaltyPlan.totalDeducted;
@@ -829,13 +835,20 @@ export async function processTaskCompletionPayout(params: {
     }));
 
     if (totalPenaltyDeducted.gt(0)) {
-      logger.info('Applying pending cancellation penalties to task completion payout', {
+      logger.info('[payoutService] Penalty deductions planned for task completion payout', {
         performerUid,
         taskId,
         grossAmount: grossAmount.toString(),
-        deducted: totalPenaltyDeducted.toString(),
-        netTransfer: netAmount.toString(),
-        deductionCount: penaltyPlan.lines.length,
+        totalPenaltyDeducted: totalPenaltyDeducted.toString(),
+        netAmount: netAmount.toString(),
+        deductionLineCount: penaltyPlan.lines.length,
+        penaltyLines: penaltyLinesMetadata,
+      });
+    } else {
+      logger.debug('[payoutService] No penalty deductions needed for task completion payout', {
+        performerUid,
+        taskId,
+        grossAmount: grossAmount.toString(),
       });
     }
 
@@ -885,7 +898,18 @@ export async function processTaskCompletionPayout(params: {
           await applyPenaltyLinesInTx(tx, penaltyPlan.lines);
         }
       });
+      logger.info('[payoutService] Penalty-only payout created and completed', {
+        performerUid,
+        taskId,
+        payoutId,
+        deductionLineCount: penaltyPlan.lines.length,
+      });
     } else {
+      logger.debug('[payoutService] Creating RazorpayX payout with penalty deduction applied', {
+        performerUid,
+        taskId,
+        netAmount: netAmount.toString(),
+      });
       const payoutResponse = await createRazorpayXPayout({
         fundAccountId,
         amountInPaise: Math.round(parseFloat(netAmount.toString()) * 100),

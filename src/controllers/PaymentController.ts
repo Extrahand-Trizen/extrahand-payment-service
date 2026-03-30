@@ -11,6 +11,7 @@ import { cancelPayment, cancelEscrow, cancelEscrowByTaskId } from '../services/c
 import { BadRequestError, NotFoundError } from '../errors/AppError';
 import logger from '../config/logger';
 import { prisma } from '../config/prisma';
+import { RAZORPAY_CONFIG } from '../config/razorpay';
 
 export class PaymentController {
   /**
@@ -192,6 +193,14 @@ export class PaymentController {
     }
 
     res.json(response);
+  }
+
+  /**
+   * GET /api/v1/payment/razorpay-key
+   * Public: publishable Key ID for client checkout only (never expose key secret).
+   */
+  static async getRazorpayKeyId(_req: Request, res: Response): Promise<void> {
+    res.json({ keyId: RAZORPAY_CONFIG.keyId });
   }
 }
 

@@ -131,20 +131,42 @@ export async function getUserTransactions(
           return null;
         }
       };
+      const normalizePercent = (value: Prisma.Decimal | null): Prisma.Decimal | null => {
+        if (!value) return null;
+        const one = new Prisma.Decimal('1');
+        const hundred = new Prisma.Decimal('100');
+        return value.greaterThan(one) ? value.div(hundred) : value;
+      };
       const totalPaid = new Prisma.Decimal(escrow.amountInRupees.toString());
+      const configuredPlatformPct = normalizePercent(toDecimal(escrow.appliedPlatformFeePercent));
+      const configuredGstPct = normalizePercent(toDecimal(escrow.appliedGstPercent));
+      const derivedTaskAmount = (() => {
+        if (!configuredPlatformPct) return null;
+        const gstPct = configuredGstPct || new Prisma.Decimal('0');
+        const multiplier = new Prisma.Decimal('1').plus(
+          configuredPlatformPct.mul(new Prisma.Decimal('1').plus(gstPct))
+        );
+        if (multiplier.lessThanOrEqualTo(0)) return null;
+        return totalPaid.div(multiplier).toDecimalPlaces(2);
+      })();
       const taskAmount =
         toDecimal(escrow.taskAmount) ||
         toDecimal(amountBreakdown.taskAmount) ||
         toDecimal(escrowMeta.taskAmount) ||
+        derivedTaskAmount ||
         totalPaid;
       const platformFee =
         toDecimal(amountBreakdown.platformFee) ||
         toDecimal(escrowMeta.platformFee) ||
+        (configuredPlatformPct ? taskAmount.mul(configuredPlatformPct).toDecimalPlaces(2) : null) ||
         new Prisma.Decimal('0');
       const gstAmount =
         toDecimal(amountBreakdown.gst) ||
         toDecimal(escrowMeta.gstAmount) ||
         toDecimal(escrowMeta.platformFeeGst) ||
+        ((configuredGstPct || configuredGstPct === null) && configuredPlatformPct
+          ? taskAmount.mul(configuredPlatformPct).mul(configuredGstPct || new Prisma.Decimal('0')).toDecimalPlaces(2)
+          : null) ||
         new Prisma.Decimal('0');
       const feesAndTaxes = platformFee.plus(gstAmount);
       const inferredFeesAndTaxes = totalPaid.minus(taskAmount);
@@ -186,6 +208,8 @@ export async function getUserTransactions(
             gstAmount: finalGst.toString(),
             totalPaid: totalPaid.toString(),
             refundedAmount: latestCompletedRefund?.refundAmount?.toString() || '0',
+            appliedPlatformFeePercent: configuredPlatformPct?.toString() || null,
+            appliedGstPercent: configuredGstPct?.toString() || null,
           }
         });
       }

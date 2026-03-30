@@ -172,6 +172,25 @@ export async function processRefund(params: {
 
     /** Actual INR captured on Razorpay (task + platform fee + GST, etc.) */
     const capturedRupees = new Prisma.Decimal((capturedPaise / 100).toFixed(2));
+    const normalizePercent = (value?: Prisma.Decimal | null): Prisma.Decimal | null => {
+      if (!value) return null;
+      const one = new Prisma.Decimal('1');
+      return value.greaterThan(one) ? value.div(new Prisma.Decimal('100')) : value;
+    };
+    const inferredTaskAmountFromEscrow = (() => {
+      const platformPct = normalizePercent(postgresEscrow.appliedPlatformFeePercent as Prisma.Decimal | null);
+      const gstPct = normalizePercent(postgresEscrow.appliedGstPercent as Prisma.Decimal | null) || new Prisma.Decimal('0');
+      if (!platformPct) return null;
+      const multiplier = new Prisma.Decimal('1').plus(platformPct.mul(new Prisma.Decimal('1').plus(gstPct)));
+      if (multiplier.lessThanOrEqualTo(0)) return null;
+      return capturedRupees.div(multiplier).toDecimalPlaces(2);
+    })();
+    const refundTaskBase =
+      feeBaseAmount != null
+        ? new Prisma.Decimal(feeBaseAmount.toString())
+        : postgresEscrow.taskAmount
+        ? new Prisma.Decimal(postgresEscrow.taskAmount.toString())
+        : inferredTaskAmountFromEscrow || capturedRupees;
 
     // Calculate cancellation fee and refund amount (use live capture, not only escrow row)
     let cancellationFeeResult: CancellationFeeResult | null = null;
@@ -190,9 +209,7 @@ export async function processRefund(params: {
     } else if (cancelledBy === 'performer') {
       // Tasker cancel: poster gets the task amount back (not platform fee or GST)
       // Platform fee and GST are retained; performer penalty handles policy enforcement
-      const performerRefundAmount = postgresEscrow.taskAmount 
-        ? new Prisma.Decimal(postgresEscrow.taskAmount.toString())
-        : capturedRupees; // Fallback to full capture if taskAmount not stored (legacy)
+      const performerRefundAmount = refundTaskBase;
       
       refundAmount = performerRefundAmount;
       cancellationFee = new Prisma.Decimal('0.00');
@@ -207,7 +224,7 @@ export async function processRefund(params: {
     } else {
       // Poster cancel: time-based cancellation fee may reduce refund
       // Use taskAmount as feeBaseAmount if available (for refund calculation on task amount only, not fees/GST)
-      const refundFeeBase = feeBaseAmount || (postgresEscrow.taskAmount ? new Prisma.Decimal(postgresEscrow.taskAmount.toString()) : capturedRupees);
+      const refundFeeBase = refundTaskBase;
       
       cancellationFeeResult = await calculateRefundWithCancellationFee({
         amount: refundFeeBase,  // Calculate fees on task amount, not full capture

@@ -985,9 +985,19 @@ export async function processTaskCompletionPayout(params: {
               status === 'failed' || status === 'reversed'
                 ? payoutResponse.failureReason || 'Payout failed'
                 : undefined,
-            metadata: metadataPayload as any,
+            metadata: {
+              ...metadataPayload,
+              penaltiesAppliedAt:
+                penaltyPlan.lines.length > 0 ? new Date().toISOString() : metadataPayload.penaltiesAppliedAt,
+            } as any,
           },
         });
+
+        if (penaltyPlan.lines.length > 0) {
+          await prisma.$transaction(async (tx) => {
+            await applyPenaltyLinesInTx(tx, penaltyPlan.lines);
+          });
+        }
       }
     }
 

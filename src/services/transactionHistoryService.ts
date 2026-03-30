@@ -244,6 +244,8 @@ export async function getUserTransactions(
             category: 'earnings', // Money received
             metadata: {
               taskId: escrow.taskId,
+              taskAmount: payout.amount.toString(),
+              totalPaid: payout.amount.toString(),
               grossAmount: payout.amount.toString(),
               platformCommission: payout.platformCommission.toString(),
               gstOnCommission: payout.gstOnCommission.toString(),
@@ -399,6 +401,15 @@ export async function getUserTransactions(
             payout.metadata && typeof payout.metadata === 'object' && !Array.isArray(payout.metadata)
               ? (payout.metadata as Record<string, unknown>)
               : {};
+          const penaltyDeducted =
+            typeof pm.penaltyDeducted === 'string'
+              ? Number.parseFloat(pm.penaltyDeducted)
+              : typeof pm.penaltyDeducted === 'number'
+              ? pm.penaltyDeducted
+              : 0;
+          const grossFromPenalty = Number.isFinite(penaltyDeducted) && penaltyDeducted > 0
+            ? new Prisma.Decimal(payout.netAmount.toString()).add(new Prisma.Decimal(penaltyDeducted.toString())).toString()
+            : payout.amount.toString();
           transactions.push({
             id: payout.id,
             transactionId: payout.payoutId,
@@ -410,7 +421,9 @@ export async function getUserTransactions(
             relatedEntityId: payout.payoutId,
             category: 'earnings',
             metadata: {
-              grossAmount: payout.amount.toString(),
+              taskAmount: grossFromPenalty,
+              totalPaid: payout.netAmount.toString(),
+              grossAmount: grossFromPenalty,
               platformCommission: payout.platformCommission.toString(),
               gstOnCommission: payout.gstOnCommission.toString(),
               tds: payout.tds?.toString() || '0',

@@ -820,7 +820,22 @@ export async function processTaskCompletionPayout(params: {
       grossAmount: grossAmount.toString(),
     });
 
-    const penaltyPlan = await planPenaltyDeductionsFromGross(performerUid, grossAmount);
+    // Fetch escrow associated with this task to check for the actual performer (may be different if linked account)
+    const taskEscrow = await prisma.escrow.findFirst({
+      where: { taskId },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    const linkedPerformerUids: string[] = [];
+    if (taskEscrow && taskEscrow.performerUid !== performerUid) {
+      linkedPerformerUids.push(taskEscrow.performerUid);
+      logger.debug('[payoutService] Found different performer in escrow, will check linked accounts', {
+        requestedPerformerUid: performerUid,
+        escrowPerformerUid: taskEscrow.performerUid,
+      });
+    }
+
+    const penaltyPlan = await planPenaltyDeductionsFromGross(performerUid, grossAmount, linkedPerformerUids);
     const netAmount = penaltyPlan.netTransfer;
     const totalPenaltyDeducted = penaltyPlan.totalDeducted;
     const platformCommission = new Prisma.Decimal(0);

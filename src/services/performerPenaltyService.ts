@@ -117,14 +117,22 @@ export type PenaltyDeductionLine = {
  */
 export async function planPenaltyDeductionsFromGross(
   performerUid: string,
-  grossAmount: Prisma.Decimal
+  grossAmount: Prisma.Decimal,
+  linkedPerformerUids?: string[]
 ): Promise<{
   netTransfer: Prisma.Decimal;
   totalDeducted: Prisma.Decimal;
   lines: PenaltyDeductionLine[];
 }> {
+  // Create unified performer UIDs list including linked accounts
+  const allPerformerUids = Array.from(
+    new Set([performerUid, ...(linkedPerformerUids || [])])
+  );
+
   logger.debug('[planPenaltyDeductionsFromGross] Starting penalty deduction planning', {
-    performerUid,
+    primaryPerformerUid: performerUid,
+    linkedPerformerUids: linkedPerformerUids || [],
+    allPerformerUids,
     grossAmount: grossAmount.toString(),
   });
 
@@ -142,7 +150,7 @@ export async function planPenaltyDeductionsFromGross(
 
   const pending = await prisma.performerCancellationPenalty.findMany({
     where: {
-      performerUid,
+      performerUid: { in: allPerformerUids },
       status: 'pending',
       remainingAmount: { gt: new Prisma.Decimal(0) },
     },

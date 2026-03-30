@@ -362,13 +362,14 @@ export async function calculateCancellationFee(params: {
       cancellationFeePercentage = 0.20;
     }
   } else {
-    // Performer cancel: refund to poster; bands mirror tasker tracking UI
+    // Performer cancel policy:
+    // >24h: collect platform fee + GST on platform fee
+    // <=24h: collect flat 10% on task amount only
     if (hoursUntilStart > 24) {
-      cancellationFeePercentage = 0;
-    } else if (hoursUntilStart > 1) {
-      cancellationFeePercentage = feeStructure.cancellationFees.medium;
+      cancellationFeePercentage =
+        feeStructure.platformFee.percentage * (1 + feeStructure.platformFee.gstPercentage);
     } else {
-      cancellationFeePercentage = 0.15;
+      cancellationFeePercentage = 0.10;
     }
   }
 

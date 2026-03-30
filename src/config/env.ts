@@ -37,6 +37,11 @@ const envSchema = z.object({
   
   // CORS
   CORS_ORIGIN: z.string().optional(),
+
+  /** Poster phones (10-digit or +91…) that skip Razorpay on escrow create when `metadata.posterPhone` matches. */
+  PLAY_REVIEW_BYPASS_PHONES: z.string().optional(),
+  /** Optional: poster Firebase UIDs that skip Razorpay on escrow create (Play review / demo). */
+  PLAY_REVIEW_BYPASS_UIDS: z.string().optional(),
 });
 
 export function validateEnv() {

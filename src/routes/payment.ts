@@ -5,7 +5,10 @@ import { asyncHandler } from '../middleware/errorHandler';
 
 const router = express.Router();
 
-// All payment routes require service authentication
+// Public: Key ID for mobile/web checkout (must match orders created by this service)
+router.get('/razorpay-key', asyncHandler(PaymentController.getRazorpayKeyId));
+
+// All other payment routes require service authentication
 router.use(serviceAuthMiddleware);
 
 // POST /api/v1/payment/create-order

@@ -1,6 +1,7 @@
 import { razorpay } from '../config/razorpay';
 import logger from '../config/logger';
 import { isPostgresConnected } from '../config/database';
+import { REVIEW_ORDER_ID_PREFIX } from '../utils/reviewBypass';
 // PaymentTransaction model removed - using Postgres Ledger instead
 import { createOrder } from './paymentService';
 import { sanitizeRazorpayOrderData, sanitizeRazorpayData, sanitizeRazorpayPaymentData } from '../utils/paymentSanitizer';
@@ -173,6 +174,13 @@ export async function createEscrow(params: {
 
     const razorpayOrder = orderResult.order;
 
+    const escrowMetadata = {
+      ...metadata,
+      ...(String(razorpayOrder.id).startsWith(REVIEW_ORDER_ID_PREFIX)
+        ? { reviewBypass: true }
+        : {}),
+    };
+
     // If Postgres is not connected, return order without saving
     if (!isPostgresConnected()) {
       logger.warn('⚠️ Postgres not connected - Escrow created but not saved');
@@ -234,7 +242,7 @@ export async function createEscrow(params: {
           status: 'pending',
           autoReleaseDate: autoReleaseDate,
           razorpayOrderData: sanitizedOrderData as any, // Store sanitized data in JSONB
-          metadata: metadata as any, // Store metadata in JSONB
+          metadata: escrowMetadata as any, // Store metadata in JSONB
           taskCategory: taskCategory ?? null,
           appliedGstPercent: appliedGstPercent ?? null,
           appliedPlatformFeePercent: appliedPlatformFeePercent ?? null,

@@ -16,6 +16,7 @@ import { BadRequestError, NotFoundError } from '../errors/AppError';
 import logger from '../config/logger';
 import { prisma } from '../config/prisma';
 import { RAZORPAY_CONFIG } from '../config/razorpay';
+import { isReviewBypassOrderId, isReviewBypassUid } from '../utils/reviewBypass';
 
 export class PaymentController {
   /**
@@ -80,9 +81,45 @@ export class PaymentController {
    */
   static async verifyPayment(req: Request, res: Response): Promise<void> {
     const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+    const uid = (req.headers['x-user-id'] as string | undefined)?.trim();
 
     if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
       throw new BadRequestError('Missing required parameters');
+    }
+
+    if (isReviewBypassOrderId(razorpay_order_id)) {
+      if (!isReviewBypassUid(uid)) {
+        throw new BadRequestError('Review payment verification not allowed for this user');
+      }
+      const escrowRow = await prisma.escrow.findUnique({
+        where: { razorpayOrderId: razorpay_order_id },
+      });
+      if (!escrowRow) {
+        throw new BadRequestError('Escrow not found');
+      }
+      if (escrowRow.posterUid !== uid) {
+        throw new BadRequestError('Forbidden');
+      }
+      const meta = escrowRow.metadata as Record<string, unknown> | null;
+      if (!meta || meta.reviewBypass !== true) {
+        throw new BadRequestError('Invalid review payment order');
+      }
+      const paymentEntity = {
+        id: razorpay_payment_id,
+        entity: 'payment',
+        reviewBypass: true,
+      };
+      await updateEscrowOnPaymentCapture(
+        razorpay_order_id,
+        razorpay_payment_id,
+        'captured',
+        paymentEntity
+      );
+      res.json({
+        success: true,
+        message: 'Payment verified (review bypass)',
+      });
+      return;
     }
 
     const result = verifyPaymentSignature(

@@ -37,6 +37,9 @@ const envSchema = z.object({
   
   // CORS
   CORS_ORIGIN: z.string().optional(),
+
+  /** Firestore/Firebase poster UIDs that skip Razorpay on escrow create (Play review / demo). */
+  PLAY_REVIEW_BYPASS_UIDS: z.string().optional(),
 });
 
 export function validateEnv() {

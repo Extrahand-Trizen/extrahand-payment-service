@@ -2,9 +2,40 @@ import Razorpay from 'razorpay';
 import crypto from 'crypto';
 import { razorpay, RAZORPAY_CONFIG } from '../config/razorpay';
 import logger from '../config/logger';
+import { prisma } from '../config/prisma';
+import { isPostgresConnected } from '../config/database';
+import {
+  isReviewBypassUid,
+  REVIEW_ORDER_ID_PREFIX,
+} from '../utils/reviewBypass';
 
 export const createOrder = async (amount: number, currency: string = 'INR', metadata: Record<string, any> = {}) => {
   try {
+    const posterUid =
+      typeof metadata.posterUid === 'string' ? metadata.posterUid.trim() : '';
+    if (posterUid && isReviewBypassUid(posterUid)) {
+      const id = `${REVIEW_ORDER_ID_PREFIX}${crypto.randomBytes(12).toString('hex')}`;
+      logger.info('Review bypass: skipped Razorpay order create', {
+        orderId: id,
+        posterUid,
+        amountPaise: amount,
+      });
+      const order = {
+        id,
+        entity: 'order',
+        amount,
+        amount_paid: 0,
+        amount_due: amount,
+        currency: currency || 'INR',
+        receipt: `rcpt_review_${Date.now()}`,
+        status: 'created',
+        attempts: 0,
+        created_at: Math.floor(Date.now() / 1000),
+        reviewBypass: true,
+      };
+      return { success: true, order };
+    }
+
     const options = {
       amount: amount, // Convert to paise
       currency,
@@ -82,6 +113,40 @@ export const getOrderDetails = async (orderId: string) => {
           attempts: 0,
           created_at: Math.floor(Date.now() / 1000),
         },
+      };
+    }
+
+    if (orderId.startsWith(REVIEW_ORDER_ID_PREFIX)) {
+      if (isPostgresConnected()) {
+        const escrowRow = await prisma.escrow.findUnique({
+          where: { razorpayOrderId: orderId },
+        });
+        if (escrowRow) {
+          const amountPaise = Number(escrowRow.amount);
+          logger.info('Review bypass order resolved from escrow', { orderId });
+          return {
+            success: true,
+            order: {
+              id: orderId,
+              entity: 'order',
+              amount: amountPaise,
+              amount_paid: 0,
+              amount_due: amountPaise,
+              currency: escrowRow.currency || 'INR',
+              receipt: `rcpt_review_escrow`,
+              status: 'created',
+              attempts: 0,
+              created_at: Math.floor(Date.now() / 1000),
+              reviewBypass: true,
+            },
+          };
+        }
+      }
+      logger.warn('Review order id but escrow not found', { orderId });
+      return {
+        success: false,
+        error: 'Order not found',
+        statusCode: 404,
       };
     }
 

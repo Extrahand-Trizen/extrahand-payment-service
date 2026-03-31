@@ -1,37 +1,16 @@
-/**
- * Refund Service
- * 
- * Handles refunds (full/partial) with cancellation fee calculation
- * Uses Prisma for financial data storage
- */
-
 import logger from '../config/logger';
 import { isPostgresConnected } from '../config/database';
-import { createLedgerEntry, getEscrowBalance } from './ledgerService';
-import { 
-  calculateCancellationFee, 
-  calculateRefundWithCancellationFee,
-  CancellationFeeResult 
-} from './feeCalculationService';
+import { calculateRefundWithCancellationFee, CancellationFeeResult } from './feeCalculationService';
 import { prisma } from '../config/prisma';
 import { Prisma } from '@prisma/client';
 import { createRefundAmountPaise, getPaymentDetails } from './paymentService';
 import { sanitizeRazorpayRefundData } from '../utils/paymentSanitizer';
-import { EmailServiceClient } from '../clients/EmailServiceClient';
+import { notifyRefundProcessed } from './paymentNotificationService';
 
-/**
- * Generate unique refund ID
- */
 function generateRefundId(): string {
   return `refund_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
 }
 
-/**
- * Process refund with cancellation fee
- * 
- * @param params - Refund parameters
- * @returns Refund result
- */
 export async function processRefund(params: {
   razorpayOrderId: string;
   razorpayPaymentId: string;
@@ -40,11 +19,8 @@ export async function processRefund(params: {
   taskStartDate: Date;
   cancelledAt: Date;
   userId?: string;
-  /** Optional: explicit refund in rupees (must match server rules if used) */
   amount?: number;
-  /** When poster cancels within 15 minutes of assignment → no fee (matches app UI) */
   assignedAt?: Date;
-  /** Task budget in rupees — % fee applies to this (matches "Task Amount" in cancel dialog) */
   feeBaseAmount?: number;
 }): Promise<{
   success: boolean;
@@ -72,51 +48,18 @@ export async function processRefund(params: {
       cancelledBy,
     });
 
-    // Get escrow from Postgres
     if (!isPostgresConnected()) {
       return { success: false, error: 'Postgres not connected' };
     }
 
-    const postgresEscrow = await prisma.escrow.findUnique({
-      where: { razorpayOrderId },
-    });
-
+    const postgresEscrow = await prisma.escrow.findUnique({ where: { razorpayOrderId } });
     if (!postgresEscrow) {
       logger.warn('⚠️ Escrow not found for order:', razorpayOrderId);
       return { success: false, error: 'Escrow not found' };
     }
 
-    // Check escrow status
     if (postgresEscrow.status === 'refunded') {
-      logger.warn('⚠️ Escrow already refunded', { razorpayOrderId });
-      // Check if there's an existing completed refund - return it for idempotency
-      const existingRefund = await prisma.refund.findFirst({
-        where: {
-          escrowId: postgresEscrow.id,
-          status: 'completed',
-        },
-        orderBy: { createdAt: 'desc' },
-      });
-      if (existingRefund) {
-        return {
-          success: true,
-          refund: {
-            refundId: existingRefund.refundId,
-            razorpayRefundId: existingRefund.razorpayRefundId,
-            amount: existingRefund.refundAmount.toString(),
-            cancellationFee: existingRefund.cancellationFee?.toString() || '0.00',
-            toOtherParty: existingRefund.toOtherParty?.toString() || '0.00',
-            toPlatform: existingRefund.toPlatform?.toString() || '0.00',
-            status: 'completed',
-          },
-        };
-      }
       return { success: false, error: 'Escrow already refunded' };
-    }
-
-    if (postgresEscrow.status !== 'held' && postgresEscrow.status !== 'pending') {
-      logger.warn('⚠️ Cannot refund - escrow status:', postgresEscrow.status);
-      return { success: false, error: `Cannot refund - escrow status: ${postgresEscrow.status}` };
     }
 
     // Idempotency check: Check if a refund is already in progress or completed for this payment
@@ -147,7 +90,6 @@ export async function processRefund(params: {
           },
         };
       }
-      // If processing, return error (don't allow duplicate processing)
       return { success: false, error: 'Refund already in progress' };
     }
 
@@ -500,14 +442,25 @@ export async function processRefund(params: {
         cancellationFee: cancellationFee.toString(),
       });
 
-      // Send refund processed email (non-blocking)
-      // Note: Requires user email lookup from user-service
+      // Send refund processed emails and notifications
       logger.info('Email trigger: refund_processed', {
         posterUid: postgresEscrow.posterUid,
         refundAmount: refundAmount.toString(),
         cancellationFee: cancellationFee.toString(),
         taskId: postgresEscrow.taskId,
         reason,
+      });
+
+      const taskTitle = (postgresEscrow.metadata as any)?.taskTitle || null;
+
+      notifyRefundProcessed({
+        posterUid: postgresEscrow.posterUid,
+        amount: refundAmount.toString(),
+        taskId: postgresEscrow.taskId,
+        taskTitle,
+        reason,
+      }).catch((error) => {
+        logger.warn('Failed to send refund notification', { error });
       });
 
       return {

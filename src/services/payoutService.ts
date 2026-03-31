@@ -15,6 +15,7 @@ import { Prisma } from '@prisma/client';
 import { updateUserPaymentProfile } from './userPaymentProfileService';
 import { createRazorpayXPayout, getRazorpayXPayoutStatus } from './razorpayxService';
 import { applyPenaltyLinesInTx, planPenaltyDeductionsFromGross } from './performerPenaltyService';
+import { notifyPayoutCompleted } from './paymentNotificationService';
 
 /**
  * Generate unique payout ID
@@ -1008,6 +1009,15 @@ export async function processTaskCompletionPayout(params: {
         payoutId,
       }).catch((error) => {
         logger.warn('Failed to update UserPaymentProfile after task completion payout', error);
+      });
+
+      notifyPayoutCompleted({
+        performerUid,
+        amount: netAmount.toString(),
+        taskTitle,
+        taskId,
+      }).catch((error) => {
+        logger.warn('Failed to send payout notification', { error });
       });
     }
 

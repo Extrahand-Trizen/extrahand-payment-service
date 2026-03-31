@@ -10,7 +10,9 @@ import { getFeeStructureForCategory } from './feeConfigService';
 import { createLedgerEntry, getEscrowBalance } from './ledgerService';
 import { Prisma } from '@prisma/client';
 import { EmailServiceClient } from '../clients/EmailServiceClient';
+import { InAppNotificationClient } from '../clients/InAppNotificationClient';
 import { logEscrowCreated, logPaymentCaptured, logPaymentFailed } from './auditLogService';
+import mongoose from 'mongoose';
 
 /**
  * Generate unique escrow ID
@@ -398,14 +400,57 @@ export async function updateEscrowOnPaymentCapture(
         logger.warn('Failed to update UserPaymentProfile for payment (non-critical):', error);
       });
 
-      // Send payment received email to poster (non-blocking)
-      // Note: Email requires user lookup from user-service which is async
+      // Send payment received email/in-app to poster (non-blocking)
       logger.info('Email trigger: payment_received', {
         posterUid: postgresEscrow.posterUid,
         amount: updatedEscrow.amountInRupees.toString(),
         taskId: postgresEscrow.taskId,
         escrowId: postgresEscrow.escrowId,
       });
+
+      (async () => {
+        try {
+          if (mongoose.connection.readyState === 1) {
+            const Profile = mongoose.connection.collection('profiles');
+            const posterProfile = await Profile.findOne({ uid: postgresEscrow.posterUid }) || await Profile.findOne({ _id: new mongoose.Types.ObjectId(postgresEscrow.posterUid) });
+            
+            if (posterProfile) {
+              const amountStr = updatedEscrow.amountInRupees.toString();
+              
+              // In-app Notification
+              await InAppNotificationClient.send({
+                userId: postgresEscrow.posterUid,
+                title: 'Amount received',
+                body: `Rs ${amountStr} payment received for task.`,
+                type: 'success',
+                category: 'payments',
+                data: {
+                  taskId: postgresEscrow.taskId,
+                  escrowId: postgresEscrow.escrowId,
+                  actionUrl: '/profile?section=payments'
+                }
+              });
+
+              // Email Notification
+              if (posterProfile.email) {
+                await EmailServiceClient.sendPaymentReceived(
+                  posterProfile.email,
+                  posterProfile.name || 'User',
+                  {
+                    amount: Number(amountStr),
+                    taskTitle: `Task ${postgresEscrow.taskId}`,
+                    transactionId: razorpayPaymentId,
+                    paymentDate: new Date().toLocaleString(),
+                    isEscrow: true
+                  }
+                );
+              }
+            }
+          }
+        } catch (err) {
+          logger.error('Error sending payment received notifications:', err);
+        }
+      })();
     }
 
     logger.info('✅ Escrow updated on payment capture (Postgres only)', {
@@ -621,14 +666,66 @@ export async function releaseEscrow(
       performerUid: postgresEscrow.performerUid,
     });
 
-    // Send email notification to performer (non-blocking)
-    // TODO: Fetch performer email from user-service
-    // For now, log the intent and the email can be triggered once profile lookup is implemented
+    // Send notifications to performer
     logger.info('Email trigger: escrow_released', {
       performerUid: postgresEscrow.performerUid,
       amount: postgresEscrow.amountInRupees.toString(),
       taskId: postgresEscrow.taskId,
     });
+
+    (async () => {
+      try {
+        if (mongoose.connection.readyState === 1) {
+          const Profile = mongoose.connection.collection('profiles');
+          const posterProfile = await Profile.findOne({ uid: postgresEscrow.posterUid }) || await Profile.findOne({ _id: new mongoose.Types.ObjectId(postgresEscrow.posterUid) });
+          const performerProfile = await Profile.findOne({ uid: postgresEscrow.performerUid }) || await Profile.findOne({ _id: new mongoose.Types.ObjectId(postgresEscrow.performerUid) });
+          
+          if (performerProfile) {
+            const amountStr = postgresEscrow.amountInRupees.toString();
+            
+            // In-app Notification
+            await InAppNotificationClient.send({
+              userId: postgresEscrow.performerUid,
+              title: 'Amount credited',
+              body: `Rs ${amountStr} payout credited.`,
+              type: 'success',
+              category: 'payments',
+              data: {
+                taskId: postgresEscrow.taskId,
+                escrowId: postgresEscrow.escrowId,
+                actionUrl: '/profile?section=payments'
+              }
+            });
+
+            // Email Notification
+            if (performerProfile.email) {
+              await EmailServiceClient.sendEscrowReleased(
+                performerProfile.email,
+                performerProfile.name || 'Tasker',
+                {
+                  amount: Number(amountStr),
+                  taskTitle: `Task ${postgresEscrow.taskId}`,
+                  requesterName: posterProfile?.name || 'Poster',
+                  transactionId: transactionId,
+                  estimatedArrival: '1-2 business days'
+                }
+              );
+            }
+
+            // SMS by default for payout
+            if (performerProfile.phoneNumber || performerProfile.phone) {
+              const phone = performerProfile.phoneNumber || performerProfile.phone;
+              await import('../clients/Fast2SMSClient').then(m => m.Fast2SMSClient.sendSMS(
+                phone,
+                `ExtraHand: Rs ${amountStr} payout credited to your account. It will reflect in your bank account shortly.`
+              ));
+            }
+          }
+        }
+      } catch (err) {
+        logger.error('Error sending escrow released notifications:', err);
+      }
+    })();
 
     // Convert to frontend format
     const escrowForFrontend = await convertPostgresEscrowToFrontendFormat(updatedEscrow);

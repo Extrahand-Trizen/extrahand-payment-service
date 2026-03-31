@@ -38,6 +38,9 @@ const envSchema = z.object({
   // CORS
   CORS_ORIGIN: z.string().optional(),
 
+  // Fast2SMS
+  FAST2SMS_API_KEY: z.string().optional(),
+
   /** Poster phones (10-digit or +91…) that skip Razorpay on escrow create when `metadata.posterPhone` matches. */
   PLAY_REVIEW_BYPASS_PHONES: z.string().optional(),
   /** Optional: poster Firebase UIDs that skip Razorpay on escrow create (Play review / demo). */

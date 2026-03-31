@@ -7,6 +7,7 @@ import { prisma } from '../config/prisma';
 import logger from '../config/logger';
 import { isPostgresConnected } from '../config/database';
 import { calculateCancellationFee } from './feeCalculationService';
+import { notifyPenaltyCreated } from './paymentNotificationService';
 
 function generatePenaltyId(): string {
   return `penalty_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
@@ -92,6 +93,15 @@ export async function createPerformerCancellationPenalty(params: {
       taskId,
       performerUid,
       amount: penaltyAmt.toString(),
+    });
+
+    notifyPenaltyCreated({
+      performerUid,
+      amount: penaltyAmt.toString(),
+      taskTitle,
+      taskId,
+    }).catch((error) => {
+      logger.warn('Failed to send penalty notification', { error });
     });
 
     return {

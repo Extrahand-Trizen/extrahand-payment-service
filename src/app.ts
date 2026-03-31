@@ -10,11 +10,15 @@ import { errorHandler } from './middleware/errorHandler';
 import routes from './routes';
 import logger from './config/logger';
 import { EmailServiceClient } from './clients/EmailServiceClient';
+import { InAppNotificationClient } from './clients/InAppNotificationClient';
+import { Fast2SMSClient } from './clients/Fast2SMSClient';
 
 const env = validateEnv();
 
 // Initialize service clients
 EmailServiceClient.initialize();
+InAppNotificationClient.initialize();
+Fast2SMSClient.initialize();
 
 export function createApp(): Application {
   const app = express();

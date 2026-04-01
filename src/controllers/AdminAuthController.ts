@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import { asyncHandler } from '../middleware/errorHandler';
 import { getAdminUser, verifyPassword } from '../services/adminAuthService';
-
+ 
 export class AdminAuthController {
   static login = asyncHandler(async (req: Request, res: Response) => {
     const { username, password } = req.body || {};

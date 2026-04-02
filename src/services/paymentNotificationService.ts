@@ -99,11 +99,13 @@ export async function notifyRefundInitiated(params: {
     hasEmail: !!email,
   });
 
+  const actionUrl = taskId ? `/tasks/${taskId}/track` : '/tasks';
+
   await sendInApp({
     userId: posterUid,
-    title: 'Refund initiated',
-    body: `Your refund of ₹${amount}${taskTitle ? ` for ${taskTitle}` : ''} has been initiated. You will receive it in 5-7 days.`,
-    data: { taskId, amount, reason },
+    title: 'Task cancelled',
+    body: `The task${taskTitle ? ` "${taskTitle}"` : ''} has been cancelled. Your amount will be refunded within 5-7 days.`,
+    data: { taskId, amount, reason, actionUrl },
   });
 
   if (email && userName) {

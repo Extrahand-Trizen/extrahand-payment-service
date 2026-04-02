@@ -475,6 +475,15 @@ export async function processRefund(params: {
 
       const taskTitle = (postgresEscrow.metadata as any)?.taskTitle || null;
       const posterContact = await getProfileContact(postgresEscrow.posterUid);
+      logger.info('[RefundService.processRefund] Dispatching poster refund notification', {
+        posterUid: postgresEscrow.posterUid,
+        taskId: postgresEscrow.taskId,
+        taskTitle,
+        refundAmount: refundAmount.toString(),
+        hasPosterEmail: Boolean(posterContact?.email),
+        hasPosterName: Boolean(posterContact?.name),
+        category: 'payments',
+      });
 
       notifyRefundInitiated({
         posterUid: postgresEscrow.posterUid,
@@ -485,7 +494,11 @@ export async function processRefund(params: {
         email: posterContact?.email || null,
         userName: posterContact?.name || null,
       }).catch((error) => {
-        logger.warn('Failed to send refund initiated notification', { error });
+        logger.warn('[RefundService.processRefund] Failed to send refund initiated notification', {
+          posterUid: postgresEscrow.posterUid,
+          taskId: postgresEscrow.taskId,
+          error: error instanceof Error ? error.message : String(error),
+        });
       });
 
       return {

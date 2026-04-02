@@ -3,12 +3,34 @@ import { isPostgresConnected } from '../config/database';
 import { calculateRefundWithCancellationFee, CancellationFeeResult } from './feeCalculationService';
 import { prisma } from '../config/prisma';
 import { Prisma } from '@prisma/client';
+import mongoose from 'mongoose';
 import { createRefundAmountPaise, getPaymentDetails } from './paymentService';
 import { sanitizeRazorpayRefundData } from '../utils/paymentSanitizer';
-import { notifyRefundProcessed } from './paymentNotificationService';
+import { notifyRefundInitiated } from './paymentNotificationService';
 
 function generateRefundId(): string {
   return `refund_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+}
+
+async function getProfileContact(uid: string): Promise<{ email?: string; name?: string } | null> {
+  if (!uid || mongoose.connection.readyState !== 1) return null;
+
+  try {
+    const Profile = mongoose.connection.collection('profiles');
+    const profile =
+      (await Profile.findOne({ uid })) ||
+      (mongoose.isValidObjectId(uid) ? await Profile.findOne({ _id: new mongoose.Types.ObjectId(uid) }) : null);
+
+    if (!profile) return null;
+
+    return {
+      email: profile.email,
+      name: profile.name || profile.displayName || 'User',
+    };
+  } catch (error) {
+    logger.debug('Failed to load profile contact for refund notification', { error, uid });
+    return null;
+  }
 }
 
 export async function processRefund(params: {
@@ -442,8 +464,8 @@ export async function processRefund(params: {
         cancellationFee: cancellationFee.toString(),
       });
 
-      // Send refund processed emails and notifications
-      logger.info('Email trigger: refund_processed', {
+      // Send refund initiated emails and notifications
+      logger.info('Email trigger: refund_initiated', {
         posterUid: postgresEscrow.posterUid,
         refundAmount: refundAmount.toString(),
         cancellationFee: cancellationFee.toString(),
@@ -452,15 +474,18 @@ export async function processRefund(params: {
       });
 
       const taskTitle = (postgresEscrow.metadata as any)?.taskTitle || null;
+      const posterContact = await getProfileContact(postgresEscrow.posterUid);
 
-      notifyRefundProcessed({
+      notifyRefundInitiated({
         posterUid: postgresEscrow.posterUid,
         amount: refundAmount.toString(),
         taskId: postgresEscrow.taskId,
         taskTitle,
         reason,
+        email: posterContact?.email || null,
+        userName: posterContact?.name || null,
       }).catch((error) => {
-        logger.warn('Failed to send refund notification', { error });
+        logger.warn('Failed to send refund initiated notification', { error });
       });
 
       return {

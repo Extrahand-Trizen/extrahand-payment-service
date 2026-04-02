@@ -203,6 +203,53 @@ export class EmailServiceClient {
   }
 
   /**
+   * Send refund initiated notification
+   */
+  static async sendRefundInitiated(
+    email: string,
+    userName: string,
+    refundDetails: {
+      amount: number;
+      taskTitle?: string;
+      refundReason?: string;
+      processingTime?: string;
+    }
+  ): Promise<boolean> {
+    return this.sendRequest('/send', {
+      to: email,
+      subject: '↩️ Refund Initiated - ExtraHand',
+      template: 'refund_initiated',
+      data: {
+        userName,
+        ...refundDetails,
+      },
+    });
+  }
+
+  /**
+   * Send payout initiated notification
+   */
+  static async sendPayoutInitiated(
+    email: string,
+    userName: string,
+    payoutDetails: {
+      amount: number;
+      taskTitle?: string;
+      processingTime?: string;
+    }
+  ): Promise<boolean> {
+    return this.sendRequest('/send', {
+      to: email,
+      subject: '💸 Payout Initiated - ExtraHand',
+      template: 'payout_initiated',
+      data: {
+        userName,
+        ...payoutDetails,
+      },
+    });
+  }
+
+  /**
    * Send invoice
    */
   static async sendInvoice(

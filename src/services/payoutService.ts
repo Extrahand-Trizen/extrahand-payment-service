@@ -12,10 +12,11 @@ import { calculateFees, FeeBreakdown } from './feeCalculationService';
 import { transferToBank, getBankTransferStatus } from './mockBankTransferService';
 import { prisma } from '../config/prisma';
 import { Prisma } from '@prisma/client';
+import mongoose from 'mongoose';
 import { updateUserPaymentProfile } from './userPaymentProfileService';
 import { createRazorpayXPayout, getRazorpayXPayoutStatus } from './razorpayxService';
 import { applyPenaltyLinesInTx, planPenaltyDeductionsFromGross } from './performerPenaltyService';
-import { notifyPayoutCompleted } from './paymentNotificationService';
+import { notifyPayoutInitiated } from './paymentNotificationService';
 
 /**
  * Generate unique payout ID
@@ -36,6 +37,27 @@ function parseVerificationRef(ref?: string | null): { fundAccountId?: string } {
 
 function pendingTaskPayoutJobId(taskId: string, performerUid: string): string {
   return `pending_task_payout_${taskId}_${performerUid}`;
+}
+
+async function getProfileContact(uid: string): Promise<{ email?: string; name?: string } | null> {
+  if (!uid || mongoose.connection.readyState !== 1) return null;
+
+  try {
+    const Profile = mongoose.connection.collection('profiles');
+    const profile =
+      (await Profile.findOne({ uid })) ||
+      (mongoose.isValidObjectId(uid) ? await Profile.findOne({ _id: new mongoose.Types.ObjectId(uid) }) : null);
+
+    if (!profile) return null;
+
+    return {
+      email: profile.email,
+      name: profile.name || profile.displayName || 'Tasker',
+    };
+  } catch (error) {
+    logger.debug('Failed to load profile contact for payout notification', { error, uid });
+    return null;
+  }
 }
 
 function mapRazorpayPayoutStatusToInternal(razorpayStatus?: string | null): string {
@@ -681,6 +703,20 @@ export async function processPayout(params: {
         transactionId: bankTransferResult.transactionId,
       });
 
+      const taskTitle = (postgresEscrow.metadata as any)?.taskTitle || null;
+      const performerContact = await getProfileContact(performerUid);
+
+      notifyPayoutInitiated({
+        performerUid,
+        amount: netPayoutAmount.toString(),
+        taskId: postgresEscrow.taskId,
+        taskTitle,
+        email: performerContact?.email || null,
+        userName: performerContact?.name || null,
+      }).catch((error) => {
+        logger.warn('Failed to send payout initiated notification', { error });
+      });
+
       return {
         success: true,
         payout: {
@@ -1011,13 +1047,16 @@ export async function processTaskCompletionPayout(params: {
         logger.warn('Failed to update UserPaymentProfile after task completion payout', error);
       });
 
-      notifyPayoutCompleted({
+      const performerContact = await getProfileContact(performerUid);
+      notifyPayoutInitiated({
         performerUid,
         amount: netAmount.toString(),
         taskTitle,
         taskId,
+        email: performerContact?.email || null,
+        userName: performerContact?.name || null,
       }).catch((error) => {
-        logger.warn('Failed to send payout notification', { error });
+        logger.warn('Failed to send payout initiated notification', { error });
       });
     }
 

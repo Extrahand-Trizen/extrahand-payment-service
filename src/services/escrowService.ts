@@ -410,41 +410,42 @@ export async function updateEscrowOnPaymentCapture(
 
       (async () => {
         try {
+          const amountStr = updatedEscrow.amountInRupees.toString();
+
+          // In-app Notification: send regardless of profile lookup/FCM tokens
+          await InAppNotificationClient.send({
+            userId: postgresEscrow.posterUid,
+            title: 'Amount received',
+            body: `Rs ${amountStr} payment received for task.`,
+            type: 'success',
+            category: 'payments',
+            data: {
+              taskId: postgresEscrow.taskId,
+              escrowId: postgresEscrow.escrowId,
+              actionUrl: '/profile?section=payments'
+            }
+          });
+
           if (mongoose.connection.readyState === 1) {
             const Profile = mongoose.connection.collection('profiles');
-            const posterProfile = await Profile.findOne({ uid: postgresEscrow.posterUid }) || await Profile.findOne({ _id: new mongoose.Types.ObjectId(postgresEscrow.posterUid) });
+            const posterProfile =
+              (await Profile.findOne({ uid: postgresEscrow.posterUid })) ||
+              (mongoose.isValidObjectId(postgresEscrow.posterUid)
+                ? await Profile.findOne({ _id: new mongoose.Types.ObjectId(postgresEscrow.posterUid) })
+                : null);
             
-            if (posterProfile) {
-              const amountStr = updatedEscrow.amountInRupees.toString();
-              
-              // In-app Notification
-              await InAppNotificationClient.send({
-                userId: postgresEscrow.posterUid,
-                title: 'Amount received',
-                body: `Rs ${amountStr} payment received for task.`,
-                type: 'success',
-                category: 'payments',
-                data: {
-                  taskId: postgresEscrow.taskId,
-                  escrowId: postgresEscrow.escrowId,
-                  actionUrl: '/profile?section=payments'
+            if (posterProfile?.email) {
+              await EmailServiceClient.sendPaymentReceived(
+                posterProfile.email,
+                posterProfile.name || 'User',
+                {
+                  amount: Number(amountStr),
+                  taskTitle: `Task ${postgresEscrow.taskId}`,
+                  transactionId: razorpayPaymentId,
+                  paymentDate: new Date().toLocaleString(),
+                  isEscrow: true
                 }
-              });
-
-              // Email Notification
-              if (posterProfile.email) {
-                await EmailServiceClient.sendPaymentReceived(
-                  posterProfile.email,
-                  posterProfile.name || 'User',
-                  {
-                    amount: Number(amountStr),
-                    taskTitle: `Task ${postgresEscrow.taskId}`,
-                    transactionId: razorpayPaymentId,
-                    paymentDate: new Date().toLocaleString(),
-                    isEscrow: true
-                  }
-                );
-              }
+              );
             }
           }
         } catch (err) {

@@ -17,6 +17,7 @@ import { updateUserPaymentProfile } from './userPaymentProfileService';
 import { createRazorpayXPayout, getRazorpayXPayoutStatus } from './razorpayxService';
 import { applyPenaltyLinesInTx, planPenaltyDeductionsFromGross } from './performerPenaltyService';
 import { notifyPayoutInitiated } from './paymentNotificationService';
+import { getFeeStructure } from './feeConfigService';
 
 /**
  * Generate unique payout ID
@@ -850,11 +851,27 @@ export async function processTaskCompletionPayout(params: {
       };
     }
 
-    const grossAmount = new Prisma.Decimal(amount.toString());
+    const grossAmount = new Prisma.Decimal(amount.toString()).toDecimalPlaces(2);
+    const feeStructure = await getFeeStructure();
+    const platformCommission = grossAmount
+      .mul(feeStructure.platformFee.percentage)
+      .toDecimalPlaces(2);
+    const gstOnCommission = platformCommission
+      .mul(feeStructure.platformFee.gstPercentage)
+      .toDecimalPlaces(2);
+    const platformFeeTotal = platformCommission.add(gstOnCommission).toDecimalPlaces(2);
+    const payoutBaseAmount = Prisma.Decimal.max(
+      grossAmount.sub(platformFeeTotal).toDecimalPlaces(2),
+      new Prisma.Decimal('0.00')
+    );
+
     logger.debug('[payoutService] Starting penalty planning for task completion payout', {
       performerUid,
       taskId,
       grossAmount: grossAmount.toString(),
+      platformCommission: platformCommission.toString(),
+      gstOnCommission: gstOnCommission.toString(),
+      payoutBaseAmount: payoutBaseAmount.toString(),
     });
 
     // Fetch escrow associated with this task to check for the actual performer (may be different if linked account)
@@ -872,12 +889,15 @@ export async function processTaskCompletionPayout(params: {
       });
     }
 
-    const penaltyPlan = await planPenaltyDeductionsFromGross(performerUid, grossAmount, linkedPerformerUids);
+    const penaltyPlan = await planPenaltyDeductionsFromGross(
+      performerUid,
+      payoutBaseAmount,
+      linkedPerformerUids
+    );
     const netAmount = penaltyPlan.netTransfer;
     const totalPenaltyDeducted = penaltyPlan.totalDeducted;
-    const platformCommission = new Prisma.Decimal(0);
-    const gstOnCommission = new Prisma.Decimal(0);
     const tds = new Prisma.Decimal(0);
+    const totalDeductions = platformFeeTotal.add(totalPenaltyDeducted).toDecimalPlaces(2);
     const penaltyLinesMetadata = penaltyPlan.lines.map((line) => ({
       penaltyDbId: line.penaltyDbId,
       penaltyId: line.penaltyId,
@@ -892,6 +912,7 @@ export async function processTaskCompletionPayout(params: {
         taskId,
         grossAmount: grossAmount.toString(),
         totalPenaltyDeducted: totalPenaltyDeducted.toString(),
+        totalFeeDeducted: platformFeeTotal.toString(),
         netAmount: netAmount.toString(),
         deductionLineCount: penaltyPlan.lines.length,
         penaltyLines: penaltyLinesMetadata,
@@ -901,6 +922,7 @@ export async function processTaskCompletionPayout(params: {
         performerUid,
         taskId,
         grossAmount: grossAmount.toString(),
+        totalFeeDeducted: platformFeeTotal.toString(),
       });
     }
 
@@ -911,8 +933,28 @@ export async function processTaskCompletionPayout(params: {
       taskId,
       taskTitle,
       grossAmount: grossAmount.toString(),
+      taskAmount: grossAmount.toString(),
+      platformFee: platformCommission.toString(),
+      platformFeeGst: gstOnCommission.toString(),
+      gstAmount: gstOnCommission.toString(),
+      totalFeeDeducted: platformFeeTotal.toString(),
+      totalDeductions: totalDeductions.toString(),
+      netAmount: netAmount.toString(),
       penaltyDeducted: totalPenaltyDeducted.toString(),
       penaltyLines: penaltyLinesMetadata,
+      amountBreakdown: {
+        taskAmount: grossAmount.toString(),
+        platformFee: platformCommission.toString(),
+        gst: gstOnCommission.toString(),
+        totalFeeDeducted: platformFeeTotal.toString(),
+        penaltyDeducted: totalPenaltyDeducted.toString(),
+        totalDeductions: totalDeductions.toString(),
+        netAmount: netAmount.toString(),
+      },
+      feeMeta: {
+        platformFeePercentage: feeStructure.platformFee.percentage,
+        gstPercentage: feeStructure.platformFee.gstPercentage,
+      },
       penaltiesAppliedAt: null as string | null,
     };
 
@@ -1075,7 +1117,7 @@ export async function processTaskCompletionPayout(params: {
           platformCommission: platformCommission.toString(),
           gstOnCommission: gstOnCommission.toString(),
           tds: tds.toString(),
-          total: '0',
+          total: platformFeeTotal.toString(),
         },
       },
     };
@@ -1241,6 +1283,10 @@ export async function getPayoutStatus(payoutId: string): Promise<{
           platformCommission: updatedPayout.platformCommission.toString(),
           gstOnCommission: updatedPayout.gstOnCommission.toString(),
           tds: updatedPayout.tds?.toString(),
+          total: updatedPayout.platformCommission
+            .plus(updatedPayout.gstOnCommission)
+            .plus(updatedPayout.tds || 0)
+            .toString(),
         },
         bankTransferId: updatedPayout.bankTransferId,
         status: updatedPayout.status,
@@ -1297,6 +1343,10 @@ export async function getPayoutsByEscrowId(escrowId: string): Promise<{
           platformCommission: payout.platformCommission.toString(),
           gstOnCommission: payout.gstOnCommission.toString(),
           tds: payout.tds?.toString(),
+          total: payout.platformCommission
+            .plus(payout.gstOnCommission)
+            .plus(payout.tds || 0)
+            .toString(),
         },
         status: payout.status,
         type: payout.type,

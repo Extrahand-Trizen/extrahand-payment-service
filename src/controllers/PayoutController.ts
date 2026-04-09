@@ -93,6 +93,11 @@ export class PayoutController {
     res.json({
       success: true,
       payout: result.payout,
+      payoutId: result.payout?.payoutId,
+      status: result.payout?.status,
+      amount: result.payout?.amount,
+      netAmount: result.payout?.netAmount,
+      fees: result.payout?.fees,
       message: 'Payout processed for task completion',
     });
   }

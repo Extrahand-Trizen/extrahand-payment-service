@@ -247,10 +247,23 @@ export async function getUserTransactions(
               taskAmount: payout.amount.toString(),
               totalPaid: payout.amount.toString(),
               grossAmount: payout.amount.toString(),
+              platformFee: payout.platformCommission.toString(),
+              platformFeeGst: payout.gstOnCommission.toString(),
+              gstAmount: payout.gstOnCommission.toString(),
               platformCommission: payout.platformCommission.toString(),
               gstOnCommission: payout.gstOnCommission.toString(),
               tds: payout.tds?.toString() || '0',
               netAmount: payout.netAmount.toString(),
+              amountBreakdown: {
+                taskAmount: payout.amount.toString(),
+                platformFee: payout.platformCommission.toString(),
+                gst: payout.gstOnCommission.toString(),
+                totalDeductions: payout.platformCommission
+                  .add(payout.gstOnCommission)
+                  .add(payout.tds || 0)
+                  .toString(),
+                netAmount: payout.netAmount.toString(),
+              },
               penaltyDeducted: penaltyDeducted,
               penaltyLines: penaltyLines,
               penaltiesAppliedAt: payoutMetadata.penaltiesAppliedAt || null,
@@ -422,12 +435,25 @@ export async function getUserTransactions(
             category: 'earnings',
             metadata: {
               taskAmount: grossFromPenalty,
-              totalPaid: payout.netAmount.toString(),
+              totalPaid: grossFromPenalty,
               grossAmount: grossFromPenalty,
+              platformFee: payout.platformCommission.toString(),
+              platformFeeGst: payout.gstOnCommission.toString(),
+              gstAmount: payout.gstOnCommission.toString(),
               platformCommission: payout.platformCommission.toString(),
               gstOnCommission: payout.gstOnCommission.toString(),
               tds: payout.tds?.toString() || '0',
               netAmount: payout.netAmount.toString(),
+              amountBreakdown: {
+                taskAmount: grossFromPenalty,
+                platformFee: payout.platformCommission.toString(),
+                gst: payout.gstOnCommission.toString(),
+                totalDeductions: payout.platformCommission
+                  .add(payout.gstOnCommission)
+                  .add(payout.tds || 0)
+                  .toString(),
+                netAmount: payout.netAmount.toString(),
+              },
               ...pm,
             },
           });

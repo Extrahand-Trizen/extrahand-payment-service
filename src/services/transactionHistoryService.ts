@@ -267,6 +267,7 @@ export async function getUserTransactions(
               penaltyDeducted: penaltyDeducted,
               penaltyLines: penaltyLines,
               penaltiesAppliedAt: payoutMetadata.penaltiesAppliedAt || null,
+              posterUid: escrow.posterUid,
               // Add task-related info if available (metadata is JSON, so we need to check type)
               ...(escrow.metadata && typeof escrow.metadata === 'object' && !Array.isArray(escrow.metadata)
                 ? {

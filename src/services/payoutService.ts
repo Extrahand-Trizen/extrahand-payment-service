@@ -932,6 +932,7 @@ export async function processTaskCompletionPayout(params: {
     const metadataPayload = {
       taskId,
       taskTitle,
+      posterUid: taskEscrow?.posterUid,
       grossAmount: grossAmount.toString(),
       taskAmount: grossAmount.toString(),
       platformFee: platformCommission.toString(),

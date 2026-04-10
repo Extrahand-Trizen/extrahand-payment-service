@@ -74,6 +74,11 @@ let feeStructureCache: FeeStructure | null = null;
 let cacheTimestamp: number = 0;
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
+const GST_18_PERCENT_CATEGORY_KEYS = new Set([
+  'water-tanker-services',
+  'driver-chauffeur',
+]);
+
 /**
  * Get fee structure from SystemConfig table
  * Falls back to environment variables if not found
@@ -230,6 +235,8 @@ export async function getFeeStructureForCategory(categoryKey?: string): Promise<
 
     if (!effectiveCfg) return base;
 
+    const forcedGstPercentage = GST_18_PERCENT_CATEGORY_KEYS.has(key) ? 0.18 : undefined;
+
     // Convert Decimal fields (if present) to numbers
     const cfgGst = effectiveCfg.gstPercentage !== null && effectiveCfg.gstPercentage !== undefined
       ? Number(effectiveCfg.gstPercentage)
@@ -248,7 +255,7 @@ export async function getFeeStructureForCategory(categoryKey?: string): Promise<
       platformFee: {
         ...base.platformFee,
         percentage: cfgPlatform ?? base.platformFee.percentage,
-        gstPercentage: cfgGst ?? base.platformFee.gstPercentage,
+        gstPercentage: forcedGstPercentage ?? cfgGst ?? base.platformFee.gstPercentage,
       },
       processingFees: {
         ...base.processingFees,

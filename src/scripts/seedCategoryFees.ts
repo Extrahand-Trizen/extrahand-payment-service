@@ -2,6 +2,11 @@ import { prisma } from '../config/prisma';
 import XLSX from 'xlsx';
 import logger from '../config/logger';
 
+const GST_18_PERCENT_CATEGORY_KEYS = new Set([
+  'water-tanker-services',
+  'driver-chauffeur',
+]);
+
 async function run() {
   try {
     const workbook = XLSX.readFile('../Categories with GST 1.xlsx');
@@ -30,7 +35,9 @@ async function run() {
       const categoryKey = categoryLabel ? slugify(categoryLabel) : null;
       if (!categoryKey) continue;
 
-      const resolvedGst = parsePercent(r['gstPercentage'] ?? r['GST Rate']) ?? 0.18;
+      const resolvedGst = GST_18_PERCENT_CATEGORY_KEYS.has(categoryKey)
+        ? 0.18
+        : (parsePercent(r['gstPercentage'] ?? r['GST Rate']) ?? 0.18);
 
       const payload: any = {
         categoryKey,

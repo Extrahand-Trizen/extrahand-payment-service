@@ -3,7 +3,7 @@ import { serviceAuthMiddleware } from '../middleware/serviceAuth';
 import { PaymentController } from '../controllers/PaymentController';
 import { asyncHandler } from '../middleware/errorHandler';
 
-const router = express.Router();
+const router = express.Router();    
 
 // Public: Key ID for mobile/web checkout (must match orders created by this service)
 router.get('/razorpay-key', asyncHandler(PaymentController.getRazorpayKeyId));

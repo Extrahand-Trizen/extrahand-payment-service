@@ -18,6 +18,7 @@ import { createRazorpayXPayout, getRazorpayXPayoutStatus } from './razorpayxServ
 import { applyPenaltyLinesInTx, planPenaltyDeductionsFromGross } from './performerPenaltyService';
 import { notifyPayoutInitiated } from './paymentNotificationService';
 import { getFeeStructure } from './feeConfigService';
+import { applyExtraCoinsForPayout, awardExtraCoinsForCompletedTask } from './extraCoinsService';
 
 /**
  * Generate unique payout ID
@@ -865,6 +866,47 @@ export async function processTaskCompletionPayout(params: {
       new Prisma.Decimal('0.00')
     );
 
+    const payoutId = generatePayoutId();
+
+    let redeemedCoins = new Prisma.Decimal('0.00');
+    let redeemedRupees = new Prisma.Decimal('0.00');
+    let redeemedSources: Array<{
+      transactionId: string;
+      redeemedCoins: string;
+      redeemedRupees: string;
+    }> = [];
+
+    try {
+      const redeemResult = await applyExtraCoinsForPayout({
+        userId: performerUid,
+        payoutId,
+        taskId,
+        maxRedeemRupees: platformFeeTotal,
+      });
+
+      if (redeemResult.success) {
+        redeemedCoins = new Prisma.Decimal(redeemResult.redeemedCoins);
+        redeemedRupees = new Prisma.Decimal(redeemResult.redeemedRupees);
+        redeemedSources = redeemResult.sources;
+      } else {
+        logger.warn('[payoutService] ExtraCoins redeem skipped due to service error', {
+          performerUid,
+          taskId,
+          error: redeemResult.error,
+        });
+      }
+    } catch (redeemError: any) {
+      logger.warn('[payoutService] ExtraCoins redeem failed unexpectedly, continuing payout without bonus', {
+        performerUid,
+        taskId,
+        error: redeemError?.message || 'Unknown error',
+      });
+    }
+
+    const payoutBaseAfterExtraCoins = payoutBaseAmount
+      .add(redeemedRupees)
+      .toDecimalPlaces(2);
+
     logger.debug('[payoutService] Starting penalty planning for task completion payout', {
       performerUid,
       taskId,
@@ -872,6 +914,9 @@ export async function processTaskCompletionPayout(params: {
       platformCommission: platformCommission.toString(),
       gstOnCommission: gstOnCommission.toString(),
       payoutBaseAmount: payoutBaseAmount.toString(),
+      redeemedRupees: redeemedRupees.toString(),
+      redeemedCoins: redeemedCoins.toString(),
+      payoutBaseAfterExtraCoins: payoutBaseAfterExtraCoins.toString(),
     });
 
     // Fetch escrow associated with this task to check for the actual performer (may be different if linked account)
@@ -891,13 +936,16 @@ export async function processTaskCompletionPayout(params: {
 
     const penaltyPlan = await planPenaltyDeductionsFromGross(
       performerUid,
-      payoutBaseAmount,
+      payoutBaseAfterExtraCoins,
       linkedPerformerUids
     );
     const netAmount = penaltyPlan.netTransfer;
     const totalPenaltyDeducted = penaltyPlan.totalDeducted;
     const tds = new Prisma.Decimal(0);
-    const totalDeductions = platformFeeTotal.add(totalPenaltyDeducted).toDecimalPlaces(2);
+    const totalDeductions = platformFeeTotal
+      .add(totalPenaltyDeducted)
+      .sub(redeemedRupees)
+      .toDecimalPlaces(2);
     const penaltyLinesMetadata = penaltyPlan.lines.map((line) => ({
       penaltyDbId: line.penaltyDbId,
       penaltyId: line.penaltyId,
@@ -942,28 +990,41 @@ export async function processTaskCompletionPayout(params: {
       totalDeductions: totalDeductions.toString(),
       netAmount: netAmount.toString(),
       penaltyDeducted: totalPenaltyDeducted.toString(),
+      extraCoinsBonus: redeemedRupees.toString(),
+      extraCoinsBonusCoins: redeemedCoins.toString(),
       penaltyLines: penaltyLinesMetadata,
       amountBreakdown: {
         taskAmount: grossAmount.toString(),
         platformFee: platformCommission.toString(),
         gst: gstOnCommission.toString(),
+        basePayout: payoutBaseAmount.toString(),
+        extraCoinsBonus: redeemedRupees.toString(),
         totalFeeDeducted: platformFeeTotal.toString(),
         penaltyDeducted: totalPenaltyDeducted.toString(),
         totalDeductions: totalDeductions.toString(),
+        finalPayout: netAmount.toString(),
         netAmount: netAmount.toString(),
+      },
+      extraCoins: {
+        coinToRupee: '0.20',
+        applied: redeemedRupees.gt(0),
+        redeemedCoins: redeemedCoins.toString(),
+        redeemedRupees: redeemedRupees.toString(),
+        redeemCapRupees: platformFeeTotal.toString(),
+        redeemSources: redeemedSources,
+        usageRule: 'Usable at payout up to platform fee. Not withdrawable as bank cash.',
       },
       feeMeta: {
         platformFeePercentage: feeStructure.platformFee.percentage,
         gstPercentage: feeStructure.platformFee.gstPercentage,
       },
+      coinFormula: '(platformFee * basePercent) * ratingMultiplier * bonuses / 0.20',
       penaltiesAppliedAt: null as string | null,
     };
 
-    let payoutId = '';
     let status: string = 'completed';
 
     if (netAmount.lte(0)) {
-      payoutId = `payout_penalty_only_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
       status = 'completed';
 
       await prisma.$transaction(async (tx) => {
@@ -1008,11 +1069,10 @@ export async function processTaskCompletionPayout(params: {
       const payoutResponse = await createRazorpayXPayout({
         fundAccountId,
         amountInPaise: Math.round(parseFloat(netAmount.toString()) * 100),
-        referenceId: `task_${taskId}`,
+        referenceId: payoutId,
         narration: payoutNarration,
       });
 
-      payoutId = payoutResponse.id;
       status = mapRazorpayPayoutStatusToInternal(payoutResponse.status);
       const completedAt = status === 'completed' ? new Date() : null;
 
@@ -1082,6 +1142,21 @@ export async function processTaskCompletionPayout(params: {
     }
 
     if (status === 'completed') {
+      awardExtraCoinsForCompletedTask({
+        userId: performerUid,
+        payoutId,
+        taskId,
+        taskAmountRupees: grossAmount,
+        platformFeeRupees: platformCommission,
+      }).catch((error) => {
+        logger.warn('Failed to award ExtraCoins for completed task payout', {
+          payoutId,
+          performerUid,
+          taskId,
+          error: error?.message || 'Unknown error',
+        });
+      });
+
       updateUserPaymentProfile(performerUid, {
         type: 'payout',
         amount: netAmount,
@@ -1113,12 +1188,22 @@ export async function processTaskCompletionPayout(params: {
         netAmount: netAmount.toString(),
         status,
         penaltyDeducted: totalPenaltyDeducted.toString(),
+        extraCoinsBonus: redeemedRupees.toString(),
+        extraCoinsBonusCoins: redeemedCoins.toString(),
         penaltyLines: penaltyLinesMetadata,
         fees: {
           platformCommission: platformCommission.toString(),
           gstOnCommission: gstOnCommission.toString(),
           tds: tds.toString(),
           total: platformFeeTotal.toString(),
+        },
+        amountBreakdown: {
+          taskAmount: grossAmount.toString(),
+          platformFee: platformCommission.toString(),
+          gst: gstOnCommission.toString(),
+          basePayout: payoutBaseAmount.toString(),
+          extraCoinsBonus: redeemedRupees.toString(),
+          finalPayout: netAmount.toString(),
         },
       },
     };
@@ -1162,7 +1247,8 @@ export async function getPayoutStatus(payoutId: string): Promise<{
     // This prevents "stuck processing" in the UI when the initial create call returns queued/processing.
     if (payout.type === 'task_completion' && payout.status === 'processing') {
       try {
-        const razorpayStatus = await getRazorpayXPayoutStatus(payout.payoutId);
+        const razorpayLookupId = payout.bankTransferId || payout.payoutId;
+        const razorpayStatus = await getRazorpayXPayoutStatus(razorpayLookupId);
         const internalStatus = mapRazorpayPayoutStatusToInternal(razorpayStatus.status);
 
         if (internalStatus !== payout.status) {
@@ -1242,6 +1328,25 @@ export async function getPayoutStatus(payoutId: string): Promise<{
                 error: err?.message || 'Unknown error',
               });
             });
+
+            const taskId = typeof md.taskId === 'string' ? md.taskId : '';
+            if (taskId) {
+              awardExtraCoinsForCompletedTask({
+                userId: payout.performerUid,
+                payoutId: payout.payoutId,
+                taskId,
+                taskAmountRupees: new Prisma.Decimal(String(md.taskAmount || payout.amount || '0')),
+                platformFeeRupees: new Prisma.Decimal(
+                  String(md.platformFee || payout.platformCommission || '0')
+                ),
+              }).catch((err) => {
+                logger.warn('Failed to award ExtraCoins after payout completion status refresh', {
+                  payoutId: payout.payoutId,
+                  performerUid: payout.performerUid,
+                  error: err?.message || 'Unknown error',
+                });
+              });
+            }
           }
         }
       } catch (e: any) {
@@ -1269,6 +1374,9 @@ export async function getPayoutStatus(payoutId: string): Promise<{
       : {};
     const penaltyDeducted = typeof metadata.penaltyDeducted === 'string' ? metadata.penaltyDeducted : '0.00';
     const penaltyLines = Array.isArray(metadata.penaltyLines) ? metadata.penaltyLines : [];
+    const extraCoinsBonus = typeof metadata.extraCoinsBonus === 'string' ? metadata.extraCoinsBonus : '0.00';
+    const extraCoinsBonusCoins =
+      typeof metadata.extraCoinsBonusCoins === 'string' ? metadata.extraCoinsBonusCoins : '0.00';
     const penaltiesAppliedAt = typeof metadata.penaltiesAppliedAt === 'string' ? metadata.penaltiesAppliedAt : null;
 
     return {
@@ -1279,6 +1387,12 @@ export async function getPayoutStatus(payoutId: string): Promise<{
         netAmount: updatedPayout.netAmount.toString(),
         penaltyDeducted: penaltyDeducted,
         penaltyLines: penaltyLines,
+        extraCoinsBonus,
+        extraCoinsBonusCoins,
+        amountBreakdown:
+          metadata.amountBreakdown && typeof metadata.amountBreakdown === 'object' && !Array.isArray(metadata.amountBreakdown)
+            ? metadata.amountBreakdown
+            : undefined,
         penaltiesAppliedAt: penaltiesAppliedAt,
         fees: {
           platformCommission: updatedPayout.platformCommission.toString(),

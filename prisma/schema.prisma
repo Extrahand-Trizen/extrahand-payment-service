@@ -282,6 +282,46 @@ model UserPaymentProfile {
   @@index([userId])
 }
 
+// ExtraCoin wallet balance per performer
+model ExtraCoinWallet {
+  id                String   @id @default(uuid())
+  userId            String   @unique
+  balanceCoins      Decimal  @default(0) @db.Decimal(12, 2)
+  balanceRupees     Decimal  @default(0) @db.Decimal(12, 2)
+  lifetimeEarnedCoins Decimal @default(0) @db.Decimal(12, 2)
+  lifetimeUsedCoins Decimal @default(0) @db.Decimal(12, 2)
+  lastUpdatedAt     DateTime @default(now())
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([userId])
+}
+
+// ExtraCoin ledger for earning, redeeming, and expiry events
+model ExtraCoinTransaction {
+  id              String   @id @default(uuid())
+  transactionId   String   @unique
+  userId          String
+  type            String // earned, redeemed, expired
+  status          String   @default("completed") // completed, reversed
+  coins           Decimal  @db.Decimal(12, 2)
+  rupeeValue      Decimal  @db.Decimal(12, 2)
+  remainingCoins  Decimal? @db.Decimal(12, 2)
+  remainingRupees Decimal? @db.Decimal(12, 2)
+  sourcePayoutId  String?
+  taskId          String?
+  expiresAt       DateTime?
+  metadata        Json?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([userId, type])
+  @@index([userId, expiresAt])
+  @@index([sourcePayoutId])
+  @@index([taskId])
+  @@index([createdAt])
+}
+
 // ============================================================================
 // SYSTEM TABLES (Optimized & Combined)
 // ============================================================================

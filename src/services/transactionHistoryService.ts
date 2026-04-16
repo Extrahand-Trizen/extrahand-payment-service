@@ -44,8 +44,10 @@ export async function getUserTransactions(
   error?: string;
 }> {
   try {
-    const limit = options?.limit || 50;
-    const offset = options?.offset || 0;
+    const parsedLimit = Number(options?.limit ?? 50);
+    const parsedOffset = Number(options?.offset ?? 0);
+    const limit = Number.isFinite(parsedLimit) ? Math.min(Math.max(Math.floor(parsedLimit), 1), 100) : 50;
+    const offset = Number.isFinite(parsedOffset) ? Math.max(Math.floor(parsedOffset), 0) : 0;
     const startDate = options?.startDate;
     const endDate = options?.endDate;
     const typeFilter = options?.type;
@@ -509,8 +511,8 @@ export async function getUserTransactions(
     // 5. Get total count for pagination (before slicing)
     const total = filteredTransactions.length;
 
-    // 6. Apply pagination (in memory - but we've already limited the initial fetch)
-    const paginatedTransactions = filteredTransactions.slice(0, limit);
+    // 6. Apply pagination on final filtered rows.
+    const paginatedTransactions = filteredTransactions.slice(offset, offset + limit);
 
     logger.info(`[TransactionHistory] Returning ${paginatedTransactions.length} transactions (total: ${total}) after pagination`);
 
@@ -550,50 +552,94 @@ export async function getTransactionSummary(
   error?: string;
 }> {
   try {
-    // Get all transactions
-    const transactionsResult = await getUserTransactions(userId, {
-      limit: 10000, // Get all for summary
-      startDate,
-      endDate,
-      linkedUserIds,
-    });
+    const uidList = [
+      ...new Set(
+        [userId, ...(linkedUserIds || [])].filter(
+          (x): x is string => typeof x === 'string' && x.trim().length > 0
+        )
+      ),
+    ];
 
-    if (!transactionsResult.success || !transactionsResult.transactions) {
-      return transactionsResult;
-    }
-
-    const transactions = transactionsResult.transactions;
-
-    // Calculate totals by type
-    let totalPayments = new Prisma.Decimal('0');
-    let totalPayouts = new Prisma.Decimal('0');
-    let totalRefunds = new Prisma.Decimal('0');
-    let totalCompensation = new Prisma.Decimal('0');
-    let totalFees = new Prisma.Decimal('0');
-
-    transactions.forEach(tx => {
-      const amount = new Prisma.Decimal(tx.amount);
-      switch (tx.type) {
-        case 'escrow':
-        case 'payment':
-          totalPayments = totalPayments.plus(amount);
-          break;
-        case 'payout':
-          totalPayouts = totalPayouts.plus(amount);
-          break;
-        case 'refund':
-          if (tx.status === 'completed') {
-            totalRefunds = totalRefunds.plus(amount);
+    const escrowWhere: Prisma.EscrowWhereInput = {
+      posterUid: { in: uidList },
+      ...(startDate || endDate
+        ? {
+            createdAt: {
+              ...(startDate ? { gte: startDate } : {}),
+              ...(endDate ? { lte: endDate } : {}),
+            },
           }
-          break;
-        case 'compensation':
-          totalCompensation = totalCompensation.plus(amount);
-          break;
-        case 'fee':
-          totalFees = totalFees.plus(amount);
-          break;
-      }
-    });
+        : {}),
+    };
+
+    const payoutWhere: Prisma.PayoutWhereInput = {
+      performerUid: { in: uidList },
+      ...(startDate || endDate
+        ? {
+            createdAt: {
+              ...(startDate ? { gte: startDate } : {}),
+              ...(endDate ? { lte: endDate } : {}),
+            },
+          }
+        : {}),
+    };
+
+    const refundWhere: Prisma.RefundWhereInput = {
+      status: 'completed',
+      escrow: {
+        OR: [{ posterUid: { in: uidList } }, { performerUid: { in: uidList } }],
+      },
+      ...(startDate || endDate
+        ? {
+            createdAt: {
+              ...(startDate ? { gte: startDate } : {}),
+              ...(endDate ? { lte: endDate } : {}),
+            },
+          }
+        : {}),
+    };
+
+    const [paymentsAgg, payoutsAgg, refundsAgg, compensationAgg] = await Promise.all([
+      prisma.escrow.aggregate({
+        where: escrowWhere,
+        _sum: { amountInRupees: true },
+        _count: { id: true },
+      }),
+      prisma.payout.aggregate({
+        where: payoutWhere,
+        _sum: { netAmount: true },
+        _count: { id: true },
+      }),
+      prisma.refund.aggregate({
+        where: {
+          ...refundWhere,
+          escrow: { posterUid: { in: uidList } },
+        },
+        _sum: { refundAmount: true },
+        _count: { id: true },
+      }),
+      prisma.refund.aggregate({
+        where: {
+          ...refundWhere,
+          cancelledBy: 'poster',
+          toOtherParty: { not: null },
+          escrow: { performerUid: { in: uidList } },
+        },
+        _sum: { toOtherParty: true },
+        _count: { id: true },
+      }),
+    ]);
+
+    const totalPayments = paymentsAgg._sum.amountInRupees || new Prisma.Decimal('0');
+    const totalPayouts = payoutsAgg._sum.netAmount || new Prisma.Decimal('0');
+    const totalRefunds = refundsAgg._sum.refundAmount || new Prisma.Decimal('0');
+    const totalCompensation = compensationAgg._sum.toOtherParty || new Prisma.Decimal('0');
+    const totalFees = new Prisma.Decimal('0');
+    const transactionCount =
+      (paymentsAgg._count.id || 0) +
+      (payoutsAgg._count.id || 0) +
+      (refundsAgg._count.id || 0) +
+      (compensationAgg._count.id || 0);
 
     // Net earnings = payouts + compensation - fees
     const netEarnings = totalPayouts.plus(totalCompensation).minus(totalFees);
@@ -607,7 +653,7 @@ export async function getTransactionSummary(
         totalCompensation: totalCompensation.toString(),
         totalFees: totalFees.toString(),
         netEarnings: netEarnings.toString(),
-        transactionCount: transactions.length
+        transactionCount
       }
     };
   } catch (error: any) {

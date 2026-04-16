@@ -87,6 +87,50 @@ export async function getUserEarnings(userId: string, linkedUserIds?: string[]):
       where: { userId },
     });
 
+    const computeSingleUidFallback = async () => {
+      const [payoutsAgg, compensationsAgg] = await Promise.all([
+        prisma.payout.aggregate({
+          where: {
+            performerUid: userId,
+            status: 'completed',
+          },
+          _sum: { netAmount: true },
+          _count: { _all: true },
+        }),
+        prisma.refund.aggregate({
+          where: {
+            escrow: {
+              performerUid: userId,
+            },
+            cancelledBy: 'poster',
+            toOtherParty: { not: null },
+            status: 'completed',
+          },
+          _sum: { toOtherParty: true },
+          _count: { _all: true },
+        }),
+      ]);
+
+      const fromPayouts = payoutsAgg._sum.netAmount || new Prisma.Decimal('0');
+      const fromCompensation = compensationsAgg._sum.toOtherParty || new Prisma.Decimal('0');
+      const totalEarnings = fromPayouts.plus(fromCompensation);
+
+      return {
+        success: true as const,
+        earnings: {
+          totalEarnings: totalEarnings.toString(),
+          fromPayouts: fromPayouts.toString(),
+          fromCompensation: fromCompensation.toString(),
+          totalPayouts: payoutsAgg._count._all || 0,
+          totalCompensations: compensationsAgg._count._all || 0,
+          labels: {
+            fromPayouts: 'From Completed Tasks',
+            fromCompensation: 'From Cancellations',
+          },
+        },
+      };
+    };
+
     // If missing or stale, recalculate
     if (!profile || (profile && isProfileStale(profile.lastUpdatedAt))) {
       logger.debug('UserPaymentProfile missing or stale, recalculating...', {
@@ -94,10 +138,18 @@ export async function getUserEarnings(userId: string, linkedUserIds?: string[]):
         hasProfile: !!profile,
         isStale: profile ? isProfileStale(profile.lastUpdatedAt) : true,
       });
-      await recalculateUserPaymentProfile(userId);
-      profile = await prisma.userPaymentProfile.findUnique({
-        where: { userId },
-      });
+      try {
+        await recalculateUserPaymentProfile(userId);
+        profile = await prisma.userPaymentProfile.findUnique({
+          where: { userId },
+        });
+      } catch (recalcError: any) {
+        logger.warn('UserPaymentProfile recalculation failed, using aggregate fallback', {
+          userId,
+          error: recalcError?.message,
+        });
+        return computeSingleUidFallback();
+      }
     }
 
     // If still no profile (user has no transactions), return zeros

@@ -22,6 +22,12 @@ router.use(serviceAuthMiddleware);
 router.get('/:userId', asyncHandler(TransactionController.getUserTransactions));
 
 /**
+ * GET /api/v1/transactions/:userId/wallet
+ * Get ExtraCoins wallet details for a user
+ */
+router.get('/:userId/wallet', asyncHandler(TransactionController.getExtraCoinsWallet));
+
+/**
  * GET /api/v1/transactions/:userId/summary
  * Get transaction summary for a user
  * Query params: startDate, endDate (ISO date strings)

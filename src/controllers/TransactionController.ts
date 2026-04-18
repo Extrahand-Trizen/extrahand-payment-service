@@ -1,5 +1,6 @@
 import { Response, Request } from 'express';
 import { getUserTransactions, getTransactionSummary } from '../services/transactionHistoryService';
+import { getExtraCoinsWallet } from '../services/extraCoinsService';
 import { BadRequestError } from '../errors/AppError';
 
 export class TransactionController {
@@ -80,6 +81,29 @@ export class TransactionController {
     res.json({
       success: true,
       summary: result.summary
+    });
+  }
+
+  /**
+   * GET /api/v1/transactions/:userId/wallet
+   * Get ExtraCoins wallet details for a user
+   */
+  static async getExtraCoinsWallet(req: Request, res: Response): Promise<void> {
+    const { userId } = req.params;
+
+    if (!userId) {
+      throw new BadRequestError('User ID is required');
+    }
+
+    const result = await getExtraCoinsWallet(userId);
+
+    if (!result.success) {
+      throw new Error(result.error || 'Failed to get ExtraCoins wallet');
+    }
+
+    res.json({
+      success: true,
+      wallet: result.wallet,
     });
   }
 }

@@ -13,6 +13,7 @@ import { EmailServiceClient } from '../clients/EmailServiceClient';
 import { InAppNotificationClient } from '../clients/InAppNotificationClient';
 import { logEscrowCreated, logPaymentCaptured, logPaymentFailed } from './auditLogService';
 import mongoose from 'mongoose';
+import { buildEscrowMetadataSnapshot, getTaskDisplayTitleFromEscrow } from '../utils/escrowMetadataSnapshot';
 
 /**
  * Generate unique escrow ID
@@ -176,12 +177,15 @@ export async function createEscrow(params: {
 
     const razorpayOrder = orderResult.order;
 
-    const escrowMetadata = {
-      ...metadata,
-      ...(String(razorpayOrder.id).startsWith(REVIEW_ORDER_ID_PREFIX)
-        ? { reviewBypass: true }
-        : {}),
-    };
+    const escrowMetadata = buildEscrowMetadataSnapshot(
+      {
+        ...metadata,
+        ...(String(razorpayOrder.id).startsWith(REVIEW_ORDER_ID_PREFIX)
+          ? { reviewBypass: true }
+          : {}),
+      } as Record<string, unknown>,
+      { taskCategory: taskCategory ?? null }
+    );
 
     // If Postgres is not connected, return order without saving
     if (!isPostgresConnected()) {
@@ -244,7 +248,7 @@ export async function createEscrow(params: {
           status: 'pending',
           autoReleaseDate: autoReleaseDate,
           razorpayOrderData: sanitizedOrderData as any, // Store sanitized data in JSONB
-          metadata: escrowMetadata as any, // Store metadata in JSONB
+          metadata: escrowMetadata as any, // JSONB: snapshot + client fields
           taskCategory: taskCategory ?? null,
           appliedGstPercent: appliedGstPercent ?? null,
           appliedPlatformFeePercent: appliedPlatformFeePercent ?? null,
@@ -440,7 +444,7 @@ export async function updateEscrowOnPaymentCapture(
                 posterProfile.name || 'User',
                 {
                   amount: Number(amountStr),
-                  taskTitle: `Task ${postgresEscrow.taskId}`,
+                  taskTitle: getTaskDisplayTitleFromEscrow(postgresEscrow),
                   transactionId: razorpayPaymentId,
                   paymentDate: new Date().toLocaleString(),
                   isEscrow: true
@@ -705,7 +709,7 @@ export async function releaseEscrow(
                 performerProfile.name || 'Tasker',
                 {
                   amount: Number(amountStr),
-                  taskTitle: `Task ${postgresEscrow.taskId}`,
+                  taskTitle: getTaskDisplayTitleFromEscrow(postgresEscrow),
                   requesterName: posterProfile?.name || 'Poster',
                   transactionId: transactionId,
                   estimatedArrival: '1-2 business days'

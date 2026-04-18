@@ -25,6 +25,7 @@ export class EscrowController {
       autoReleaseAfterDays,
       metadata,
       taskCategory,
+      taskTitle: taskTitleBody,
     } = req.body;
 
     // Validation
@@ -34,6 +35,18 @@ export class EscrowController {
 
     if (amount <= 0) {
       throw new BadRequestError('Amount must be greater than 0');
+    }
+
+    const baseMeta =
+      metadata && typeof metadata === 'object' && !Array.isArray(metadata)
+        ? { ...(metadata as Record<string, unknown>) }
+        : {};
+    const titleFromBody =
+      typeof taskTitleBody === 'string' && taskTitleBody.trim().length > 0
+        ? taskTitleBody.trim()
+        : undefined;
+    if (titleFromBody && !baseMeta.taskTitle && !baseMeta.taskTitleSnapshot) {
+      baseMeta.taskTitle = titleFromBody;
     }
 
     const result = await createEscrow({
@@ -46,7 +59,7 @@ export class EscrowController {
       currency,
       autoReleaseAfterDays,
       taskCategory,
-      metadata,
+      metadata: baseMeta,
     });
 
     if (!result.success) {

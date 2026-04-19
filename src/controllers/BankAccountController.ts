@@ -34,6 +34,9 @@ export class BankAccountController {
     });
 
     if (!result.success) {
+      if (result.isRazorpayClientError) {
+        throw new BadRequestError(result.error || 'Bank account could not be verified. Check details and try again.');
+      }
       throw new Error(result.error || 'Failed to save bank account');
     }
 

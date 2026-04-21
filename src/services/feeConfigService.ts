@@ -77,7 +77,50 @@ const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 const GST_18_PERCENT_CATEGORY_KEYS = new Set([
   'water-tanker-services',
   'driver-chauffeur',
+  'water_tanker_services',
 ]);
+
+const CATEGORY_KEY_ALIASES: Record<string, string[]> = {
+  'beauty services': ['beauticians', 'beauty-services'],
+  'beauty-services': ['beauticians', 'beauty-services'],
+  beauticians: ['beauticians', 'beauty-services'],
+  'fitness trainers': ['fitness', 'fitness-trainers'],
+  'fitness-trainers': ['fitness', 'fitness-trainers'],
+  fitness: ['fitness', 'fitness-trainers'],
+  'massage spa': ['massage_spa', 'massage-spa'],
+  'massage / spa': ['massage_spa', 'massage-spa'],
+  'massage-spa': ['massage_spa', 'massage-spa'],
+  massage_spa: ['massage_spa', 'massage-spa'],
+  'security patrol': ['security_patrol', 'security-patrol'],
+  'security patrol watchman': ['security_patrol', 'security-patrol'],
+  'security-patrol': ['security_patrol', 'security-patrol'],
+  security_patrol: ['security_patrol', 'security-patrol'],
+  'water & tanker services': ['water_tanker_services', 'water-tanker-services'],
+  'water tanker services': ['water_tanker_services', 'water-tanker-services'],
+  'water-tanker-services': ['water_tanker_services', 'water-tanker-services'],
+  water_tanker_services: ['water_tanker_services', 'water-tanker-services'],
+  'senior care elder care': ['senior_elder_care', 'senior-care-elder-care'],
+  'senior-care-elder-care': ['senior_elder_care', 'senior-care-elder-care'],
+  senior_elder_care: ['senior_elder_care', 'senior-care-elder-care'],
+};
+
+function normalizeCategoryLookupKey(categoryKey?: string): string {
+  const raw = (categoryKey || 'default').trim().toLowerCase();
+  return raw
+    .replace(/&/g, 'and')
+    .replace(/[\s_]+/g, ' ')
+    .replace(/\s*\/\s*/g, ' ')
+    .replace(/[-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function getCategoryLookupKeys(categoryKey?: string): string[] {
+  const raw = (categoryKey || 'default').trim();
+  const normalized = normalizeCategoryLookupKey(raw);
+  const aliases = CATEGORY_KEY_ALIASES[normalized] || CATEGORY_KEY_ALIASES[raw.toLowerCase()] || [];
+  return Array.from(new Set([raw, normalized, ...aliases].filter(Boolean)));
+}
 
 /**
  * Get fee structure from SystemConfig table
@@ -214,21 +257,27 @@ export async function getFeeStructureForCategory(categoryKey?: string): Promise<
   const base = await getFeeStructure();
 
   const key = categoryKey || 'default';
+  const lookupKeys = getCategoryLookupKeys(key);
 
   try {
     const now = new Date();
 
-    const cfg = await prisma.categoryFeeConfig.findFirst({
-      where: {
-        categoryKey: key,
-        OR: [
-          { effectiveFrom: null, effectiveTo: null },
-          { effectiveFrom: { lte: now }, effectiveTo: null },
-          { effectiveFrom: { lte: now }, effectiveTo: { gte: now } },
-        ],
-      },
-      orderBy: { effectiveFrom: 'desc' },
-    }) as any;
+    let cfg: any = null;
+    for (const lookupKey of lookupKeys) {
+      cfg = await prisma.categoryFeeConfig.findFirst({
+        where: {
+          categoryKey: lookupKey,
+          OR: [
+            { effectiveFrom: null, effectiveTo: null },
+            { effectiveFrom: { lte: now }, effectiveTo: null },
+            { effectiveFrom: { lte: now }, effectiveTo: { gte: now } },
+          ],
+        },
+        orderBy: { effectiveFrom: 'desc' },
+      }) as any;
+
+      if (cfg) break;
+    }
 
     // If not found, try to load the default row
     const effectiveCfg = cfg ?? (await prisma.categoryFeeConfig.findUnique({ where: { categoryKey: 'default' } }) as any);

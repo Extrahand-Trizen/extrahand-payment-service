@@ -5,7 +5,41 @@ import logger from '../config/logger';
 const GST_18_PERCENT_CATEGORY_KEYS = new Set([
   'water-tanker-services',
   'driver-chauffeur',
+  'water_tanker_services',
 ]);
+
+const MANUAL_CATEGORY_CONFIGS = [
+  {
+    categoryKey: 'beauticians',
+    displayName: 'Beauty Services',
+    gstPercentage: 0.18,
+  },
+  {
+    categoryKey: 'fitness',
+    displayName: 'Fitness Trainers',
+    gstPercentage: 0.18,
+  },
+  {
+    categoryKey: 'massage_spa',
+    displayName: 'Massage / Spa',
+    gstPercentage: 0.05,
+  },
+  {
+    categoryKey: 'security_patrol',
+    displayName: 'Security Patrol / Watchman',
+    gstPercentage: 0.18,
+  },
+  {
+    categoryKey: 'water_tanker_services',
+    displayName: 'Water & Tanker Services',
+    gstPercentage: 0.18,
+  },
+  {
+    categoryKey: 'senior_elder_care',
+    displayName: 'Senior Care / Elder Care',
+    gstPercentage: 0.18,
+  },
+] as const;
 
 async function run() {
   try {
@@ -58,6 +92,23 @@ async function run() {
       });
 
       logger.info(`Upserted category config: ${categoryKey}`);
+    }
+
+    for (const config of MANUAL_CATEGORY_CONFIGS) {
+      await prisma.categoryFeeConfig.upsert({
+        where: { categoryKey: config.categoryKey },
+        create: {
+          categoryKey: config.categoryKey,
+          displayName: config.displayName,
+          gstPercentage: config.gstPercentage,
+        },
+        update: {
+          displayName: config.displayName,
+          gstPercentage: config.gstPercentage,
+        },
+      });
+
+      logger.info(`Upserted manual category config: ${config.categoryKey}`);
     }
 
     await prisma.categoryFeeConfig.upsert({

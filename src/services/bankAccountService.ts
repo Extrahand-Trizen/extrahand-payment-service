@@ -1,6 +1,10 @@
 import { prisma } from '../config/prisma';
 import logger from '../config/logger';
-import { createRazorpayXContact, createRazorpayXFundAccount } from './razorpayxService';
+import {
+  createRazorpayXContact,
+  createRazorpayXFundAccount,
+  parseRazorpayApiError,
+} from './razorpayxService';
 import { processPendingTaskCompletionPayouts } from './payoutService';
 
 function maskAccountNumber(accountNumber: string): string {
@@ -52,6 +56,8 @@ export async function upsertTaskerBankAccount(params: {
   maskedAccountNumber?: string;
   fundAccountId?: string;
   error?: string;
+  /** Razorpay returned 4xx — safe to show message to user; map to HTTP 400 */
+  isRazorpayClientError?: boolean;
 }> {
   try {
     const accountNumber = params.accountNumber.trim();
@@ -122,14 +128,18 @@ export async function upsertTaskerBankAccount(params: {
       maskedAccountNumber,
       fundAccountId,
     };
-  } catch (error: any) {
+  } catch (error: unknown) {
+    const parsed = parseRazorpayApiError(error);
     logger.error('Error upserting bank account for payout', {
       userId: params.userId,
-      error: error.message,
+      error: parsed.message,
+      httpStatus: parsed.httpStatus,
+      isRazorpayClientError: parsed.isClientError,
     });
     return {
       success: false,
-      error: error.message || 'Failed to save bank account',
+      error: parsed.message || 'Failed to save bank account',
+      isRazorpayClientError: parsed.isClientError,
     };
   }
 }

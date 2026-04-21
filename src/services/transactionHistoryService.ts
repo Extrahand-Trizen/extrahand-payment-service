@@ -17,6 +17,58 @@ export interface Transaction {
 }
 
 /**
+ * Counter-offer flows can create multiple escrow rows for the same task (each Razorpay order).
+ * Posters should see one "payment" line per task: prefer higher lifecycle status, then newest.
+ */
+function dedupePosterEscrowPaymentRows(transactions: Transaction[]): Transaction[] {
+  const kept: Transaction[] = [];
+  const posterEscrowsByTask = new Map<string, Transaction[]>();
+
+  for (const t of transactions) {
+    const isPosterEscrow =
+      t.type === 'escrow' &&
+      t.category === 'payments' &&
+      t.metadata &&
+      typeof (t.metadata as { taskId?: unknown }).taskId === 'string' &&
+      String((t.metadata as { taskId: string }).taskId).length > 0;
+
+    if (isPosterEscrow) {
+      const taskId = String((t.metadata as { taskId: string }).taskId);
+      const arr = posterEscrowsByTask.get(taskId) || [];
+      arr.push(t);
+      posterEscrowsByTask.set(taskId, arr);
+    } else {
+      kept.push(t);
+    }
+  }
+
+  const rankStatus = (status: string): number => {
+    const s = (status || '').toLowerCase();
+    if (s === 'released') return 5;
+    if (s === 'held') return 4;
+    if (s === 'refunded') return 3;
+    if (s === 'pending') return 2;
+    if (s === 'cancelled') return 0;
+    return 1;
+  };
+
+  for (const [, rows] of posterEscrowsByTask) {
+    if (rows.length === 1) {
+      kept.push(rows[0]);
+      continue;
+    }
+    const sorted = [...rows].sort((a, b) => {
+      const dr = rankStatus(b.status) - rankStatus(a.status);
+      if (dr !== 0) return dr;
+      return new Date(b.date).getTime() - new Date(a.date).getTime();
+    });
+    kept.push(sorted[0]);
+  }
+
+  return kept;
+}
+
+/**
  * Get all transactions for a user
  * Combines data from:
  * - Escrows (as poster or performer)
@@ -152,7 +204,7 @@ export async function getUserTransactions(
         return totalPaid.div(multiplier).toDecimalPlaces(2);
       })();
       const taskAmount =
-        toDecimal(escrow.taskAmount) ||
+        toDecimal((escrow as { taskAmount?: unknown }).taskAmount) ||
         toDecimal(amountBreakdown.taskAmount) ||
         toDecimal(escrowMeta.taskAmount) ||
         derivedTaskAmount ||
@@ -187,6 +239,26 @@ export async function getUserTransactions(
         .filter((refund) => refund.status === 'completed')
         .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0];
 
+      const em = escrowMeta as Record<string, any>;
+      const taskTitleSnapshot =
+        typeof em.taskTitleSnapshot === 'string' && em.taskTitleSnapshot.trim().length > 0
+          ? em.taskTitleSnapshot.trim()
+          : typeof em.taskTitle === 'string' && em.taskTitle.trim().length > 0
+            ? em.taskTitle.trim()
+            : undefined;
+      const taskCategorySnapshot =
+        typeof em.taskCategorySnapshot === 'string' && em.taskCategorySnapshot.trim().length > 0
+          ? em.taskCategorySnapshot.trim()
+          : typeof escrow.taskCategory === 'string' && escrow.taskCategory.trim().length > 0
+            ? escrow.taskCategory.trim()
+            : typeof em.taskCategory === 'string' && em.taskCategory.trim().length > 0
+              ? em.taskCategory.trim()
+              : undefined;
+      const taskDescriptionSnapshot =
+        typeof em.taskDescription === 'string' && em.taskDescription.trim().length > 0
+          ? em.taskDescription.trim()
+          : undefined;
+
       // Escrow creation (payment) - only show if user is poster (money paid)
       // If user is performer, they'll see the payout instead
       if ((!typeFilter || typeFilter === 'payment' || typeFilter === 'escrow') && isPoster) {
@@ -197,12 +269,24 @@ export async function getUserTransactions(
           type: 'escrow',
           amount: escrow.amountInRupees.toString(),
           status: escrow.status,
-          description: `Payment for task`,
+          description: taskTitleSnapshot
+            ? `Payment — ${taskTitleSnapshot.length > 120 ? `${taskTitleSnapshot.slice(0, 117)}...` : taskTitleSnapshot}`
+            : `Payment for task`,
           date: escrow.createdAt.toISOString(),
           relatedEntityId: escrow.escrowId,
           category: 'payments', // Money spent
           metadata: {
             taskId: escrow.taskId,
+            ...(taskTitleSnapshot
+              ? {
+                  taskTitle: taskTitleSnapshot,
+                  taskTitleSnapshot,
+                }
+              : {}),
+            ...(taskCategorySnapshot ? { taskCategory: taskCategorySnapshot, taskCategorySnapshot } : {}),
+            ...(taskDescriptionSnapshot ? { taskDescription: taskDescriptionSnapshot } : {}),
+            ...(typeof em.snapshotVersion === 'number' ? { snapshotVersion: em.snapshotVersion } : {}),
+            ...(typeof em.capturedAt === 'string' ? { capturedAt: em.capturedAt } : {}),
             role: 'poster',
             razorpayOrderId: escrow.razorpayOrderId,
             amountInRupees: escrow.amountInRupees.toString(),
@@ -228,9 +312,11 @@ export async function getUserTransactions(
           // Always add payout transactions when user is the performer (they earned)
           
           // Extract penalty information from payout metadata
-          const payoutMetadata = payout.metadata && typeof payout.metadata === 'object' && !Array.isArray(payout.metadata)
-            ? (payout.metadata as Record<string, any>)
-            : {};
+          const payoutRawMeta = (payout as { metadata?: unknown }).metadata;
+          const payoutMetadata =
+            payoutRawMeta && typeof payoutRawMeta === 'object' && !Array.isArray(payoutRawMeta)
+              ? (payoutRawMeta as Record<string, any>)
+              : {};
           const penaltyDeducted = payoutMetadata.penaltyDeducted || '0.00';
           const penaltyLines = Array.isArray(payoutMetadata.penaltyLines) ? payoutMetadata.penaltyLines : [];
           
@@ -240,12 +326,24 @@ export async function getUserTransactions(
             type: 'payout',
             amount: payout.netAmount.toString(),
             status: payout.status,
-            description: `Money received from task ${escrow.taskId}`,
+            description: taskTitleSnapshot
+              ? `Money received — ${taskTitleSnapshot.length > 100 ? `${taskTitleSnapshot.slice(0, 97)}...` : taskTitleSnapshot}`
+              : `Money received from task ${escrow.taskId}`,
             date: payout.createdAt.toISOString(),
             relatedEntityId: payout.escrowId || undefined,
             category: 'earnings', // Money received
             metadata: {
               taskId: escrow.taskId,
+              ...(taskTitleSnapshot
+                ? {
+                    taskTitle: taskTitleSnapshot,
+                    taskTitleSnapshot,
+                  }
+                : {}),
+              ...(taskCategorySnapshot
+                ? { taskCategory: taskCategorySnapshot, taskCategorySnapshot }
+                : {}),
+              ...(taskDescriptionSnapshot ? { taskDescription: taskDescriptionSnapshot } : {}),
               taskAmount: payout.amount.toString(),
               totalPaid: payout.amount.toString(),
               grossAmount: payout.amount.toString(),
@@ -270,13 +368,6 @@ export async function getUserTransactions(
               penaltyLines: penaltyLines,
               penaltiesAppliedAt: payoutMetadata.penaltiesAppliedAt || null,
               posterUid: escrow.posterUid,
-              // Add task-related info if available (metadata is JSON, so we need to check type)
-              ...(escrow.metadata && typeof escrow.metadata === 'object' && !Array.isArray(escrow.metadata)
-                ? {
-                    taskTitle: (escrow.metadata as any).taskTitle,
-                    taskDescription: (escrow.metadata as any).taskDescription
-                  }
-                : {})
             }
           });
         }
@@ -300,12 +391,24 @@ export async function getUserTransactions(
               type: 'refund',
               amount: refund.refundAmount.toString(),
               status: refund.status,
-              description: `Money returned for cancelled task ${escrow.taskId}`,
+              description: taskTitleSnapshot
+                ? `Refund — ${taskTitleSnapshot.length > 100 ? `${taskTitleSnapshot.slice(0, 97)}...` : taskTitleSnapshot}`
+                : `Money returned for cancelled task ${escrow.taskId}`,
               date: refund.createdAt.toISOString(),
               relatedEntityId: refund.escrowId || undefined,
               category: 'payments', // Money returned (related to payment)
               metadata: {
                 taskId: escrow.taskId,
+                ...(taskTitleSnapshot
+                  ? {
+                      taskTitle: taskTitleSnapshot,
+                      taskTitleSnapshot,
+                    }
+                  : {}),
+                ...(taskCategorySnapshot
+                  ? { taskCategory: taskCategorySnapshot, taskCategorySnapshot }
+                  : {}),
+                ...(taskDescriptionSnapshot ? { taskDescription: taskDescriptionSnapshot } : {}),
                 cancellationFee: refund.cancellationFee?.toString() || '0',
                 refundAmount: refund.refundAmount.toString(),
                 toOtherParty: refund.toOtherParty?.toString() || '0',
@@ -327,12 +430,24 @@ export async function getUserTransactions(
               type: 'compensation',
               amount: (refund.toOtherParty?.toString() || '0'),
               status: refund.status,
-              description: `Money from cancelled task ${escrow.taskId}`,
+              description: taskTitleSnapshot
+                ? `Compensation — ${taskTitleSnapshot.length > 100 ? `${taskTitleSnapshot.slice(0, 97)}...` : taskTitleSnapshot}`
+                : `Money from cancelled task ${escrow.taskId}`,
               date: refund.createdAt.toISOString(),
               relatedEntityId: refund.escrowId || undefined,
               category: 'earnings', // Money received
               metadata: {
                 taskId: escrow.taskId,
+                ...(taskTitleSnapshot
+                  ? {
+                      taskTitle: taskTitleSnapshot,
+                      taskTitleSnapshot,
+                    }
+                  : {}),
+                ...(taskCategorySnapshot
+                  ? { taskCategory: taskCategorySnapshot, taskCategorySnapshot }
+                  : {}),
+                ...(taskDescriptionSnapshot ? { taskDescription: taskDescriptionSnapshot } : {}),
                 cancellationFee: refund.cancellationFee?.toString() || '0',
                 refundAmount: refund.refundAmount.toString(),
                 toOtherParty: refund.toOtherParty?.toString() || '0',
@@ -359,7 +474,7 @@ export async function getUserTransactions(
           take: fetchLimit,
         });
 
-        penalties.forEach((pen) => {
+        penalties.forEach((pen: (typeof penalties)[number]) => {
           transactions.push({
             id: pen.id,
             transactionId: pen.penaltyId,
@@ -413,9 +528,12 @@ export async function getUserTransactions(
         });
 
         standalonePayouts.forEach((payout) => {
+          const payoutStandaloneMeta = (payout as { metadata?: unknown }).metadata;
           const pm =
-            payout.metadata && typeof payout.metadata === 'object' && !Array.isArray(payout.metadata)
-              ? (payout.metadata as Record<string, unknown>)
+            payoutStandaloneMeta &&
+            typeof payoutStandaloneMeta === 'object' &&
+            !Array.isArray(payoutStandaloneMeta)
+              ? (payoutStandaloneMeta as Record<string, unknown>)
               : {};
           const penaltyDeducted =
             typeof pm.penaltyDeducted === 'string'
@@ -472,17 +590,19 @@ export async function getUserTransactions(
     // Individual fee entries are not shown to keep the UI clean
     // Fees are included in the payout metadata for detailed breakdown when needed
 
+    const dedupedTransactions = dedupePosterEscrowPaymentRows(transactions);
+
     // 3. Sort all transactions by date (newest first)
-    transactions.sort((a, b) => {
+    dedupedTransactions.sort((a, b) => {
       return new Date(b.date).getTime() - new Date(a.date).getTime();
     });
 
     // 4. Apply filters if specified (in-memory filtering for category/type)
     // Note: Category and type filters are complex (depend on user role) so we filter in memory
     // But we've already applied status filter at database level where possible
-    let filteredTransactions = transactions;
-    
-    logger.info(`[TransactionHistory] Total transactions before filtering: ${transactions.length}`);
+    let filteredTransactions = dedupedTransactions;
+
+    logger.info(`[TransactionHistory] Total transactions before filtering: ${filteredTransactions.length}`);
     
     // Apply category filter (earnings/payments) - in memory due to complexity
     if (categoryFilter && categoryFilter !== 'all') {
@@ -599,12 +719,7 @@ export async function getTransactionSummary(
         : {}),
     };
 
-    const [paymentsAgg, payoutsAgg, refundsAgg, compensationAgg] = await Promise.all([
-      prisma.escrow.aggregate({
-        where: escrowWhere,
-        _sum: { amountInRupees: true },
-        _count: { id: true },
-      }),
+    const [payoutsAgg, refundsAgg, compensationAgg] = await Promise.all([
       prisma.payout.aggregate({
         where: payoutWhere,
         _sum: { netAmount: true },
@@ -630,13 +745,28 @@ export async function getTransactionSummary(
       }),
     ]);
 
-    const totalPayments = paymentsAgg._sum.amountInRupees || new Prisma.Decimal('0');
+    // One logical "payment" per task for posters (matches dedupe in getUserTransactions).
+    const posterEscrowsLatest = await prisma.escrow.findMany({
+      where: escrowWhere,
+      select: { taskId: true, amountInRupees: true, createdAt: true },
+      orderBy: { createdAt: 'desc' },
+    });
+    const seenPaymentTask = new Set<string>();
+    let totalPayments = new Prisma.Decimal('0');
+    let paymentEscrowCount = 0;
+    for (const row of posterEscrowsLatest) {
+      if (seenPaymentTask.has(row.taskId)) continue;
+      seenPaymentTask.add(row.taskId);
+      totalPayments = totalPayments.add(row.amountInRupees);
+      paymentEscrowCount += 1;
+    }
+
     const totalPayouts = payoutsAgg._sum.netAmount || new Prisma.Decimal('0');
     const totalRefunds = refundsAgg._sum.refundAmount || new Prisma.Decimal('0');
     const totalCompensation = compensationAgg._sum.toOtherParty || new Prisma.Decimal('0');
     const totalFees = new Prisma.Decimal('0');
     const transactionCount =
-      (paymentsAgg._count.id || 0) +
+      paymentEscrowCount +
       (payoutsAgg._count.id || 0) +
       (refundsAgg._count.id || 0) +
       (compensationAgg._count.id || 0);

@@ -3,6 +3,62 @@ import crypto from 'crypto';
 import { validateEnv } from '../config/env';
 import logger from '../config/logger';
 
+/** Razorpay Contacts API expects E.164; Indian numbers often arrive as 10 digits without +91 */
+export function normalizeIndianPhoneForRazorpay(input?: string): string | undefined {
+  if (!input?.trim()) return undefined;
+  const raw = input.trim();
+  if (raw.startsWith('+')) return raw;
+  const digits = raw.replace(/\D/g, '');
+  if (digits.length === 10) return `+91${digits}`;
+  if (digits.length === 12 && digits.startsWith('91')) return `+${digits}`;
+  return raw;
+}
+
+export type RazorpayApiErrorInfo = {
+  message: string;
+  /** True when Razorpay returned 4xx (user-fixable / validation) */
+  isClientError: boolean;
+  httpStatus?: number;
+};
+
+/** Turn axios + Razorpay JSON body into a message; avoid generic "Request failed with status code 400". */
+export function parseRazorpayApiError(error: unknown): RazorpayApiErrorInfo {
+  if (axios.isAxiosError(error)) {
+    const status = error.response?.status;
+    const data = error.response?.data as Record<string, unknown> | undefined;
+    let message = '';
+
+    if (data && typeof data === 'object') {
+      const errObj = data.error;
+      if (typeof errObj === 'string') {
+        message = errObj;
+      } else if (errObj && typeof errObj === 'object') {
+        const e = errObj as Record<string, unknown>;
+        const desc = e.description;
+        const reason = e.reason;
+        const code = e.code;
+        if (typeof desc === 'string') message = desc;
+        else if (typeof reason === 'string') message = reason;
+        else if (typeof code === 'string') message = code;
+      }
+      if (!message && typeof data.message === 'string') message = data.message;
+    }
+
+    if (!message) {
+      message = error.message;
+    }
+
+    const isClientError = typeof status === 'number' && status >= 400 && status < 500;
+    return { message, isClientError, httpStatus: status };
+  }
+
+  if (error instanceof Error) {
+    return { message: error.message, isClientError: false };
+  }
+
+  return { message: 'Failed to communicate with Razorpay', isClientError: false };
+}
+
 type RazorpayXAuth = {
   username: string;
   password: string;
@@ -41,7 +97,8 @@ export async function createRazorpayXContact(params: {
   };
 
   if (params.email) payload.email = params.email;
-  if (params.phone) payload.contact = params.phone;
+  const phoneNorm = normalizeIndianPhoneForRazorpay(params.phone);
+  if (phoneNorm) payload.contact = phoneNorm;
 
   const response = await axios.post('https://api.razorpay.com/v1/contacts', payload, {
     auth: {

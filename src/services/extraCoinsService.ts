@@ -68,11 +68,23 @@ async function getPerformerCoinContext(uid: string): Promise<{
       typeof profile.rating === 'number' || typeof profile.rating === 'string'
         ? Number(profile.rating)
         : 0;
+    const totalReviews =
+      typeof profile.totalReviews === 'number' || typeof profile.totalReviews === 'string'
+        ? Number(profile.totalReviews)
+        : 0;
+
     const normalizedRating = Number.isFinite(rawRating) ? Math.max(rawRating, 0) : 0;
     const rating = new Prisma.Decimal(normalizedRating.toFixed(2));
-    const ratingMultiplier = rating.greaterThanOrEqualTo(new Prisma.Decimal('3.50'))
-      ? minDecimal(rating.div(new Prisma.Decimal('5')).toDecimalPlaces(4), ONE)
-      : ZERO;
+    
+    let ratingMultiplier: Prisma.Decimal;
+    if (totalReviews === 0) {
+      // Unrated users get a default base multiplier of 0.80
+      ratingMultiplier = new Prisma.Decimal('0.80');
+    } else {
+      ratingMultiplier = rating.greaterThanOrEqualTo(new Prisma.Decimal('3.50'))
+        ? minDecimal(rating.div(new Prisma.Decimal('5')).toDecimalPlaces(4), ONE)
+        : ZERO;
+    }
 
     const skillList =
       profile.skills &&

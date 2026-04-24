@@ -27,6 +27,44 @@ function generatePayoutId(): string {
   return `payout_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
 }
 
+async function ensureExtraCoinsAwardedForTaskCompletionPayout(params: {
+  payoutId: string;
+  performerUid: string;
+  taskId: string;
+  taskAmountRupees: Prisma.Decimal;
+  platformFeeRupees: Prisma.Decimal;
+  context: string;
+}): Promise<void> {
+  const { payoutId, performerUid, taskId, taskAmountRupees, platformFeeRupees, context } = params;
+
+  try {
+    const awardResult = await awardExtraCoinsForCompletedTask({
+      userId: performerUid,
+      payoutId,
+      taskId,
+      taskAmountRupees,
+      platformFeeRupees,
+    });
+
+    if (!awardResult.success) {
+      logger.warn(`[payoutService] ExtraCoins award did not complete during ${context}`, {
+        payoutId,
+        performerUid,
+        taskId,
+        reason: awardResult.reason,
+        error: awardResult.error,
+      });
+    }
+  } catch (error: any) {
+    logger.warn(`[payoutService] ExtraCoins award failed during ${context}`, {
+      payoutId,
+      performerUid,
+      taskId,
+      error: error?.message || 'Unknown error',
+    });
+  }
+}
+
 function parseVerificationRef(ref?: string | null): { fundAccountId?: string } {
   if (!ref) return {};
   try {
@@ -798,6 +836,25 @@ export async function processTaskCompletionPayout(params: {
     });
 
     if (existing) {
+      if (existing.status === 'completed') {
+        const existingMetadata =
+          existing.metadata && typeof existing.metadata === 'object' && !Array.isArray(existing.metadata)
+            ? (existing.metadata as Record<string, unknown>)
+            : {};
+        const existingTaskId = typeof existingMetadata.taskId === 'string' ? existingMetadata.taskId : taskId;
+
+        if (existingTaskId) {
+          await ensureExtraCoinsAwardedForTaskCompletionPayout({
+            payoutId: existing.payoutId,
+            performerUid,
+            taskId: existingTaskId,
+            taskAmountRupees: new Prisma.Decimal(String(existingMetadata.taskAmount || existing.amount || amount || '0')),
+            platformFeeRupees: new Prisma.Decimal(String(existingMetadata.platformFee || existing.platformCommission || '0')),
+            context: 'existing completed payout lookup',
+          });
+        }
+      }
+
       return {
         success: true,
         payout: {
@@ -1142,19 +1199,13 @@ export async function processTaskCompletionPayout(params: {
     }
 
     if (status === 'completed') {
-      awardExtraCoinsForCompletedTask({
-        userId: performerUid,
+      await ensureExtraCoinsAwardedForTaskCompletionPayout({
         payoutId,
+        performerUid,
         taskId,
         taskAmountRupees: grossAmount,
         platformFeeRupees: platformCommission,
-      }).catch((error) => {
-        logger.warn('Failed to award ExtraCoins for completed task payout', {
-          payoutId,
-          performerUid,
-          taskId,
-          error: error?.message || 'Unknown error',
-        });
+        context: 'payout creation',
       });
 
       updateUserPaymentProfile(performerUid, {
@@ -1331,20 +1382,15 @@ export async function getPayoutStatus(payoutId: string): Promise<{
 
             const taskId = typeof md.taskId === 'string' ? md.taskId : '';
             if (taskId) {
-              awardExtraCoinsForCompletedTask({
-                userId: payout.performerUid,
+              await ensureExtraCoinsAwardedForTaskCompletionPayout({
                 payoutId: payout.payoutId,
+                performerUid: payout.performerUid,
                 taskId,
                 taskAmountRupees: new Prisma.Decimal(String(md.taskAmount || payout.amount || '0')),
                 platformFeeRupees: new Prisma.Decimal(
                   String(md.platformFee || payout.platformCommission || '0')
                 ),
-              }).catch((err) => {
-                logger.warn('Failed to award ExtraCoins after payout completion status refresh', {
-                  payoutId: payout.payoutId,
-                  performerUid: payout.performerUid,
-                  error: err?.message || 'Unknown error',
-                });
+                context: 'payout status refresh',
               });
             }
           }

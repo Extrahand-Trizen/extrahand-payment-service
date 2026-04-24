@@ -629,6 +629,44 @@ export async function awardExtraCoinsForCompletedTask(params: {
   }
 }
 
+async function backfillMissingExtraCoinsForWallet(userId: string): Promise<void> {
+  if (!userId) return;
+
+  const payouts = await prisma.payout.findMany({
+    where: {
+      performerUid: userId,
+      type: 'task_completion',
+      status: 'completed',
+    },
+    orderBy: { createdAt: 'asc' },
+    select: {
+      payoutId: true,
+      performerUid: true,
+      amount: true,
+      platformCommission: true,
+      metadata: true,
+    },
+  });
+
+  for (const payout of payouts) {
+    const metadata =
+      payout.metadata && typeof payout.metadata === 'object' && !Array.isArray(payout.metadata)
+        ? (payout.metadata as Record<string, unknown>)
+        : {};
+    const taskId = typeof metadata.taskId === 'string' ? metadata.taskId : '';
+
+    if (!taskId) continue;
+
+    await awardExtraCoinsForCompletedTask({
+      userId: payout.performerUid,
+      payoutId: payout.payoutId,
+      taskId,
+      taskAmountRupees: new Prisma.Decimal(String(metadata.taskAmount || payout.amount || '0')),
+      platformFeeRupees: new Prisma.Decimal(String(metadata.platformFee || payout.platformCommission || '0')),
+    });
+  }
+}
+
 export async function getExtraCoinsWallet(userId: string): Promise<{
   success: boolean;
   wallet?: {
@@ -672,6 +710,7 @@ export async function getExtraCoinsWallet(userId: string): Promise<{
   error?: string;
 }> {
   try {
+    await backfillMissingExtraCoinsForWallet(userId);
     await expireExtraCoins(userId);
 
     const now = new Date();

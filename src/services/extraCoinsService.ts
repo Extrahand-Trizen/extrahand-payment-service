@@ -43,7 +43,8 @@ async function getPerformerCoinContext(uid: string): Promise<{
   if (!uid || mongoose.connection.readyState !== 1) {
     return {
       rating: ZERO,
-      ratingMultiplier: ZERO,
+      // When profile context is unavailable, keep baseline rewards enabled.
+      ratingMultiplier: new Prisma.Decimal('0.80'),
       skillCertificateBonusPct: ZERO,
     };
   }
@@ -59,7 +60,8 @@ async function getPerformerCoinContext(uid: string): Promise<{
     if (!profile) {
       return {
         rating: ZERO,
-        ratingMultiplier: ZERO,
+        // Missing profile should behave like an unrated user, not a hard block.
+        ratingMultiplier: new Prisma.Decimal('0.80'),
         skillCertificateBonusPct: ZERO,
       };
     }
@@ -113,7 +115,7 @@ async function getPerformerCoinContext(uid: string): Promise<{
     logger.warn('[extraCoins] Failed to read performer profile context', { uid, error });
     return {
       rating: ZERO,
-      ratingMultiplier: ZERO,
+      ratingMultiplier: new Prisma.Decimal('0.80'),
       skillCertificateBonusPct: ZERO,
     };
   }

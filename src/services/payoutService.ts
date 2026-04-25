@@ -46,6 +46,28 @@ async function ensureExtraCoinsAwardedForTaskCompletionPayout(params: {
       platformFeeRupees,
     });
 
+    if (awardResult.success) {
+      const awardedCoins = new Prisma.Decimal(awardResult.awardedCoins || '0');
+      if (awardedCoins.lessThanOrEqualTo(new Prisma.Decimal('0'))) {
+        logger.info(`[payoutService] ExtraCoins award resulted in zero during ${context}`, {
+          payoutId,
+          performerUid,
+          taskId,
+          reason: awardResult.reason || 'no_reason_provided',
+          details: awardResult.details,
+        });
+      } else {
+        logger.info(`[payoutService] ExtraCoins awarded during ${context}`, {
+          payoutId,
+          performerUid,
+          taskId,
+          awardedCoins: awardResult.awardedCoins,
+          awardedRupees: awardResult.awardedRupees,
+          details: awardResult.details,
+        });
+      }
+    }
+
     if (!awardResult.success) {
       logger.warn(`[payoutService] ExtraCoins award did not complete during ${context}`, {
         payoutId,

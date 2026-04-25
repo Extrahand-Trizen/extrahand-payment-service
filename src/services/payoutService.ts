@@ -1079,6 +1079,15 @@ export async function processTaskCompletionPayout(params: {
       penaltiesAppliedAt: null as string | null,
     };
 
+    await ensureExtraCoinsAwardedForTaskCompletionPayout({
+      payoutId,
+      performerUid,
+      taskId,
+      taskAmountRupees: grossAmount,
+      platformFeeRupees: platformCommission,
+      context: 'payout creation',
+    });
+
     let status: string = 'completed';
 
     if (netAmount.lte(0)) {
@@ -1199,15 +1208,6 @@ export async function processTaskCompletionPayout(params: {
     }
 
     if (status === 'completed') {
-      await ensureExtraCoinsAwardedForTaskCompletionPayout({
-        payoutId,
-        performerUid,
-        taskId,
-        taskAmountRupees: grossAmount,
-        platformFeeRupees: platformCommission,
-        context: 'payout creation',
-      });
-
       updateUserPaymentProfile(performerUid, {
         type: 'payout',
         amount: netAmount,

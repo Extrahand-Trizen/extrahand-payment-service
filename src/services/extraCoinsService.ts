@@ -444,7 +444,7 @@ export async function awardExtraCoinsForCompletedTask(params: {
       where: {
         userId,
         type: 'earned',
-        sourcePayoutId: payoutId,
+        OR: [{ sourcePayoutId: payoutId }, { taskId }],
         status: 'completed',
       },
     });

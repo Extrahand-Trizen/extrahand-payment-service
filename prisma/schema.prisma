@@ -26,8 +26,8 @@ model Transaction {
   status            String // created, authorized, captured, failed
   paymentMethod     String?
   metadata          Json?
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
 
   @@index([userId])
   @@index([taskId])
@@ -78,40 +78,11 @@ model Escrow {
   refunds  Refund[]
   payouts  Payout[]
   disputes Dispute[]
-  transactions Transaction[]
 
   @@index([taskId, status])
   @@index([posterUid, status])
   @@index([performerUid, status])
   @@index([status, autoReleaseDate])
-  @@index([createdAt])
-}
-
-// Transaction - Pay-in record (Razorpay payment) linked to escrow and ledger
-model Transaction {
-  id                 String   @id @default(uuid())
-  transactionId      String   @unique
-  escrowId           String?
-  razorpayOrderId    String
-  razorpayPaymentId  String?  @unique
-  amount             Decimal  @db.Decimal(12, 2)
-  currency           String   @default("INR")
-  status             String   // authorized, captured, failed
-  paymentMethod      String?
-  authorizedAt       DateTime?
-  capturedAt         DateTime?
-  failedAt           DateTime?
-  metadata           Json?
-  ledgerEntryId      String?  @unique
-  createdAt          DateTime @default(now())
-  updatedAt          DateTime @updatedAt
-
-  escrow Escrow? @relation(fields: [escrowId], references: [id], onDelete: SetNull)
-  ledger Ledger? @relation(fields: [ledgerEntryId], references: [id], onDelete: SetNull)
-
-  @@index([escrowId])
-  @@index([razorpayOrderId])
-  @@index([status])
   @@index([createdAt])
 }
 
@@ -141,7 +112,6 @@ model Ledger {
   escrow Escrow? @relation(fields: [escrowId], references: [id], onDelete: SetNull)
   payout Payout? @relation(fields: [payoutId], references: [id], onDelete: SetNull)
   refund Refund? @relation(fields: [refundId], references: [id], onDelete: SetNull)
-  paymentTransaction Transaction? @relation(fields: [paymentTransactionId], references: [id], onDelete: SetNull)
 
   @@unique([razorpayPaymentId, type])
   @@index([escrowId])
@@ -150,7 +120,6 @@ model Ledger {
   @@index([type])
   @@index([payoutId])
   @@index([refundId])
-  @@index([paymentTransactionId])
   @@index([createdAt])
 }
 

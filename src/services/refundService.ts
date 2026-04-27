@@ -310,6 +310,7 @@ export async function processRefund(params: {
           const ledgerEntries: Array<{
             transactionId: string;
             escrowId: string;
+            refundId: string;
             type: string;
             amount: Prisma.Decimal;
             balanceBefore: Prisma.Decimal;
@@ -327,6 +328,7 @@ export async function processRefund(params: {
           ledgerEntries.push({
             transactionId: generateTxId(),
             escrowId: postgresEscrow.id,
+            refundId,
             type: 'refund',
             amount: refundAmount.neg(),
             balanceBefore: currentBalance,
@@ -354,6 +356,7 @@ export async function processRefund(params: {
             ledgerEntries.push({
               transactionId: generateTxId(),
               escrowId: postgresEscrow.id,
+              refundId,
               type: 'cancellation_fee',
               amount: cancellationFee.neg(),
               balanceBefore: balanceBeforeFee,
@@ -374,6 +377,7 @@ export async function processRefund(params: {
               ledgerEntries.push({
                 transactionId: generateTxId(),
                 escrowId: postgresEscrow.id,
+                refundId,
                 type: 'compensation',
                 amount: toOtherParty.neg(),
                 balanceBefore: balanceBeforeComp,
@@ -394,6 +398,7 @@ export async function processRefund(params: {
               ledgerEntries.push({
                 transactionId: generateTxId(),
                 escrowId: postgresEscrow.id,
+                refundId,
                 type: 'platform_fee',
                 amount: toPlatform.neg(),
                 balanceBefore: balanceBeforePlatform,

@@ -56,11 +56,40 @@ model Escrow {
   refunds  Refund[]
   payouts  Payout[]
   disputes Dispute[]
+  transactions Transaction[]
 
   @@index([taskId, status])
   @@index([posterUid, status])
   @@index([performerUid, status])
   @@index([status, autoReleaseDate])
+  @@index([createdAt])
+}
+
+// Transaction - Pay-in record (Razorpay payment) linked to escrow and ledger
+model Transaction {
+  id                 String   @id @default(uuid())
+  transactionId      String   @unique
+  escrowId           String?
+  razorpayOrderId    String
+  razorpayPaymentId  String?  @unique
+  amount             Decimal  @db.Decimal(12, 2)
+  currency           String   @default("INR")
+  status             String   // authorized, captured, failed
+  paymentMethod      String?
+  authorizedAt       DateTime?
+  capturedAt         DateTime?
+  failedAt           DateTime?
+  metadata           Json?
+  ledgerEntryId      String?  @unique
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  escrow Escrow? @relation(fields: [escrowId], references: [id], onDelete: SetNull)
+  ledger Ledger? @relation(fields: [ledgerEntryId], references: [id], onDelete: SetNull)
+
+  @@index([escrowId])
+  @@index([razorpayOrderId])
+  @@index([status])
   @@index([createdAt])
 }
 
@@ -71,6 +100,9 @@ model Ledger {
   id            String   @id @default(uuid())
   transactionId String   @unique
   escrowId      String?
+  payoutId      String?
+  refundId      String?
+  paymentTransactionId String?
   razorpayPaymentId String?
   type          String // escrow, payment, refund, payout, razorpay_fee, platform_commission, gst, tds, cancellation_fee, platform_fee
   amount        Decimal  @db.Decimal(12, 2)
@@ -82,9 +114,15 @@ model Ledger {
 
   // Relations
   escrow Escrow? @relation(fields: [escrowId], references: [id], onDelete: SetNull)
+  payout Payout? @relation(fields: [payoutId], references: [id], onDelete: SetNull)
+  refund Refund? @relation(fields: [refundId], references: [id], onDelete: SetNull)
+  paymentTransaction Transaction? @relation(fields: [paymentTransactionId], references: [id], onDelete: SetNull)
 
   @@index([escrowId])
   @@index([type])
+  @@index([payoutId])
+  @@index([refundId])
+  @@index([paymentTransactionId])
   @@index([createdAt])
   @@unique([razorpayPaymentId, type])
 }
@@ -111,6 +149,7 @@ model Refund {
 
   // Relations
   escrow Escrow? @relation(fields: [escrowId], references: [id], onDelete: SetNull)
+  ledger Ledger[]
 
   @@index([escrowId])
   @@index([paymentId])
@@ -141,6 +180,7 @@ model Payout {
 
   // Relations
   escrow Escrow? @relation(fields: [escrowId], references: [id], onDelete: SetNull)
+  ledger Ledger[]
 
   @@index([escrowId])
   @@index([performerUid])

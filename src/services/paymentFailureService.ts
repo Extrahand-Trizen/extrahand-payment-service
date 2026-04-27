@@ -57,6 +57,13 @@ export async function handlePaymentFailure(params: {
     });
 
     if (postgresEscrow) {
+      const paymentTransaction = razorpayPaymentId
+        ? await prisma.transaction.findUnique({
+            where: { razorpayPaymentId },
+            select: { id: true },
+          })
+        : null;
+
       // Get current balance
       const balanceResult = await getEscrowBalance(postgresEscrow.id);
       const currentBalance = balanceResult.balance || new Prisma.Decimal('0.00');
@@ -64,6 +71,7 @@ export async function handlePaymentFailure(params: {
       // Create ledger entry for failure (balance remains 0, no money was captured)
       await createLedgerEntry({
         escrowId: postgresEscrow.id,
+        paymentTransactionId: paymentTransaction?.id,
         type: 'payment',
         amount: new Prisma.Decimal('0.00'), // No amount captured
         balanceBefore: currentBalance,

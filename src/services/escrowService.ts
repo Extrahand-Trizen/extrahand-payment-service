@@ -22,6 +22,10 @@ function generateEscrowId(): string {
   return `escrow_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
 }
 
+function generatePaymentTransactionId(): string {
+  return `txn_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+}
+
 /**
  * Calculate auto-release days from auto-release date and creation date
  */
@@ -373,6 +377,51 @@ export async function updateEscrowOnPaymentCapture(
       data: updateData,
     });
 
+    const shouldPersistTransaction =
+      typeof razorpayPaymentId === 'string' &&
+      razorpayPaymentId.trim().length > 0 &&
+      razorpayPaymentId !== 'unknown';
+
+    let paymentTransaction: { id: string } | null = null;
+    if (shouldPersistTransaction) {
+      const paymentMethod =
+        sanitizedPaymentData &&
+        typeof (sanitizedPaymentData as any).method === 'string'
+          ? String((sanitizedPaymentData as any).method)
+          : null;
+
+      paymentTransaction = await prisma.transaction.upsert({
+        where: { razorpayPaymentId },
+        create: {
+          transactionId: generatePaymentTransactionId(),
+          escrowId: postgresEscrow.id,
+          razorpayOrderId,
+          razorpayPaymentId,
+          amount: updatedEscrow.amountInRupees,
+          currency: updatedEscrow.currency || 'INR',
+          status: paymentStatus,
+          paymentMethod,
+          authorizedAt: paymentStatus === 'authorized' ? new Date() : null,
+          capturedAt: paymentStatus === 'captured' ? new Date() : null,
+          failedAt: paymentStatus === 'failed' ? new Date() : null,
+          metadata: sanitizedPaymentData ? { payment: sanitizedPaymentData } : undefined,
+        },
+        update: {
+          escrowId: postgresEscrow.id,
+          razorpayOrderId,
+          amount: updatedEscrow.amountInRupees,
+          currency: updatedEscrow.currency || 'INR',
+          status: paymentStatus,
+          paymentMethod: paymentMethod ?? undefined,
+          authorizedAt: paymentStatus === 'authorized' ? new Date() : undefined,
+          capturedAt: paymentStatus === 'captured' ? new Date() : undefined,
+          failedAt: paymentStatus === 'failed' ? new Date() : undefined,
+          metadata: sanitizedPaymentData ? { payment: sanitizedPaymentData } : undefined,
+        },
+        select: { id: true },
+      });
+    }
+
     // Create ledger entry for payment capture
     if (paymentStatus === 'captured') {
       // Get current balance (using Postgres escrow ID)
@@ -380,8 +429,9 @@ export async function updateEscrowOnPaymentCapture(
       const currentBalance = balanceResult.balance || new Prisma.Decimal('0.00');
 
       // Create ledger entry for payment capture
-      await createLedgerEntry({
+      const ledgerResult = await createLedgerEntry({
         escrowId: postgresEscrow.id,
+        paymentTransactionId: paymentTransaction?.id,
         type: 'payment',
         amount: updatedEscrow.amountInRupees,
         balanceBefore: currentBalance,
@@ -393,6 +443,13 @@ export async function updateEscrowOnPaymentCapture(
           escrowId: postgresEscrow.escrowId,
         },
       });
+
+      if (paymentTransaction?.id && ledgerResult.success && ledgerResult.ledger?.id) {
+        await prisma.transaction.update({
+          where: { id: paymentTransaction.id },
+          data: { ledgerEntryId: ledgerResult.ledger.id },
+        });
+      }
 
       // Update UserPaymentProfile cache for poster (payment made)
       const { updateUserPaymentProfile } = await import('./userPaymentProfileService');

@@ -1,6 +1,7 @@
 import { Response, Request } from 'express';
 import { getUserTransactions, getTransactionSummary } from '../services/transactionHistoryService';
-import { getExtraCoinsWallet } from '../services/extraCoinsService';
+import { getExtraCoinsWallet, awardReferralSignupCoins, awardReferralTaskBonus } from '../services/extraCoinsService';
+import { Prisma } from '@prisma/client';
 import { BadRequestError } from '../errors/AppError';
 
 export class TransactionController {
@@ -114,6 +115,42 @@ export class TransactionController {
       success: true,
       wallet: result.wallet,
     });
+  }
+
+  /**
+   * POST /api/v1/transactions/award-referral-coins
+   * Award ExtraCoins for referral signup or task completion.
+   * Body: { type: 'signup' | 'task_bonus', referrerUid, refereeUid, referralCode, platformFeeRupees?, taskId? }
+   */
+  static async awardReferralCoins(req: Request, res: Response): Promise<void> {
+    const { type, referrerUid, refereeUid, referralCode, platformFeeRupees, taskId } = req.body;
+
+    if (!type || !referrerUid || !refereeUid || !referralCode) {
+      throw new BadRequestError('type, referrerUid, refereeUid, referralCode are required');
+    }
+
+    if (type === 'signup') {
+      const result = await awardReferralSignupCoins({ referrerUid, refereeUid, referralCode });
+      res.json({ success: result.success, ...result });
+      return;
+    }
+
+    if (type === 'task_bonus') {
+      if (!taskId || !platformFeeRupees) {
+        throw new BadRequestError('taskId and platformFeeRupees are required for task_bonus');
+      }
+      const result = await awardReferralTaskBonus({
+        referrerUid,
+        refereeUid,
+        taskId,
+        platformFeeRupees: new Prisma.Decimal(String(platformFeeRupees)),
+        referralCode,
+      });
+      res.json({ success: result.success, ...result });
+      return;
+    }
+
+    throw new BadRequestError(`Unknown type: ${type}`);
   }
 }
 

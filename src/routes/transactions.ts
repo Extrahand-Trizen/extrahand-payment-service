@@ -34,5 +34,12 @@ router.get('/:userId/wallet', asyncHandler(TransactionController.getExtraCoinsWa
  */
 router.get('/:userId/summary', asyncHandler(TransactionController.getTransactionSummary));
 
+/**
+ * POST /api/v1/transactions/award-referral-coins
+ * Award ExtraCoins for referral events (signup bonus or task completion bonus).
+ * Called by user-service via service auth.
+ */
+router.post('/award-referral-coins', asyncHandler(TransactionController.awardReferralCoins));
+
 export default router;
 

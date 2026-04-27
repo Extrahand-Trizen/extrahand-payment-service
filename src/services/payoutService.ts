@@ -609,6 +609,7 @@ export async function processPayout(params: {
           const ledgerEntries: Array<{
             transactionId: string;
             escrowId: string;
+            payoutId: string;
             type: string;
             amount: Prisma.Decimal;
             balanceBefore: Prisma.Decimal;
@@ -627,6 +628,7 @@ export async function processPayout(params: {
           ledgerEntries.push({
             transactionId: generateTxId(),
             escrowId: postgresEscrow.id,
+            payoutId,
             type: 'platform_commission',
             amount: feeBreakdown.platformCommission.neg(),
             balanceBefore: currentBalance,
@@ -645,6 +647,7 @@ export async function processPayout(params: {
           ledgerEntries.push({
             transactionId: generateTxId(),
             escrowId: postgresEscrow.id,
+            payoutId,
             type: 'gst',
             amount: feeBreakdown.platformCommissionGst.neg(),
             balanceBefore: balanceBeforeGst1,
@@ -664,6 +667,7 @@ export async function processPayout(params: {
           ledgerEntries.push({
             transactionId: generateTxId(),
             escrowId: postgresEscrow.id,
+            payoutId,
             type: 'razorpay_fee',
             amount: feeBreakdown.razorpayFee.neg(),
             balanceBefore: balanceBeforeRazorpay,
@@ -682,6 +686,7 @@ export async function processPayout(params: {
           ledgerEntries.push({
             transactionId: generateTxId(),
             escrowId: postgresEscrow.id,
+            payoutId,
             type: 'gst',
             amount: feeBreakdown.razorpayFeeGst.neg(),
             balanceBefore: balanceBeforeGst2,
@@ -701,6 +706,7 @@ export async function processPayout(params: {
           ledgerEntries.push({
             transactionId: generateTxId(),
             escrowId: postgresEscrow.id,
+            payoutId,
             type: 'tds',
             amount: feeBreakdown.tds.neg(),
             balanceBefore: balanceBeforeTds,
@@ -720,6 +726,7 @@ export async function processPayout(params: {
           ledgerEntries.push({
             transactionId: generateTxId(),
             escrowId: postgresEscrow.id,
+            payoutId,
             type: 'payout',
             amount: netPayoutAmount.neg(),
             balanceBefore: finalBalance,

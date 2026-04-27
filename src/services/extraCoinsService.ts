@@ -840,3 +840,242 @@ export async function getExtraCoinsWallet(userId: string, linkedUserIds?: string
     };
   }
 }
+
+// ─── Referral ExtraCoins ─────────────────────────────────────────────────────
+
+/**
+ * Award referral sign-up ExtraCoins:
+ *   Referrer → 125 coins (₹25)
+ *   Referee  → 75 coins (₹15 welcome bonus)
+ * Called when a new user applies a referral code.
+ */
+export async function awardReferralSignupCoins(params: {
+  referrerUid: string;
+  refereeUid: string;
+  referralCode: string;
+}): Promise<{
+  success: boolean;
+  referrerCoins: string;
+  refereeCoins: string;
+  error?: string;
+}> {
+  const { referrerUid, refereeUid, referralCode } = params;
+
+  // Coin rate: ₹0.20 per coin
+  const REFERRER_RUPEES = new Prisma.Decimal('25.00');   // ₹25 → 125 coins
+  const REFEREE_RUPEES  = new Prisma.Decimal('15.00');   // ₹15 → 75 coins
+  const REFERRER_COINS  = REFERRER_RUPEES.div(COIN_VALUE_INR).toDecimalPlaces(2);
+  const REFEREE_COINS   = REFEREE_RUPEES.div(COIN_VALUE_INR).toDecimalPlaces(2);
+  const expiresAt = new Date(Date.now() + COIN_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
+
+  try {
+    await prisma.$transaction(async (tx) => {
+      // Referrer reward
+      await tx.extraCoinTransaction.create({
+        data: {
+          transactionId: generateCoinTransactionId('earned'),
+          userId: referrerUid,
+          type: 'earned',
+          status: 'completed',
+          coins: REFERRER_COINS,
+          rupeeValue: REFERRER_RUPEES,
+          remainingCoins: REFERRER_COINS,
+          remainingRupees: REFERRER_RUPEES,
+          expiresAt,
+          metadata: {
+            source: 'referral_signup',
+            referralCode,
+            refereeUid,
+            description: `Referral bonus — ${refereeUid} joined with your code`,
+          } as Prisma.JsonObject,
+        },
+      });
+      await tx.extraCoinWallet.upsert({
+        where: { userId: referrerUid },
+        update: {
+          balanceCoins: { increment: REFERRER_COINS },
+          balanceRupees: { increment: REFERRER_RUPEES },
+          lifetimeEarnedCoins: { increment: REFERRER_COINS },
+          lastUpdatedAt: new Date(),
+        },
+        create: {
+          userId: referrerUid,
+          balanceCoins: REFERRER_COINS,
+          balanceRupees: REFERRER_RUPEES,
+          lifetimeEarnedCoins: REFERRER_COINS,
+          lifetimeUsedCoins: ZERO,
+          lastUpdatedAt: new Date(),
+        },
+      });
+
+      // Referee welcome bonus
+      await tx.extraCoinTransaction.create({
+        data: {
+          transactionId: generateCoinTransactionId('earned'),
+          userId: refereeUid,
+          type: 'earned',
+          status: 'completed',
+          coins: REFEREE_COINS,
+          rupeeValue: REFEREE_RUPEES,
+          remainingCoins: REFEREE_COINS,
+          remainingRupees: REFEREE_RUPEES,
+          expiresAt,
+          metadata: {
+            source: 'referral_welcome',
+            referralCode,
+            referrerUid,
+            description: `Welcome bonus — you joined with referral code ${referralCode}`,
+          } as Prisma.JsonObject,
+        },
+      });
+      await tx.extraCoinWallet.upsert({
+        where: { userId: refereeUid },
+        update: {
+          balanceCoins: { increment: REFEREE_COINS },
+          balanceRupees: { increment: REFEREE_RUPEES },
+          lifetimeEarnedCoins: { increment: REFEREE_COINS },
+          lastUpdatedAt: new Date(),
+        },
+        create: {
+          userId: refereeUid,
+          balanceCoins: REFEREE_COINS,
+          balanceRupees: REFEREE_RUPEES,
+          lifetimeEarnedCoins: REFEREE_COINS,
+          lifetimeUsedCoins: ZERO,
+          lastUpdatedAt: new Date(),
+        },
+      });
+    });
+
+    logger.info('[extraCoins] Referral signup coins awarded', {
+      referrerUid, refereeUid, referralCode,
+      referrerCoins: REFERRER_COINS.toString(),
+      refereeCoins: REFEREE_COINS.toString(),
+    });
+
+    return {
+      success: true,
+      referrerCoins: REFERRER_COINS.toString(),
+      refereeCoins: REFEREE_COINS.toString(),
+    };
+  } catch (error: any) {
+    logger.error('[extraCoins] Failed to award referral signup coins', { referrerUid, refereeUid, error });
+    return {
+      success: false,
+      referrerCoins: '0',
+      refereeCoins: '0',
+      error: error?.message || 'Failed to award referral coins',
+    };
+  }
+}
+
+/**
+ * Award referral task-completion bonus to the referrer:
+ *   Referrer → 20% of platform fee ÷ 0.20 coins
+ * Called when referred tasker completes their qualifying task.
+ */
+export async function awardReferralTaskBonus(params: {
+  referrerUid: string;
+  refereeUid: string;
+  taskId: string;
+  platformFeeRupees: Prisma.Decimal;
+  referralCode: string;
+}): Promise<{
+  success: boolean;
+  awardedCoins: string;
+  awardedRupees: string;
+  error?: string;
+}> {
+  const { referrerUid, refereeUid, taskId, platformFeeRupees, referralCode } = params;
+
+  try {
+    // Check for duplicate
+    const existing = await prisma.extraCoinTransaction.findFirst({
+      where: {
+        userId: referrerUid,
+        type: 'earned',
+        taskId,
+        metadata: { path: ['source'], equals: 'referral_task_bonus' },
+      },
+    });
+    if (existing) {
+      return {
+        success: true,
+        awardedCoins: existing.coins.toString(),
+        awardedRupees: existing.rupeeValue.toString(),
+      };
+    }
+
+    const BONUS_PCT = new Prisma.Decimal('0.20');           // 20% of platform fee
+    const bonusRupees = platformFeeRupees.mul(BONUS_PCT).toDecimalPlaces(2);
+    const bonusCoins  = bonusRupees.div(COIN_VALUE_INR).toDecimalPlaces(2);
+
+    if (bonusRupees.lessThanOrEqualTo(ZERO)) {
+      return { success: true, awardedCoins: '0', awardedRupees: '0' };
+    }
+
+    const expiresAt = new Date(Date.now() + COIN_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
+
+    await prisma.$transaction(async (tx) => {
+      await tx.extraCoinTransaction.create({
+        data: {
+          transactionId: generateCoinTransactionId('earned'),
+          userId: referrerUid,
+          type: 'earned',
+          status: 'completed',
+          coins: bonusCoins,
+          rupeeValue: bonusRupees,
+          remainingCoins: bonusCoins,
+          remainingRupees: bonusRupees,
+          taskId,
+          expiresAt,
+          metadata: {
+            source: 'referral_task_bonus',
+            referralCode,
+            refereeUid,
+            platformFeeRupees: platformFeeRupees.toString(),
+            bonusPct: BONUS_PCT.toString(),
+            description: `Referral task bonus — your referral completed a task`,
+          } as Prisma.JsonObject,
+        },
+      });
+      await tx.extraCoinWallet.upsert({
+        where: { userId: referrerUid },
+        update: {
+          balanceCoins: { increment: bonusCoins },
+          balanceRupees: { increment: bonusRupees },
+          lifetimeEarnedCoins: { increment: bonusCoins },
+          lastUpdatedAt: new Date(),
+        },
+        create: {
+          userId: referrerUid,
+          balanceCoins: bonusCoins,
+          balanceRupees: bonusRupees,
+          lifetimeEarnedCoins: bonusCoins,
+          lifetimeUsedCoins: ZERO,
+          lastUpdatedAt: new Date(),
+        },
+      });
+    });
+
+    logger.info('[extraCoins] Referral task bonus awarded', {
+      referrerUid, refereeUid, taskId,
+      awardedCoins: bonusCoins.toString(),
+      awardedRupees: bonusRupees.toString(),
+    });
+
+    return {
+      success: true,
+      awardedCoins: bonusCoins.toString(),
+      awardedRupees: bonusRupees.toString(),
+    };
+  } catch (error: any) {
+    logger.error('[extraCoins] Failed to award referral task bonus', { referrerUid, taskId, error });
+    return {
+      success: false,
+      awardedCoins: '0',
+      awardedRupees: '0',
+      error: error?.message || 'Failed to award referral task bonus',
+    };
+  }
+}

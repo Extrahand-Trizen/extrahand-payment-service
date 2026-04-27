@@ -90,12 +90,21 @@ export class TransactionController {
    */
   static async getExtraCoinsWallet(req: Request, res: Response): Promise<void> {
     const { userId } = req.params;
+    const { linkedUserIds } = req.query;
 
     if (!userId) {
       throw new BadRequestError('User ID is required');
     }
 
-    const result = await getExtraCoinsWallet(userId);
+    const linkedParsed =
+      typeof linkedUserIds === 'string' && linkedUserIds.trim()
+        ? linkedUserIds
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : undefined;
+
+    const result = await getExtraCoinsWallet(userId, linkedParsed);
 
     if (!result.success) {
       throw new Error(result.error || 'Failed to get ExtraCoins wallet');

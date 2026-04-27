@@ -43,7 +43,8 @@ async function getPerformerCoinContext(uid: string): Promise<{
   if (!uid || mongoose.connection.readyState !== 1) {
     return {
       rating: ZERO,
-      ratingMultiplier: ZERO,
+      // When profile context is unavailable, keep baseline rewards enabled.
+      ratingMultiplier: new Prisma.Decimal('0.80'),
       skillCertificateBonusPct: ZERO,
     };
   }
@@ -59,7 +60,8 @@ async function getPerformerCoinContext(uid: string): Promise<{
     if (!profile) {
       return {
         rating: ZERO,
-        ratingMultiplier: ZERO,
+        // Missing profile should behave like an unrated user, not a hard block.
+        ratingMultiplier: new Prisma.Decimal('0.80'),
         skillCertificateBonusPct: ZERO,
       };
     }
@@ -113,7 +115,7 @@ async function getPerformerCoinContext(uid: string): Promise<{
     logger.warn('[extraCoins] Failed to read performer profile context', { uid, error });
     return {
       rating: ZERO,
-      ratingMultiplier: ZERO,
+      ratingMultiplier: new Prisma.Decimal('0.80'),
       skillCertificateBonusPct: ZERO,
     };
   }
@@ -444,7 +446,7 @@ export async function awardExtraCoinsForCompletedTask(params: {
       where: {
         userId,
         type: 'earned',
-        sourcePayoutId: payoutId,
+        OR: [{ sourcePayoutId: payoutId }, { taskId }],
         status: 'completed',
       },
     });
@@ -629,7 +631,45 @@ export async function awardExtraCoinsForCompletedTask(params: {
   }
 }
 
-export async function getExtraCoinsWallet(userId: string): Promise<{
+async function backfillMissingExtraCoinsForWallet(userId: string): Promise<void> {
+  if (!userId) return;
+
+  const payouts = await prisma.payout.findMany({
+    where: {
+      performerUid: userId,
+      type: 'task_completion',
+      status: 'completed',
+    },
+    orderBy: { createdAt: 'asc' },
+    select: {
+      payoutId: true,
+      performerUid: true,
+      amount: true,
+      platformCommission: true,
+      metadata: true,
+    },
+  });
+
+  for (const payout of payouts) {
+    const metadata =
+      payout.metadata && typeof payout.metadata === 'object' && !Array.isArray(payout.metadata)
+        ? (payout.metadata as Record<string, unknown>)
+        : {};
+    const taskId = typeof metadata.taskId === 'string' ? metadata.taskId : '';
+
+    if (!taskId) continue;
+
+    await awardExtraCoinsForCompletedTask({
+      userId: payout.performerUid,
+      payoutId: payout.payoutId,
+      taskId,
+      taskAmountRupees: new Prisma.Decimal(String(metadata.taskAmount || payout.amount || '0')),
+      platformFeeRupees: new Prisma.Decimal(String(metadata.platformFee || payout.platformCommission || '0')),
+    });
+  }
+}
+
+export async function getExtraCoinsWallet(userId: string, linkedUserIds?: string[]): Promise<{
   success: boolean;
   wallet?: {
     coinToRupee: string;
@@ -672,30 +712,51 @@ export async function getExtraCoinsWallet(userId: string): Promise<{
   error?: string;
 }> {
   try {
-    await expireExtraCoins(userId);
+    const allUserIds = Array.from(
+      new Set(
+        [userId, ...(linkedUserIds || [])]
+          .map((id) => (typeof id === 'string' ? id.trim() : ''))
+          .filter((id) => id.length > 0)
+      )
+    );
+
+    if (allUserIds.length === 0) {
+      return {
+        success: false,
+        error: 'User ID is required',
+      };
+    }
+
+    await Promise.all(allUserIds.map((id) => backfillMissingExtraCoinsForWallet(id)));
+    await Promise.all(allUserIds.map((id) => expireExtraCoins(id)));
 
     const now = new Date();
     const expiringSoonDate = new Date(now.getTime() + EXPIRING_SOON_DAYS * 24 * 60 * 60 * 1000);
 
-    const [wallet, lifetimeExpiredAgg, earnedRows, usedRows, expiringRows] = await Promise.all([
-      prisma.extraCoinWallet.findUnique({ where: { userId } }),
+    const walletWhere =
+      allUserIds.length === 1
+        ? { userId: allUserIds[0] }
+        : { userId: { in: allUserIds } };
+
+    const [walletRows, lifetimeExpiredAgg, earnedRows, usedRows, expiringRows] = await Promise.all([
+      prisma.extraCoinWallet.findMany({ where: walletWhere }),
       prisma.extraCoinTransaction.aggregate({
-        where: { userId, type: 'expired', status: 'completed' },
+        where: { ...walletWhere, type: 'expired', status: 'completed' },
         _sum: { coins: true },
       }),
       prisma.extraCoinTransaction.findMany({
-        where: { userId, type: 'earned', status: 'completed' },
+        where: { ...walletWhere, type: 'earned', status: 'completed' },
         orderBy: { createdAt: 'desc' },
-        take: 100,
+        take: 200,
       }),
       prisma.extraCoinTransaction.findMany({
-        where: { userId, type: 'redeemed', status: 'completed' },
+        where: { ...walletWhere, type: 'redeemed', status: 'completed' },
         orderBy: { createdAt: 'desc' },
-        take: 100,
+        take: 200,
       }),
       prisma.extraCoinTransaction.findMany({
         where: {
-          userId,
+          ...walletWhere,
           type: 'earned',
           status: 'completed',
           remainingRupees: { gt: ZERO },
@@ -708,14 +769,30 @@ export async function getExtraCoinsWallet(userId: string): Promise<{
       }),
     ]);
 
+    const mergedWallet = walletRows.reduce(
+      (acc, row) => {
+        acc.balanceCoins = acc.balanceCoins.plus(toDecimal(row.balanceCoins || ZERO));
+        acc.balanceRupees = acc.balanceRupees.plus(toDecimal(row.balanceRupees || ZERO));
+        acc.lifetimeEarnedCoins = acc.lifetimeEarnedCoins.plus(toDecimal(row.lifetimeEarnedCoins || ZERO));
+        acc.lifetimeUsedCoins = acc.lifetimeUsedCoins.plus(toDecimal(row.lifetimeUsedCoins || ZERO));
+        return acc;
+      },
+      {
+        balanceCoins: ZERO,
+        balanceRupees: ZERO,
+        lifetimeEarnedCoins: ZERO,
+        lifetimeUsedCoins: ZERO,
+      }
+    );
+
     return {
       success: true,
       wallet: {
         coinToRupee: COIN_VALUE_INR.toString(),
-        totalCoins: toDecimal(wallet?.balanceCoins || ZERO).toDecimalPlaces(2).toString(),
-        totalRupeeValue: toDecimal(wallet?.balanceRupees || ZERO).toDecimalPlaces(2).toString(),
-        lifetimeEarnedCoins: toDecimal(wallet?.lifetimeEarnedCoins || ZERO).toDecimalPlaces(2).toString(),
-        lifetimeUsedCoins: toDecimal(wallet?.lifetimeUsedCoins || ZERO).toDecimalPlaces(2).toString(),
+        totalCoins: mergedWallet.balanceCoins.toDecimalPlaces(2).toString(),
+        totalRupeeValue: mergedWallet.balanceRupees.toDecimalPlaces(2).toString(),
+        lifetimeEarnedCoins: mergedWallet.lifetimeEarnedCoins.toDecimalPlaces(2).toString(),
+        lifetimeUsedCoins: mergedWallet.lifetimeUsedCoins.toDecimalPlaces(2).toString(),
         lifetimeExpiredCoins: toDecimal(lifetimeExpiredAgg._sum.coins || ZERO).toDecimalPlaces(2).toString(),
         earnedHistory: earnedRows.map((row) => ({
           transactionId: row.transactionId,

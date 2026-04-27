@@ -9,6 +9,7 @@ import transactionRoutes from './transactions';
 import feesRoutes from './fees';
 import adminRoutes from './admin';
 import bankAccountRoutes from './bankAccounts';
+import dashboardRoutes from './dashboard';
 import { validateEnv } from '../config/env';
 import { isDatabaseConnected, isPostgresConnected } from '../config/database';
 
@@ -58,6 +59,9 @@ router.use('/fees', feesRoutes);
 
 // Admin auth routes
 router.use('/admin', adminRoutes);
+
+// Internal dashboard routes (service auth)
+router.use('/dashboard', dashboardRoutes);
 
 export default router;
 

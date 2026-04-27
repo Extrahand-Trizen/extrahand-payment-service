@@ -11,10 +11,13 @@ export class AdminAuthController {
     }
 
     const admin = await getAdminUser(username);
-    if (!admin || !verifyPassword(password, admin.passwordHash)) {
+    if (!admin?.passwordHash || !verifyPassword(password, admin.passwordHash)) {
       return res.status(401).json({ success: false, error: 'Invalid credentials' });
     }
 
-    return res.status(200).json({ success: true, user: { username: admin.username } });
+    return res.status(200).json({
+      success: true,
+      user: { username: admin.username, email: admin.email ?? null, role: admin.role },
+    });
   });
 }

@@ -393,29 +393,22 @@ export async function updateEscrowOnPaymentCapture(
       paymentTransaction = await prisma.transaction.upsert({
         where: { razorpayPaymentId },
         create: {
-          transactionId: generatePaymentTransactionId(),
-          escrowId: postgresEscrow.id,
+          userId: postgresEscrow.posterUid,
+          taskId: postgresEscrow.taskId,
           razorpayOrderId,
           razorpayPaymentId,
           amount: updatedEscrow.amountInRupees,
           currency: updatedEscrow.currency || 'INR',
           status: paymentStatus,
           paymentMethod,
-          authorizedAt: paymentStatus === 'authorized' ? new Date() : null,
-          capturedAt: paymentStatus === 'captured' ? new Date() : null,
-          failedAt: paymentStatus === 'failed' ? new Date() : null,
           metadata: sanitizedPaymentData ? { payment: sanitizedPaymentData } : undefined,
         },
         update: {
-          escrowId: postgresEscrow.id,
           razorpayOrderId,
           amount: updatedEscrow.amountInRupees,
           currency: updatedEscrow.currency || 'INR',
           status: paymentStatus,
           paymentMethod: paymentMethod ?? undefined,
-          authorizedAt: paymentStatus === 'authorized' ? new Date() : undefined,
-          capturedAt: paymentStatus === 'captured' ? new Date() : undefined,
-          failedAt: paymentStatus === 'failed' ? new Date() : undefined,
           metadata: sanitizedPaymentData ? { payment: sanitizedPaymentData } : undefined,
         },
         select: { id: true },
@@ -445,10 +438,7 @@ export async function updateEscrowOnPaymentCapture(
       });
 
       if (paymentTransaction?.id && ledgerResult.success && ledgerResult.ledger?.id) {
-        await prisma.transaction.update({
-          where: { id: paymentTransaction.id },
-          data: { ledgerEntryId: ledgerResult.ledger.id },
-        });
+        // Transaction is linked from Ledger side via paymentTransactionId
       }
 
       // Update UserPaymentProfile cache for poster (payment made)

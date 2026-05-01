@@ -39,6 +39,22 @@ export class AdminFinanceController {
       if (end) escrowWhere.createdAt.lte = end;
     }
 
+    const refundWhere: Prisma.RefundWhereInput = { status: 'completed' };
+    const payoutWhere: Prisma.PayoutWhereInput = { status: 'completed' };
+
+    if (start || end) {
+      refundWhere.createdAt = {};
+      payoutWhere.createdAt = {};
+      if (start) {
+        refundWhere.createdAt.gte = start;
+        payoutWhere.createdAt.gte = start;
+      }
+      if (end) {
+        refundWhere.createdAt.lte = end;
+        payoutWhere.createdAt.lte = end;
+      }
+    }
+
     const [capturedCount, failedCount, totalPayins, totalRefunds, totalPayouts] = await Promise.all([
       prisma.escrow.count({ where: { ...escrowWhere, paymentStatus: 'captured' } }),
       prisma.escrow.count({ where: { ...escrowWhere, paymentStatus: 'failed' } }),
@@ -47,11 +63,11 @@ export class AdminFinanceController {
         _sum: { amountInRupees: true },
       }),
       prisma.refund.aggregate({
-        where: { status: 'completed', ...(start || end ? { createdAt: escrowWhere.createdAt } : {}) },
+        where: refundWhere,
         _sum: { refundAmount: true },
       }),
       prisma.payout.aggregate({
-        where: { status: 'completed', ...(start || end ? { createdAt: escrowWhere.createdAt } : {}) },
+        where: payoutWhere,
         _sum: { netAmount: true },
       }),
     ]);
@@ -62,9 +78,9 @@ export class AdminFinanceController {
     res.json({
       success: true,
       metrics: {
-        totalPayins: toStringValue(totalPayins._sum.amountInRupees),
-        totalRefunds: toStringValue(totalRefunds._sum.refundAmount),
-        totalPayouts: toStringValue(totalPayouts._sum.netAmount),
+        totalPayins: toStringValue(totalPayins._sum?.amountInRupees),
+        totalRefunds: toStringValue(totalRefunds._sum?.refundAmount),
+        totalPayouts: toStringValue(totalPayouts._sum?.netAmount),
         capturedCount,
         failedCount,
         successRate,
@@ -142,22 +158,20 @@ export class AdminFinanceController {
           { razorpayPaymentId: id },
         ],
       },
-      include: {
-        transactions: { orderBy: { createdAt: 'desc' } },
-        payouts: { orderBy: { createdAt: 'desc' } },
-        refunds: { orderBy: { createdAt: 'desc' } },
-      },
     });
 
     let resolvedEscrow = escrow;
     if (!resolvedEscrow) {
       const transaction = await prisma.transaction.findFirst({
         where: {
-          OR: [{ transactionId: id }, { razorpayPaymentId: id }],
+          OR: [{ id: id }, { razorpayPaymentId: id }, { razorpayOrderId: id }],
         },
-        include: { escrow: true },
       });
-      resolvedEscrow = transaction?.escrow || null;
+      if (transaction?.razorpayOrderId) {
+        resolvedEscrow = await prisma.escrow.findUnique({
+          where: { razorpayOrderId: transaction.razorpayOrderId },
+        });
+      }
     }
 
     if (!resolvedEscrow) {
@@ -180,7 +194,7 @@ export class AdminFinanceController {
 
     const [transactions, payouts, refunds, ledger] = await Promise.all([
       prisma.transaction.findMany({
-        where: { escrowId: resolvedEscrow.id },
+        where: { razorpayOrderId: resolvedEscrow.razorpayOrderId },
         orderBy: { createdAt: 'desc' },
       }),
       prisma.payout.findMany({

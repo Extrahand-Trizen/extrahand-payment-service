@@ -131,7 +131,7 @@ export class TransactionController {
 
     if (type === 'signup') {
       const result = await awardReferralSignupCoins({ referrerUid, refereeUid, referralCode });
-      res.json({ success: result.success, ...result });
+      res.json(result);
       return;
     }
 
@@ -146,7 +146,7 @@ export class TransactionController {
         platformFeeRupees: new Prisma.Decimal(String(platformFeeRupees)),
         referralCode,
       });
-      res.json({ success: result.success, ...result });
+      res.json(result);
       return;
     }
 

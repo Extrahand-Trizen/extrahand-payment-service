@@ -162,14 +162,38 @@ export class PaymentController {
     const result = await getOrderDetails(orderId);
 
     if (!result.success) {
-      // Return 404 for not found, 500 for other errors
       if (result.statusCode === 404) {
-        throw new NotFoundError(result.error || 'Order not found');
+        res.status(404).json({
+          success: false,
+          error: result.error || 'Order not found',
+          code: (result as any).errorCode || 'PAYMENT_ORDER_NOT_FOUND',
+        });
+        return;
       }
-      throw new Error(result.error || 'Failed to get order details');
+      res.status(500).json({
+        success: false,
+        error: result.error || 'Failed to get order details',
+        code: (result as any).errorCode || 'PAYMENT_ORDER_STATUS_FETCH_FAILED',
+      });
+      return;
     }
 
-    res.json({ order: result.order });
+    const order = result.order as any;
+    const statusRaw = String(order?.status || '').toLowerCase();
+    const amountPaid = Number(order?.amount_paid || 0);
+    const statusHint =
+      statusRaw === 'paid'
+        ? 'PAYMENT_CAPTURED'
+        : statusRaw === 'attempted' && amountPaid <= 0
+          ? 'PAYMENT_ATTEMPTED_NOT_CAPTURED'
+          : statusRaw === 'created'
+            ? 'PAYMENT_PENDING'
+            : 'PAYMENT_STATUS_UNKNOWN';
+
+    res.json({
+      order,
+      statusHint,
+    });
   }
 
   /**

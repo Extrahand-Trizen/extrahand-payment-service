@@ -2,6 +2,9 @@ import { prisma } from '../config/prisma';
 import logger from '../config/logger';
 import { Prisma } from '@prisma/client';
 
+const SUCCESSFUL_ESCROW_PAYMENT_STATUSES = new Set(['held', 'released']);
+const SUCCESSFUL_PAYOUT_STATUSES = new Set(['completed', 'released']);
+
 export interface Transaction {
   id: string;
   transactionId: string;
@@ -167,6 +170,7 @@ export async function getUserTransactions(
     escrows.forEach((escrow) => {
       const isPoster = uidList.includes(escrow.posterUid);
       const isPerformer = uidList.includes(escrow.performerUid);
+      const escrowStatusNormalized = String(escrow.status || '').trim().toLowerCase();
       const escrowMeta =
         escrow.metadata && typeof escrow.metadata === 'object' && !Array.isArray(escrow.metadata)
           ? (escrow.metadata as Record<string, unknown>)
@@ -261,7 +265,15 @@ export async function getUserTransactions(
 
       // Escrow creation (payment) - only show if user is poster (money paid)
       // If user is performer, they'll see the payout instead
-      if ((!typeFilter || typeFilter === 'payment' || typeFilter === 'escrow') && isPoster) {
+      // Default history should represent successful money movement only. When caller
+      // explicitly asks for a status filter, respect it (including cancelled/pending).
+      const includePosterEscrowInDefaultList =
+        Boolean(statusFilter) || SUCCESSFUL_ESCROW_PAYMENT_STATUSES.has(escrowStatusNormalized);
+      if (
+        (!typeFilter || typeFilter === 'payment' || typeFilter === 'escrow') &&
+        isPoster &&
+        includePosterEscrowInDefaultList
+      ) {
         // Always add payment transactions when user is the poster (they paid)
         transactions.push({
           id: escrow.id,
@@ -682,6 +694,7 @@ export async function getTransactionSummary(
 
     const escrowWhere: Prisma.EscrowWhereInput = {
       posterUid: { in: uidList },
+      status: { in: Array.from(SUCCESSFUL_ESCROW_PAYMENT_STATUSES) },
       ...(startDate || endDate
         ? {
             createdAt: {
@@ -694,6 +707,7 @@ export async function getTransactionSummary(
 
     const payoutWhere: Prisma.PayoutWhereInput = {
       performerUid: { in: uidList },
+      status: { in: Array.from(SUCCESSFUL_PAYOUT_STATUSES) },
       ...(startDate || endDate
         ? {
             createdAt: {

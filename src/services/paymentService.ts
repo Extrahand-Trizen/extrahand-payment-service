@@ -154,6 +154,7 @@ export const getOrderDetails = async (orderId: string) => {
         success: false,
         error: 'Order not found',
         statusCode: 404,
+        errorCode: 'PAYMENT_ORDER_NOT_FOUND',
       };
     }
 
@@ -175,11 +176,16 @@ export const getOrderDetails = async (orderId: string) => {
       return { 
         success: false, 
         error: 'Order not found',
-        statusCode: 404 
+        statusCode: 404,
+        errorCode: 'PAYMENT_ORDER_NOT_FOUND',
       };
     }
     
-    return { success: false, error: error.message || 'Failed to fetch order details' };
+    return {
+      success: false,
+      error: error.message || 'Failed to fetch order details',
+      errorCode: 'PAYMENT_ORDER_STATUS_FETCH_FAILED',
+    };
   }
 };
 

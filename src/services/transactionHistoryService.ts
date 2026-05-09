@@ -788,6 +788,12 @@ export async function getTransactionSummary(
     // Net earnings = payouts + compensation - fees
     const netEarnings = totalPayouts.plus(totalCompensation).minus(totalFees);
 
+    // Net spent = payments minus completed refunds (so cancelled payments show ₹0)
+    const totalSpent = Prisma.Decimal.max(
+      new Prisma.Decimal('0'),
+      totalPayments.minus(totalRefunds),
+    );
+
     return {
       success: true,
       summary: {
@@ -796,6 +802,7 @@ export async function getTransactionSummary(
         totalRefunds: totalRefunds.toString(),
         totalCompensation: totalCompensation.toString(),
         totalFees: totalFees.toString(),
+        totalSpent: totalSpent.toString(),
         netEarnings: netEarnings.toString(),
         transactionCount
       }

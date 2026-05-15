@@ -1,4 +1,5 @@
 import { Response, Request } from 'express';
+import axios from 'axios';
 import {
   createOrder,
   verifyPaymentSignature,
@@ -17,6 +18,57 @@ import logger from '../config/logger';
 import { prisma } from '../config/prisma';
 import { RAZORPAY_CONFIG } from '../config/razorpay';
 import { isReviewBypassOrderId } from '../utils/reviewBypass';
+
+/**
+ * After additional payment is verified, notify the task service to mark the request as paid.
+ * This is the reliable trigger — runs server-side, not dependent on mobile app callback.
+ */
+async function notifyTaskServiceAdditionalPaymentPaid(
+  razorpayOrderId: string,
+  posterUid: string,
+): Promise<void> {
+  try {
+    const escrow = await prisma.escrow.findUnique({ where: { razorpayOrderId } });
+    if (!escrow) return;
+    const meta = escrow.metadata as Record<string, unknown> | null;
+    if (!meta || meta.type !== 'additional_payment') return;
+
+    // taskId is a direct field on the escrow row; also check metadata as fallback
+    const taskId = String((escrow as any).taskId || meta.taskId || '').trim();
+    const requestId = String(meta.requestId || '').trim();
+    if (!taskId || !requestId) {
+      logger.warn('[PaymentController] Missing taskId or requestId in escrow metadata', { razorpayOrderId, meta });
+      return;
+    }
+
+    const taskServiceUrl = process.env.TASK_SERVICE_URL || 'http://localhost:4002';
+    const serviceAuthToken = process.env.SERVICE_AUTH_TOKEN || '';
+
+    logger.info('[PaymentController] Notifying task service of additional payment paid', { taskId, requestId });
+
+    await axios.post(
+      `${taskServiceUrl}/api/v1/tasks/${taskId}/additional-payment-complete/${requestId}`,
+      {},
+      {
+        headers: {
+          'X-Service-Auth': serviceAuthToken,
+          'X-Service-Name': 'payment-service',
+          'X-User-Id': posterUid,
+          'X-User-Uid': posterUid,
+        },
+        timeout: 10000,
+      }
+    );
+
+    logger.info('[PaymentController] Task service notified successfully', { taskId, requestId });
+  } catch (err: any) {
+    // Non-blocking — log but don't fail the payment verification
+    logger.warn('[PaymentController] Failed to notify task service of additional payment', {
+      error: err?.message,
+      razorpayOrderId,
+    });
+  }
+}
 
 export class PaymentController {
   /**
@@ -142,6 +194,8 @@ export class PaymentController {
         'captured',
         paymentEntity
       );
+      // If this is an additional payment, notify task service to mark request as paid
+      void notifyTaskServiceAdditionalPaymentPaid(razorpay_order_id, uid || '');
     } catch (escrowError: any) {
       // Log error but don't fail the payment verification
       logger.warn('Failed to update escrow on payment capture:', escrowError);

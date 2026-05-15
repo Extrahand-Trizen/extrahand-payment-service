@@ -177,6 +177,44 @@ export class EscrowController {
       message: releaseDate ? 'Auto-release date set successfully' : 'Auto-release cancelled successfully',
     });
   }
+
+  /**
+   * POST /api/v1/escrow/task/:taskId/release-all
+   * Release ALL active escrows for a task (original + additional payments).
+   * Called by task service on task completion.
+   */
+  static async releaseAllForTask(req: Request, res: Response): Promise<void> {
+    const { taskId } = req.params;
+    const { releasedBy } = req.body;
+
+    if (!taskId) throw new BadRequestError('taskId is required');
+    if (!releasedBy) throw new BadRequestError('releasedBy (user UID) is required');
+
+    const { getAllActiveEscrowsByTaskId, releaseEscrow } = await import('../services/escrowService');
+    const escrows = await getAllActiveEscrowsByTaskId(taskId);
+
+    if (escrows.length === 0) {
+      res.json({ success: true, released: 0, message: 'No active escrows found for task' });
+      return;
+    }
+
+    const results = await Promise.allSettled(
+      escrows.map((e: any) => releaseEscrow(e.escrowId, releasedBy))
+    );
+
+    const released = results.filter((r) => r.status === 'fulfilled' && (r as any).value?.success).length;
+    const failed = results.length - released;
+
+    logger.info('[EscrowController.releaseAllForTask] Released escrows', { taskId, released, failed });
+
+    res.json({
+      success: released > 0,
+      released,
+      failed,
+      total: escrows.length,
+      message: `Released ${released} of ${escrows.length} escrows for task`,
+    });
+  }
 }
 
 

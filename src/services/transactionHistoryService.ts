@@ -318,6 +318,58 @@ export async function getUserTransactions(
         });
       }
 
+      // Performer: poster payment is visible as an escrow row, but performers only received
+      // payout-derived lines. If payout records are missing or lag behind task completion,
+      // the tasker's Transactions tab looked empty. Show a single earnings row for funded escrows.
+      const performerHasPayoutLine = escrow.payouts.some((p) =>
+        uidList.includes(p.performerUid),
+      );
+      if (
+        (!typeFilter || typeFilter === 'escrow') &&
+        isPerformer &&
+        !performerHasPayoutLine &&
+        SUCCESSFUL_ESCROW_PAYMENT_STATUSES.has(escrowStatusNormalized) &&
+        (!categoryFilter || categoryFilter === 'all' || categoryFilter === 'earnings')
+      ) {
+        transactions.push({
+          id: `${escrow.id}_performer_escrow`,
+          transactionId: `${escrow.escrowId}_performer`,
+          type: 'escrow',
+          amount: taskAmount.toString(),
+          status: escrow.status,
+          description: taskTitleSnapshot
+            ? `Earnings (payout pending) — ${
+                taskTitleSnapshot.length > 100
+                  ? `${taskTitleSnapshot.slice(0, 97)}...`
+                  : taskTitleSnapshot
+              }`
+            : `Earnings pending for task`,
+          date: escrow.updatedAt.toISOString(),
+          relatedEntityId: escrow.escrowId,
+          category: 'earnings',
+          metadata: {
+            taskId: escrow.taskId,
+            ...(taskTitleSnapshot
+              ? { taskTitle: taskTitleSnapshot, taskTitleSnapshot }
+              : {}),
+            ...(taskCategorySnapshot
+              ? { taskCategory: taskCategorySnapshot, taskCategorySnapshot }
+              : {}),
+            ...(taskDescriptionSnapshot ? { taskDescription: taskDescriptionSnapshot } : {}),
+            role: 'performer',
+            pendingPayout: true,
+            razorpayOrderId: escrow.razorpayOrderId,
+            amountInRupees: escrow.amountInRupees.toString(),
+            escrowStatus: escrow.status,
+            taskAmount: taskAmount.toString(),
+            platformFee: finalPlatformFee.toString(),
+            gstAmount: finalGst.toString(),
+            totalPaid: totalPaid.toString(),
+            posterUid: escrow.posterUid,
+          },
+        });
+      }
+
       // Payouts from this escrow (money earned)
       escrow.payouts.forEach((payout) => {
         if ((!typeFilter || typeFilter === 'payout') && uidList.includes(payout.performerUid)) {

@@ -607,6 +607,29 @@ export async function getEscrowByTaskId(taskId: string): Promise<any | null> {
 }
 
 /**
+ * Get ALL active (held/captured) escrows for a task.
+ * Used at task completion to release both original + additional payment escrows.
+ */
+export async function getAllActiveEscrowsByTaskId(taskId: string): Promise<any[]> {
+  try {
+    if (!isPostgresConnected()) return [];
+
+    const escrows = await prisma.escrow.findMany({
+      where: {
+        taskId,
+        status: { notIn: ['cancelled', 'refunded', 'released'] },
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    return await Promise.all(escrows.map(convertPostgresEscrowToFrontendFormat));
+  } catch (error: any) {
+    logger.error('❌ Error getting all active escrows by task ID:', error);
+    return [];
+  }
+}
+
+/**
  * Get escrow status
  * Now uses Postgres only
  */

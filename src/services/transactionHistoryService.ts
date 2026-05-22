@@ -19,9 +19,64 @@ export interface Transaction {
   category?: 'earnings' | 'payments'; // earnings = money received, payments = money spent
 }
 
+type PosterPaymentLineItem = {
+  escrowId?: string;
+  amount: string;
+  date: string;
+  paymentKind: 'initial' | 'additional';
+  paymentLabel: string;
+  requestId?: string | null;
+};
+
+function resolvePosterPaymentKind(em: Record<string, unknown>): 'initial' | 'additional' {
+  if (em.type === 'additional_payment' || em.paymentKind === 'additional') {
+    return 'additional';
+  }
+  return 'initial';
+}
+
+function posterPaymentLabel(kind: 'initial' | 'additional'): string {
+  return kind === 'additional'
+    ? 'Additional payment (helper request)'
+    : 'Original task payment';
+}
+
+function buildPosterPaymentLineItem(row: Transaction): PosterPaymentLineItem {
+  const md = (row.metadata || {}) as Record<string, unknown>;
+  const kind = resolvePosterPaymentKind(md);
+  const amountNum = Number(row.amount);
+  const amount =
+    Number.isFinite(amountNum) && amountNum > 0
+      ? amountNum
+      : Number(md.totalPaid ?? md.amountInRupees ?? 0);
+  return {
+    escrowId: row.relatedEntityId,
+    amount: (Number.isFinite(amount) ? amount : 0).toFixed(2),
+    date: row.date,
+    paymentKind: kind,
+    paymentLabel:
+      typeof md.paymentLabel === 'string' && md.paymentLabel.trim().length > 0
+        ? md.paymentLabel.trim()
+        : posterPaymentLabel(kind),
+    requestId:
+      typeof md.requestId === 'string' && md.requestId.trim().length > 0
+        ? md.requestId.trim()
+        : null,
+  };
+}
+
+function sumLineItemsByKind(
+  items: PosterPaymentLineItem[],
+  kind: 'initial' | 'additional',
+): number {
+  return items
+    .filter((i) => i.paymentKind === kind)
+    .reduce((acc, i) => acc + Number(i.amount), 0);
+}
+
 /**
- * Counter-offer flows can create multiple escrow rows for the same task (each Razorpay order).
- * Posters should see one "payment" line per task: prefer higher lifecycle status, then newest.
+ * Additional-payment flows create multiple escrow rows for a single task.
+ * Posters should see a single aggregated payment line per task with summed amounts.
  */
 function dedupePosterEscrowPaymentRows(transactions: Transaction[]): Transaction[] {
   const kept: Transaction[] = [];
@@ -55,17 +110,70 @@ function dedupePosterEscrowPaymentRows(transactions: Transaction[]): Transaction
     return 1;
   };
 
-  for (const [, rows] of posterEscrowsByTask) {
+  for (const [taskId, rows] of posterEscrowsByTask) {
     if (rows.length === 1) {
       kept.push(rows[0]);
       continue;
     }
+
     const sorted = [...rows].sort((a, b) => {
       const dr = rankStatus(b.status) - rankStatus(a.status);
       if (dr !== 0) return dr;
       return new Date(b.date).getTime() - new Date(a.date).getTime();
     });
-    kept.push(sorted[0]);
+
+    const best = sorted[0];
+    const asNumber = (value: unknown): number => {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : 0;
+    };
+    const sum = (field: string): string => {
+      const total = rows.reduce((acc, row) => acc + asNumber((row.metadata as any)?.[field]), 0);
+      return total.toFixed(2);
+    };
+
+    const mergedAmount = rows.reduce((acc, row) => acc + asNumber(row.amount), 0);
+    const paymentLineItems = [...rows]
+      .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime())
+      .map(buildPosterPaymentLineItem);
+    const originalTaskPaymentAmount = sumLineItemsByKind(paymentLineItems, 'initial');
+    const additionalPaymentAmount = sumLineItemsByKind(paymentLineItems, 'additional');
+    const mergedMetadata: Record<string, any> = {
+      ...(best.metadata || {}),
+      taskId,
+      mergedEscrowCount: rows.length,
+      mergedEscrowIds: rows.map((r) => r.relatedEntityId).filter(Boolean),
+      paymentLineItems,
+      originalTaskPaymentAmount: originalTaskPaymentAmount.toFixed(2),
+      additionalPaymentAmount: additionalPaymentAmount.toFixed(2),
+      amountInRupees: mergedAmount.toFixed(2),
+      totalPaid: mergedAmount.toFixed(2),
+      taskAmount: mergedAmount.toFixed(2),
+      platformFee: sum('platformFee'),
+      gstAmount: sum('gstAmount'),
+      refundedAmount: sum('refundedAmount'),
+    };
+
+    const titleSnap =
+      typeof (best.metadata as any)?.taskTitleSnapshot === 'string' &&
+      (best.metadata as any).taskTitleSnapshot.trim().length > 0
+        ? (best.metadata as any).taskTitleSnapshot
+        : null;
+    const breakdownHint =
+      originalTaskPaymentAmount > 0 && additionalPaymentAmount > 0
+        ? ` (₹${originalTaskPaymentAmount.toFixed(0)} original + ₹${additionalPaymentAmount.toFixed(0)} additional)`
+        : '';
+
+    kept.push({
+      ...best,
+      id: `task_payment_${taskId}`,
+      transactionId: `task_payment_${taskId}`,
+      amount: mergedAmount.toFixed(2),
+      description: titleSnap
+        ? `Payment — ${titleSnap}${breakdownHint}`
+        : best.description,
+      metadata: mergedMetadata,
+    });
   }
 
   return kept;
@@ -274,6 +382,24 @@ export async function getUserTransactions(
         isPoster &&
         includePosterEscrowInDefaultList
       ) {
+        const paymentKind = resolvePosterPaymentKind(em);
+        const paymentLabel = posterPaymentLabel(paymentKind);
+        const lineAmount = totalPaid.toString();
+        const requestId =
+          typeof em.requestId === 'string' && em.requestId.trim().length > 0
+            ? em.requestId.trim()
+            : undefined;
+        const paymentLineItems: PosterPaymentLineItem[] = [
+          {
+            escrowId: escrow.escrowId,
+            amount: lineAmount,
+            date: escrow.createdAt.toISOString(),
+            paymentKind,
+            paymentLabel,
+            requestId: requestId ?? null,
+          },
+        ];
+
         // Always add payment transactions when user is the poster (they paid)
         transactions.push({
           id: escrow.id,
@@ -282,8 +408,18 @@ export async function getUserTransactions(
           amount: escrow.amountInRupees.toString(),
           status: escrow.status,
           description: taskTitleSnapshot
-            ? `Payment — ${taskTitleSnapshot.length > 120 ? `${taskTitleSnapshot.slice(0, 117)}...` : taskTitleSnapshot}`
-            : `Payment for task`,
+            ? paymentKind === 'additional'
+              ? `Additional payment — ${
+                  taskTitleSnapshot.length > 100
+                    ? `${taskTitleSnapshot.slice(0, 97)}...`
+                    : taskTitleSnapshot
+                }`
+              : `Original payment — ${
+                  taskTitleSnapshot.length > 100
+                    ? `${taskTitleSnapshot.slice(0, 97)}...`
+                    : taskTitleSnapshot
+                }`
+            : paymentLabel,
           date: escrow.createdAt.toISOString(),
           relatedEntityId: escrow.escrowId,
           category: 'payments', // Money spent
@@ -299,14 +435,24 @@ export async function getUserTransactions(
             ...(taskDescriptionSnapshot ? { taskDescription: taskDescriptionSnapshot } : {}),
             ...(typeof em.snapshotVersion === 'number' ? { snapshotVersion: em.snapshotVersion } : {}),
             ...(typeof em.capturedAt === 'string' ? { capturedAt: em.capturedAt } : {}),
+            ...(em.type ? { type: em.type } : {}),
+            paymentKind,
+            paymentLabel,
+            paymentLineItems,
+            ...(paymentKind === 'initial'
+              ? { originalTaskPaymentAmount: lineAmount }
+              : { additionalPaymentAmount: lineAmount }),
+            ...(requestId ? { requestId } : {}),
+            ...(escrow.applicationId ? { applicationId: escrow.applicationId } : {}),
             role: 'poster',
             razorpayOrderId: escrow.razorpayOrderId,
             amountInRupees: escrow.amountInRupees.toString(),
             escrowStatus: escrow.status,
-            taskAmount: taskAmount.toString(),
-            platformFee: finalPlatformFee.toString(),
-            gstAmount: finalGst.toString(),
-            totalPaid: totalPaid.toString(),
+            // Customer pays work amount only; platform fee + GST are deducted from helper payout.
+            taskAmount: lineAmount,
+            platformFee: '0',
+            gstAmount: '0',
+            totalPaid: lineAmount,
             refundedAmount: latestCompletedRefund?.refundAmount?.toString() || '0',
             latestRefundAmount: latestRefund?.refundAmount?.toString() || '0',
             latestRefundStatus: latestRefund?.status || null,
@@ -811,21 +957,16 @@ export async function getTransactionSummary(
       }),
     ]);
 
-    // One logical "payment" per task for posters (matches dedupe in getUserTransactions).
-    const posterEscrowsLatest = await prisma.escrow.findMany({
+    // Sum all successful poster escrow payments (base + additional).
+    const posterEscrows = await prisma.escrow.findMany({
       where: escrowWhere,
-      select: { taskId: true, amountInRupees: true, createdAt: true },
-      orderBy: { createdAt: 'desc' },
+      select: { amountInRupees: true },
     });
-    const seenPaymentTask = new Set<string>();
-    let totalPayments = new Prisma.Decimal('0');
-    let paymentEscrowCount = 0;
-    for (const row of posterEscrowsLatest) {
-      if (seenPaymentTask.has(row.taskId)) continue;
-      seenPaymentTask.add(row.taskId);
-      totalPayments = totalPayments.add(row.amountInRupees);
-      paymentEscrowCount += 1;
-    }
+    const totalPayments = posterEscrows.reduce(
+      (acc, row) => acc.add(row.amountInRupees),
+      new Prisma.Decimal('0')
+    );
+    const paymentEscrowCount = posterEscrows.length;
 
     const totalPayouts = payoutsAgg._sum.netAmount || new Prisma.Decimal('0');
     const totalRefunds = refundsAgg._sum.refundAmount || new Prisma.Decimal('0');

@@ -11,8 +11,8 @@ import cron from 'node-cron';
 import logger from '../config/logger';
 import { isPostgresConnected } from '../config/database';
 import { prisma } from '../config/prisma';
-import { processPayout } from './payoutService';
-import { getEscrowByOrderId } from './escrowService';
+import { processTaskCompletionPayout } from './payoutService';
+import { releaseEscrow, getAllActiveEscrowsByTaskId } from './escrowService';
 
 /**
  * Get grace period from environment (default: 10 minutes)
@@ -73,20 +73,24 @@ async function isTaskCompleted(taskId: string): Promise<boolean> {
   }
 }
 
+const tasksProcessedThisCycle = new Set<string>();
+
 /**
- * Process auto-release for a single escrow
+ * One combined payout per task: release all escrows, then transfer net amount only.
  */
 async function processAutoRelease(escrow: any): Promise<void> {
   try {
-    const { escrowId, razorpayOrderId, performerUid, amountInRupees, taskId } = escrow;
+    const { escrowId, taskId, performerUid, posterUid } = escrow;
 
-    logger.info('🔄 Processing auto-release', {
+    if (tasksProcessedThisCycle.has(taskId)) {
+      return;
+    }
+
+    logger.info('🔄 Processing auto-release (combined payout per task)', {
       escrowId,
-      razorpayOrderId,
       taskId,
     });
 
-    // Check if task is completed
     const taskCompleted = await isTaskCompleted(taskId);
     if (!taskCompleted) {
       logger.info('⏸️ Task not completed yet - skipping auto-release', {
@@ -96,7 +100,6 @@ async function processAutoRelease(escrow: any): Promise<void> {
       return;
     }
 
-    // Get performer bank account from UserPaymentProfile
     const profile = await prisma.userPaymentProfile.findUnique({
       where: { userId: performerUid },
     });
@@ -106,7 +109,6 @@ async function processAutoRelease(escrow: any): Promise<void> {
         escrowId,
         performerUid,
       });
-      // Skip auto-release if no bank account - user needs to set one up
       return;
     }
 
@@ -122,24 +124,43 @@ async function processAutoRelease(escrow: any): Promise<void> {
       return;
     }
 
-    // Process payout using stored bank account
-    const payoutResult = await processPayout({
-      razorpayOrderId,
+    tasksProcessedThisCycle.add(taskId);
+
+    const activeEscrows = await getAllActiveEscrowsByTaskId(taskId);
+    const releaseBy = posterUid || performerUid;
+
+    for (const active of activeEscrows) {
+      if (String(active.status).toLowerCase() !== 'held') continue;
+      const releaseResult = await releaseEscrow(active.escrowId, releaseBy);
+      if (!releaseResult.success) {
+        logger.warn('[autoRelease] Escrow release failed', {
+          escrowId: active.escrowId,
+          error: releaseResult.error,
+        });
+      }
+    }
+
+    const payoutResult = await processTaskCompletionPayout({
+      taskId,
       performerUid,
-      bankAccountId: bankAccount.id, // Use stored bank account
-      userId: 'system', // System-initiated payout
+      amount: 1,
+      enqueueOnMissingBank: true,
     });
 
     if (payoutResult.success) {
-      logger.info('✅ Auto-release completed', {
-        escrowId,
+      logger.info('✅ Auto-release completed — net amount sent to bank', {
+        taskId,
         payoutId: payoutResult.payout?.payoutId,
+        netAmount: payoutResult.payout?.netAmount,
+        bankTransferAmount: payoutResult.payout?.bankTransferAmount,
       });
     } else {
-      logger.error('❌ Auto-release failed', {
-        escrowId,
+      logger.error('❌ Auto-release payout failed', {
+        taskId,
         error: payoutResult.error,
+        requiresBankAccount: payoutResult.requiresBankAccount,
       });
+      tasksProcessedThisCycle.delete(taskId);
     }
   } catch (error: any) {
     logger.error('❌ Error processing auto-release:', {
@@ -154,6 +175,8 @@ async function processAutoRelease(escrow: any): Promise<void> {
  */
 async function checkAndProcessAutoReleases(): Promise<void> {
   try {
+    tasksProcessedThisCycle.clear();
+
     if (!isPostgresConnected()) {
       logger.warn('⚠️ Postgres not connected - skipping auto-release check');
       return;
@@ -161,10 +184,6 @@ async function checkAndProcessAutoReleases(): Promise<void> {
 
     const now = new Date();
 
-    // Find escrows ready for auto-release
-    // Conditions:
-    // 1. Status is 'held'
-    // 2. autoReleaseDate is set and <= now
     const readyEscrows = await prisma.escrow.findMany({
       where: {
         status: 'held',
@@ -174,7 +193,7 @@ async function checkAndProcessAutoReleases(): Promise<void> {
         },
       },
       orderBy: {
-        autoReleaseDate: 'asc', // Process oldest first
+        autoReleaseDate: 'asc',
       },
     });
 
@@ -185,18 +204,21 @@ async function checkAndProcessAutoReleases(): Promise<void> {
 
     logger.info(`🔄 Found ${readyEscrows.length} escrow(s) ready for auto-release`);
 
-    // Process escrows in parallel batches for better performance
-    // Use a concurrency limit to avoid overwhelming the system
-    const BATCH_SIZE = 5; // Process 5 escrows in parallel at a time
+    const seenTaskIds = new Set<string>();
+    const uniqueByTask = readyEscrows.filter((e) => {
+      if (seenTaskIds.has(e.taskId)) return false;
+      seenTaskIds.add(e.taskId);
+      return true;
+    });
+
+    const BATCH_SIZE = 5;
     
-    for (let i = 0; i < readyEscrows.length; i += BATCH_SIZE) {
-      const batch = readyEscrows.slice(i, i + BATCH_SIZE);
+    for (let i = 0; i < uniqueByTask.length; i += BATCH_SIZE) {
+      const batch = uniqueByTask.slice(i, i + BATCH_SIZE);
       
-      // Process batch in parallel
       await Promise.all(
         batch.map(escrow => 
           processAutoRelease(escrow).catch(error => {
-            // Log error but don't fail the entire batch
             logger.error('❌ Error processing auto-release in batch:', {
               escrowId: escrow.escrowId,
               error: error.message,
@@ -204,8 +226,6 @@ async function checkAndProcessAutoReleases(): Promise<void> {
           })
         )
       );
-      
-      logger.debug(`✅ Processed batch ${Math.floor(i / BATCH_SIZE) + 1} of ${Math.ceil(readyEscrows.length / BATCH_SIZE)}`);
     }
   } catch (error: any) {
     logger.error('❌ Error in auto-release check:', error);
@@ -226,8 +246,6 @@ export async function catchUpMissedReleases(): Promise<void> {
 
     const now = new Date();
 
-    // Find escrows that should have been released but weren't
-    // (autoReleaseDate is in the past and status is still 'held')
     const missedEscrows = await prisma.escrow.findMany({
       where: {
         status: 'held',
@@ -246,33 +264,19 @@ export async function catchUpMissedReleases(): Promise<void> {
       return;
     }
 
-    logger.info(`🔄 Found ${missedEscrows.length} missed auto-release(s) - processing now`);
+    logger.info(`🔄 Found ${missedEscrows.length} missed auto-release(s) — processing catch-up`);
 
-    // Process missed escrows in parallel batches
-    const BATCH_SIZE = 5; // Process 5 escrows in parallel at a time
-    
-    for (let i = 0; i < missedEscrows.length; i += BATCH_SIZE) {
-      const batch = missedEscrows.slice(i, i + BATCH_SIZE);
-      
-      // Process batch in parallel
-      await Promise.all(
-        batch.map(escrow => 
-          processAutoRelease(escrow).catch(error => {
-            // Log error but don't fail the entire batch
-            logger.error('❌ Error processing missed auto-release in batch:', {
-              escrowId: escrow.escrowId,
-              error: error.message,
-            });
-          })
-        )
-      );
-      
-      logger.debug(`✅ Processed catch-up batch ${Math.floor(i / BATCH_SIZE) + 1} of ${Math.ceil(missedEscrows.length / BATCH_SIZE)}`);
+    tasksProcessedThisCycle.clear();
+    const seenTaskIds = new Set<string>();
+    for (const escrow of missedEscrows) {
+      if (seenTaskIds.has(escrow.taskId)) continue;
+      seenTaskIds.add(escrow.taskId);
+      await processAutoRelease(escrow);
     }
 
-    logger.info('✅ Catch-up completed');
+    logger.info('✅ Catch-up for missed auto-releases completed');
   } catch (error: any) {
-    logger.error('❌ Error in catch-up:', error);
+    logger.error('❌ Error in catch-up for missed auto-releases:', error);
   }
 }
 
@@ -280,42 +284,22 @@ export async function catchUpMissedReleases(): Promise<void> {
  * Start the auto-release scheduler
  */
 export function startAutoReleaseScheduler(): void {
-  try {
-    const intervalMinutes = getCheckIntervalMinutes();
-    
-    // Convert minutes to cron expression
-    // Every N minutes: `*/N * * * *`
-    const cronExpression = `*/${intervalMinutes} * * * *`;
+  const intervalMinutes = getCheckIntervalMinutes();
+  const cronExpression = `*/${intervalMinutes} * * * *`;
 
-    logger.info('⏰ Starting auto-release scheduler', {
-      intervalMinutes,
-      cronExpression,
-      gracePeriodMinutes: getGracePeriodMinutes(),
+  logger.info('🕐 Starting auto-release scheduler', {
+    intervalMinutes,
+    gracePeriodMinutes: getGracePeriodMinutes(),
+    cronExpression,
+  });
+
+  cron.schedule(cronExpression, () => {
+    checkAndProcessAutoReleases().catch((error) => {
+      logger.error('❌ Auto-release scheduler error:', error);
     });
+  });
 
-    // Run catch-up on startup
-    catchUpMissedReleases().catch(error => {
-      logger.error('❌ Error in startup catch-up:', error);
-    });
-
-    // Schedule periodic checks
-    cron.schedule(cronExpression, async () => {
-      logger.debug('🔄 Running scheduled auto-release check');
-      await checkAndProcessAutoReleases();
-    });
-
-    logger.info('✅ Auto-release scheduler started');
-  } catch (error: any) {
-    logger.error('❌ Error starting auto-release scheduler:', error);
-  }
+  catchUpMissedReleases().catch((error) => {
+    logger.error('❌ Catch-up error on startup:', error);
+  });
 }
-
-/**
- * Stop the auto-release scheduler
- */
-export function stopAutoReleaseScheduler(): void {
-  // Cron jobs are automatically stopped when the process exits
-  // This function is for future use if we need manual control
-  logger.info('⏹️ Auto-release scheduler stopped');
-}
-

@@ -27,6 +27,138 @@ function generatePayoutId(): string {
   return `payout_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
 }
 
+type TaskGrossPaymentLineItem = {
+  escrowId: string;
+  amount: string;
+  date: string;
+  paymentKind: 'initial' | 'additional';
+  paymentLabel: string;
+  requestId?: string | null;
+};
+
+async function resolveTaskGrossPaymentBreakdown(taskId: string): Promise<{
+  originalTaskAmount: Prisma.Decimal;
+  additionalPaymentAmount: Prisma.Decimal;
+  grossAmount: Prisma.Decimal;
+  paymentLineItems: TaskGrossPaymentLineItem[];
+}> {
+  const escrows = await prisma.escrow.findMany({
+    where: {
+      taskId,
+      status: { in: ['held', 'released'] },
+      paymentStatus: 'captured',
+    },
+    orderBy: { createdAt: 'asc' },
+  });
+
+  let originalTaskAmount = new Prisma.Decimal('0');
+  let additionalPaymentAmount = new Prisma.Decimal('0');
+  const paymentLineItems: TaskGrossPaymentLineItem[] = [];
+
+  for (const escrow of escrows) {
+    const em =
+      escrow.metadata && typeof escrow.metadata === 'object' && !Array.isArray(escrow.metadata)
+        ? (escrow.metadata as Record<string, unknown>)
+        : {};
+    const lineAmount = new Prisma.Decimal(escrow.amountInRupees.toString());
+    const isAdditional =
+      em.type === 'additional_payment' || em.paymentKind === 'additional';
+    const paymentKind: 'initial' | 'additional' = isAdditional ? 'additional' : 'initial';
+    const paymentLabel =
+      typeof em.paymentLabel === 'string' && em.paymentLabel.trim().length > 0
+        ? em.paymentLabel.trim()
+        : isAdditional
+          ? 'Additional payment (helper request)'
+          : 'Original task payment';
+
+    if (isAdditional) {
+      additionalPaymentAmount = additionalPaymentAmount.add(lineAmount);
+    } else {
+      originalTaskAmount = originalTaskAmount.add(lineAmount);
+    }
+
+    paymentLineItems.push({
+      escrowId: escrow.escrowId,
+      amount: lineAmount.toFixed(2),
+      date: escrow.createdAt.toISOString(),
+      paymentKind,
+      paymentLabel,
+      requestId:
+        typeof em.requestId === 'string' && em.requestId.trim().length > 0
+          ? em.requestId.trim()
+          : null,
+    });
+  }
+
+  const grossAmount = originalTaskAmount.add(additionalPaymentAmount).toDecimalPlaces(2);
+
+  return {
+    originalTaskAmount: originalTaskAmount.toDecimalPlaces(2),
+    additionalPaymentAmount: additionalPaymentAmount.toDecimalPlaces(2),
+    grossAmount,
+    paymentLineItems,
+  };
+}
+
+function taskCompletionPayoutDescription(taskId: string): string {
+  return `Task completion payout for task ${taskId}`;
+}
+
+async function findExistingTaskCompletionPayout(
+  taskId: string,
+  performerUid: string,
+) {
+  return prisma.payout.findFirst({
+    where: {
+      performerUid,
+      description: taskCompletionPayoutDescription(taskId),
+      status: { in: ['processing', 'completed'] },
+    },
+    orderBy: { createdAt: 'desc' },
+  });
+}
+
+function formatPayoutApiResponse(payout: {
+  payoutId: string;
+  amount: Prisma.Decimal;
+  netAmount: Prisma.Decimal;
+  platformCommission: Prisma.Decimal;
+  gstOnCommission: Prisma.Decimal;
+  tds: Prisma.Decimal | null;
+  bankTransferId: string | null;
+  status: string;
+  completedAt: Date | null;
+  metadata?: unknown;
+}) {
+  const md =
+    payout.metadata && typeof payout.metadata === 'object' && !Array.isArray(payout.metadata)
+      ? (payout.metadata as Record<string, unknown>)
+      : {};
+  const amountBreakdown =
+    md.amountBreakdown && typeof md.amountBreakdown === 'object' && !Array.isArray(md.amountBreakdown)
+      ? (md.amountBreakdown as Record<string, string>)
+      : {};
+
+  return {
+    payoutId: payout.payoutId,
+    amount: payout.amount.toString(),
+    grossAmount: payout.amount.toString(),
+    netAmount: payout.netAmount.toString(),
+    bankTransferAmount: payout.netAmount.toString(),
+    fees: {
+      platformCommission: payout.platformCommission.toString(),
+      gstOnCommission: payout.gstOnCommission.toString(),
+      tds: payout.tds?.toString() || '0.00',
+      total: payout.platformCommission.plus(payout.gstOnCommission).plus(payout.tds || 0).toString(),
+    },
+    bankTransferId: payout.bankTransferId,
+    status: payout.status,
+    completedAt: payout.completedAt,
+    amountBreakdown,
+    metadata: md,
+  };
+}
+
 async function ensureExtraCoinsAwardedForTaskCompletionPayout(params: {
   payoutId: string;
   performerUid: string;
@@ -404,6 +536,43 @@ export async function processPayout(params: {
     if (!postgresEscrow) {
       logger.warn('⚠️ Escrow not found for order:', razorpayOrderId);
       return { success: false, error: 'Escrow not found' };
+    }
+
+    const taskId = postgresEscrow.taskId;
+
+    const existingCombinedPayout = await findExistingTaskCompletionPayout(
+      taskId,
+      performerUid,
+    );
+    if (existingCombinedPayout) {
+      logger.info('[payoutService] Task completion payout already exists — skipping per-escrow payout', {
+        taskId,
+        payoutId: existingCombinedPayout.payoutId,
+      });
+      return {
+        success: true,
+        payout: formatPayoutApiResponse(existingCombinedPayout),
+      };
+    }
+
+    const capturedEscrowCount = await prisma.escrow.count({
+      where: {
+        taskId,
+        paymentStatus: 'captured',
+        status: { notIn: ['cancelled', 'refunded'] },
+      },
+    });
+    if (capturedEscrowCount > 1) {
+      logger.info(
+        '[payoutService] Multiple escrows for task — routing to combined payout (fees on total, net to bank)',
+        { taskId, capturedEscrowCount },
+      );
+      return processTaskCompletionPayout({
+        taskId,
+        performerUid,
+        amount: Number(postgresEscrow.amountInRupees.toString()),
+        userId: params.userId,
+      });
     }
 
     // Check escrow status
@@ -853,7 +1022,7 @@ export async function processTaskCompletionPayout(params: {
       return { success: false, error: 'Postgres not connected' };
     }
 
-    const duplicateDescription = `Task completion payout for task ${taskId}`;
+    const duplicateDescription = taskCompletionPayoutDescription(taskId);
 
     const existing = await prisma.payout.findFirst({
       where: {
@@ -938,7 +1107,11 @@ export async function processTaskCompletionPayout(params: {
       };
     }
 
-    const grossAmount = new Prisma.Decimal(amount.toString()).toDecimalPlaces(2);
+    const grossBreakdown = await resolveTaskGrossPaymentBreakdown(taskId);
+    const grossFromEscrows = grossBreakdown.grossAmount;
+    const grossAmount = grossFromEscrows.greaterThan(0)
+      ? grossFromEscrows
+      : new Prisma.Decimal(amount.toString()).toDecimalPlaces(2);
     const feeStructure = await getFeeStructure();
     const platformCommission = grossAmount
       .mul(feeStructure.platformFee.percentage)
@@ -1068,10 +1241,16 @@ export async function processTaskCompletionPayout(params: {
       taskTitle,
       posterUid: taskEscrow?.posterUid,
       grossAmount: grossAmount.toString(),
+      grossEarningsAmount: grossAmount.toString(),
+      originalTaskPaymentAmount: grossBreakdown.originalTaskAmount.toString(),
+      additionalPaymentAmount: grossBreakdown.additionalPaymentAmount.toString(),
+      paymentLineItems: grossBreakdown.paymentLineItems,
       taskAmount: grossAmount.toString(),
       platformFee: platformCommission.toString(),
+      platformCommission: platformCommission.toString(),
       platformFeeGst: gstOnCommission.toString(),
       gstAmount: gstOnCommission.toString(),
+      gstOnCommission: gstOnCommission.toString(),
       totalFeeDeducted: platformFeeTotal.toString(),
       totalDeductions: totalDeductions.toString(),
       netAmount: netAmount.toString(),
@@ -1080,6 +1259,9 @@ export async function processTaskCompletionPayout(params: {
       extraCoinsBonusCoins: redeemedCoins.toString(),
       penaltyLines: penaltyLinesMetadata,
       amountBreakdown: {
+        originalTaskAmount: grossBreakdown.originalTaskAmount.toString(),
+        additionalPaymentAmount: grossBreakdown.additionalPaymentAmount.toString(),
+        grossTaskAmount: grossAmount.toString(),
         taskAmount: grossAmount.toString(),
         platformFee: platformCommission.toString(),
         gst: gstOnCommission.toString(),
@@ -1156,14 +1338,40 @@ export async function processTaskCompletionPayout(params: {
         deductionLineCount: penaltyPlan.lines.length,
       });
     } else {
-      logger.debug('[payoutService] Creating RazorpayX payout with penalty deduction applied', {
+      const bankTransferPaise = Math.round(parseFloat(netAmount.toString()) * 100);
+      if (bankTransferPaise <= 0) {
+        return {
+          success: false,
+          error: 'Net payout amount must be greater than zero for bank transfer',
+        };
+      }
+      if (netAmount.gt(grossAmount)) {
+        logger.error('[payoutService] Net payout exceeds gross — aborting bank transfer', {
+          taskId,
+          grossAmount: grossAmount.toString(),
+          netAmount: netAmount.toString(),
+        });
+        return { success: false, error: 'Invalid payout calculation: net amount exceeds gross' };
+      }
+
+      logger.info('[payoutService] Bank transfer — net amount only (fees retained by platform)', {
         performerUid,
         taskId,
+        originalTaskPaymentAmount: grossBreakdown.originalTaskAmount.toString(),
+        additionalPaymentAmount: grossBreakdown.additionalPaymentAmount.toString(),
+        grossAmount: grossAmount.toString(),
+        platformCommission: platformCommission.toString(),
+        gstOnCommission: gstOnCommission.toString(),
+        platformFeeTotal: platformFeeTotal.toString(),
+        penaltyDeducted: totalPenaltyDeducted.toString(),
+        extraCoinsBonus: redeemedRupees.toString(),
         netAmount: netAmount.toString(),
+        bankTransferPaise,
       });
+
       const payoutResponse = await createRazorpayXPayout({
         fundAccountId,
-        amountInPaise: Math.round(parseFloat(netAmount.toString()) * 100),
+        amountInPaise: bankTransferPaise,
         referenceId: payoutId,
         narration: payoutNarration,
       });
@@ -1265,12 +1473,17 @@ export async function processTaskCompletionPayout(params: {
         taskId,
         taskTitle,
         amount: grossAmount.toString(),
+        grossAmount: grossAmount.toString(),
+        originalTaskPaymentAmount: grossBreakdown.originalTaskAmount.toString(),
+        additionalPaymentAmount: grossBreakdown.additionalPaymentAmount.toString(),
         netAmount: netAmount.toString(),
+        bankTransferAmount: netAmount.toString(),
         status,
         penaltyDeducted: totalPenaltyDeducted.toString(),
         extraCoinsBonus: redeemedRupees.toString(),
         extraCoinsBonusCoins: redeemedCoins.toString(),
         penaltyLines: penaltyLinesMetadata,
+        paymentLineItems: grossBreakdown.paymentLineItems,
         fees: {
           platformCommission: platformCommission.toString(),
           gstOnCommission: gstOnCommission.toString(),
@@ -1278,12 +1491,18 @@ export async function processTaskCompletionPayout(params: {
           total: platformFeeTotal.toString(),
         },
         amountBreakdown: {
+          originalTaskAmount: grossBreakdown.originalTaskAmount.toString(),
+          additionalPaymentAmount: grossBreakdown.additionalPaymentAmount.toString(),
+          grossTaskAmount: grossAmount.toString(),
           taskAmount: grossAmount.toString(),
           platformFee: platformCommission.toString(),
           gst: gstOnCommission.toString(),
           basePayout: payoutBaseAmount.toString(),
           extraCoinsBonus: redeemedRupees.toString(),
+          penaltyDeducted: totalPenaltyDeducted.toString(),
           finalPayout: netAmount.toString(),
+          netAmount: netAmount.toString(),
+          bankTransferAmount: netAmount.toString(),
         },
       },
     };

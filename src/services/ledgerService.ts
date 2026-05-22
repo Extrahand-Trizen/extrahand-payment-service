@@ -61,21 +61,25 @@ export async function createLedgerEntry(params: {
 
     const transactionId = generateLedgerTransactionId();
 
-    const ledger = await prisma.ledger.create({
-      data: {
-        transactionId,
-        escrowId: escrowId || null,
-        payoutId: payoutId || null,
-        refundId: refundId || null,
-        paymentTransactionId: paymentTransactionId || null,
-        razorpayPaymentId: (metadata as any)?.razorpayPaymentId ?? null,
-        type,
-        amount: amountDecimal,
-        balanceBefore: balanceBeforeDecimal,
-        balanceAfter: balanceAfterDecimal,
-        description: description || `${type} transaction`,
-        metadata: metadata || {},
+    const ledgerData: Prisma.LedgerUncheckedCreateInput = {
+      transactionId,
+      escrowId: escrowId || null,
+      payoutId: payoutId || null,
+      refundId: refundId || null,
+      razorpayPaymentId: (metadata as any)?.razorpayPaymentId ?? null,
+      type,
+      amount: amountDecimal,
+      balanceBefore: balanceBeforeDecimal,
+      balanceAfter: balanceAfterDecimal,
+      description: description || `${type} transaction`,
+      metadata: {
+        ...(metadata || {}),
+        ...(paymentTransactionId ? { paymentTransactionId } : {}),
       },
+    };
+
+    const ledger = await prisma.ledger.create({
+      data: ledgerData,
     });
 
     logger.info('✅ Ledger entry created', {

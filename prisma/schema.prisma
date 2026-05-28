@@ -81,7 +81,9 @@ model Escrow {
 
   @@index([taskId, status])
   @@index([posterUid, status])
+  @@index([posterUid, status, createdAt(sort: Desc)])
   @@index([performerUid, status])
+  @@index([performerUid, status, createdAt(sort: Desc)])
   @@index([status, autoReleaseDate])
   @@index([createdAt])
 }
@@ -154,6 +156,7 @@ model Refund {
   @@index([taskId])
   @@index([paymentId])
   @@index([status])
+  @@index([status, createdAt(sort: Desc)])
   @@index([createdAt])
 }
 
@@ -189,6 +192,8 @@ model Payout {
   @@index([transactionId])
   @@index([taskId])
   @@index([performerUid])
+  @@index([performerUid, createdAt(sort: Desc)])
+  @@index([performerUid, status, createdAt(sort: Desc)])
   @@index([status])
   @@index([createdAt])
 }

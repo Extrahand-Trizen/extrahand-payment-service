@@ -1,6 +1,8 @@
 CREATE TABLE IF NOT EXISTS "Transaction" (
   "id" TEXT NOT NULL,
-  "transactionId" TEXT NOT NULL,
+  "userId" TEXT NOT NULL,
+  "taskId" TEXT,
+  "applicationId" TEXT,
   "escrowId" TEXT,
   "razorpayOrderId" TEXT NOT NULL,
   "razorpayPaymentId" TEXT,
@@ -19,13 +21,14 @@ CREATE TABLE IF NOT EXISTS "Transaction" (
   CONSTRAINT "Transaction_pkey" PRIMARY KEY ("id")
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS "Transaction_transactionId_key" ON "Transaction"("transactionId");
 CREATE UNIQUE INDEX IF NOT EXISTS "Transaction_razorpayPaymentId_key" ON "Transaction"("razorpayPaymentId");
 CREATE UNIQUE INDEX IF NOT EXISTS "Transaction_ledgerEntryId_key" ON "Transaction"("ledgerEntryId");
 CREATE INDEX IF NOT EXISTS "Transaction_escrowId_idx" ON "Transaction"("escrowId");
 CREATE INDEX IF NOT EXISTS "Transaction_razorpayOrderId_idx" ON "Transaction"("razorpayOrderId");
 CREATE INDEX IF NOT EXISTS "Transaction_status_idx" ON "Transaction"("status");
 CREATE INDEX IF NOT EXISTS "Transaction_createdAt_idx" ON "Transaction"("createdAt");
+CREATE INDEX IF NOT EXISTS "Transaction_userId_idx" ON "Transaction"("userId");
+CREATE INDEX IF NOT EXISTS "Transaction_taskId_idx" ON "Transaction"("taskId");
 
 ALTER TABLE "Ledger" ADD COLUMN IF NOT EXISTS "payoutId" TEXT;
 ALTER TABLE "Ledger" ADD COLUMN IF NOT EXISTS "refundId" TEXT;

@@ -19,6 +19,8 @@ import { applyPenaltyLinesInTx, planPenaltyDeductionsFromGross } from './perform
 import { notifyPayoutInitiated } from './paymentNotificationService';
 import { getFeeStructure } from './feeConfigService';
 import { applyExtraCoinsForPayout, awardExtraCoinsForCompletedTask } from './extraCoinsService';
+import { paymentRewardsFlags } from '../config/rewardsFlags';
+import { CoinUsageConfigProvider } from '../rewards/config/CoinUsageConfigProvider';
 
 /**
  * Generate unique payout ID
@@ -840,6 +842,8 @@ export async function processTaskCompletionPayout(params: {
   taskTitle?: string;
   userId?: string;
   enqueueOnMissingBank?: boolean;
+  useExtraCoins?: boolean;
+  requestedCoinRedeemRupees?: number;
 }): Promise<{
   success: boolean;
   payout?: any;
@@ -847,7 +851,15 @@ export async function processTaskCompletionPayout(params: {
   error?: string;
 }> {
   try {
-    const { taskId, performerUid, amount, taskTitle, enqueueOnMissingBank = true } = params;
+    const {
+      taskId,
+      performerUid,
+      amount,
+      taskTitle,
+      enqueueOnMissingBank = false,
+      useExtraCoins = false,
+      requestedCoinRedeemRupees,
+    } = params;
 
     if (!isPostgresConnected()) {
       return { success: false, error: 'Postgres not connected' };
@@ -947,6 +959,13 @@ export async function processTaskCompletionPayout(params: {
       .mul(feeStructure.platformFee.gstPercentage)
       .toDecimalPlaces(2);
     const platformFeeTotal = platformCommission.add(gstOnCommission).toDecimalPlaces(2);
+    const coinCaps = await CoinUsageConfigProvider.getCapPercents();
+    const taskerCapPercent = paymentRewardsFlags.TASKER_PLATFORM_FEE_COIN_CAP_ENABLED
+      ? coinCaps.taskerPlatformFee.toFixed(4)
+      : '1.0000';
+    const maxTaskerCoinRedeemRupees = platformCommission
+      .mul(new Prisma.Decimal(taskerCapPercent))
+      .toDecimalPlaces(2);
     const payoutBaseAmount = Prisma.Decimal.max(
       grossAmount.sub(platformFeeTotal).toDecimalPlaces(2),
       new Prisma.Decimal('0.00')
@@ -962,31 +981,44 @@ export async function processTaskCompletionPayout(params: {
       redeemedRupees: string;
     }> = [];
 
-    try {
-      const redeemResult = await applyExtraCoinsForPayout({
-        userId: performerUid,
-        payoutId,
-        taskId,
-        maxRedeemRupees: platformFeeTotal,
-      });
+    const requestedRedeemRupees = (() => {
+      if (!useExtraCoins) return new Prisma.Decimal('0.00');
+      const raw = Number(requestedCoinRedeemRupees ?? 0);
+      if (!Number.isFinite(raw) || raw <= 0) return maxTaskerCoinRedeemRupees;
+      const requested = new Prisma.Decimal(raw.toFixed(2));
+      return requested.lessThan(maxTaskerCoinRedeemRupees)
+        ? requested
+        : maxTaskerCoinRedeemRupees;
+    })();
 
-      if (redeemResult.success) {
-        redeemedCoins = new Prisma.Decimal(redeemResult.redeemedCoins);
-        redeemedRupees = new Prisma.Decimal(redeemResult.redeemedRupees);
-        redeemedSources = redeemResult.sources;
-      } else {
-        logger.warn('[payoutService] ExtraCoins redeem skipped due to service error', {
+    if (useExtraCoins && requestedRedeemRupees.gt(0)) {
+      try {
+        const redeemResult = await applyExtraCoinsForPayout({
+          userId: performerUid,
+          payoutId,
+          taskId,
+          maxRedeemRupees: requestedRedeemRupees,
+          walletRole: 'tasker',
+        });
+
+        if (redeemResult.success) {
+          redeemedCoins = new Prisma.Decimal(redeemResult.redeemedCoins);
+          redeemedRupees = new Prisma.Decimal(redeemResult.redeemedRupees);
+          redeemedSources = redeemResult.sources;
+        } else {
+          logger.warn('[payoutService] ExtraCoins redeem skipped due to service error', {
+            performerUid,
+            taskId,
+            error: redeemResult.error,
+          });
+        }
+      } catch (redeemError: any) {
+        logger.warn('[payoutService] ExtraCoins redeem failed unexpectedly, continuing payout without bonus', {
           performerUid,
           taskId,
-          error: redeemResult.error,
+          error: redeemError?.message || 'Unknown error',
         });
       }
-    } catch (redeemError: any) {
-      logger.warn('[payoutService] ExtraCoins redeem failed unexpectedly, continuing payout without bonus', {
-        performerUid,
-        taskId,
-        error: redeemError?.message || 'Unknown error',
-      });
     }
 
     const payoutBaseAfterExtraCoins = payoutBaseAmount
@@ -1092,8 +1124,10 @@ export async function processTaskCompletionPayout(params: {
         netAmount: netAmount.toString(),
       },
       extraCoins: {
-        coinToRupee: '0.20',
+        coinToRupee: '1.00',
         applied: redeemedRupees.gt(0),
+        requested: useExtraCoins,
+        requestedRedeemRupees: requestedRedeemRupees.toString(),
         redeemedCoins: redeemedCoins.toString(),
         redeemedRupees: redeemedRupees.toString(),
         redeemCapRupees: platformFeeTotal.toString(),
@@ -1104,7 +1138,7 @@ export async function processTaskCompletionPayout(params: {
         platformFeePercentage: feeStructure.platformFee.percentage,
         gstPercentage: feeStructure.platformFee.gstPercentage,
       },
-      coinFormula: '(platformFee * basePercent) * ratingMultiplier * bonuses / 0.20',
+      coinFormula: '(platformFee * basePercent) * ratingMultiplier * bonuses / 1.00 (1 coin = ₹1)',
       penaltiesAppliedAt: null as string | null,
     };
 

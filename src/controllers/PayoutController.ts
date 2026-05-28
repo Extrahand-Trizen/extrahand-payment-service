@@ -62,7 +62,7 @@ export class PayoutController {
    * Process payout directly on task completion (without escrow dependency)
    */
   static async processTaskCompletionPayout(req: Request, res: Response): Promise<void> {
-    const { taskId, performerUid, amount, taskTitle, userId } = req.body;
+    const { taskId, performerUid, amount, taskTitle, userId, useExtraCoins, requestedCoinRedeemRupees } = req.body;
 
     if (!taskId || !performerUid || !amount) {
       throw new BadRequestError('taskId, performerUid and amount are required');
@@ -79,6 +79,10 @@ export class PayoutController {
       amount: numericAmount,
       taskTitle,
       userId,
+      enqueueOnMissingBank: false,
+      useExtraCoins: useExtraCoins === true,
+      requestedCoinRedeemRupees:
+        requestedCoinRedeemRupees != null ? Number(requestedCoinRedeemRupees) : undefined,
     });
 
     if (!result.success) {

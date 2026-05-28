@@ -13,10 +13,139 @@ export interface Transaction {
   status: string;
   description?: string;
   date: string;
+  /** Same instant as `date` — for clients that read createdAt on invoices */
+  createdAt?: string;
   relatedEntityId?: string; // escrowId, payoutId, refundId, etc.
   metadata?: Record<string, any>;
   // User-friendly categorization
   category?: 'earnings' | 'payments'; // earnings = money received, payments = money spent
+}
+
+type PosterPaymentLineItem = {
+  escrowId?: string;
+  amount: string;
+  date: string;
+  paymentKind: 'initial' | 'additional';
+  paymentLabel: string;
+  requestId?: string | null;
+};
+
+function pickStringField(em: Record<string, unknown>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const v = em[key];
+    if (typeof v === 'string' && v.trim().length > 0) return v.trim();
+  }
+  return undefined;
+}
+
+/** Names/phones persisted on escrow metadata for invoices and history. */
+function partySnapshotFromEscrowMeta(em: Record<string, unknown>): Record<string, string> {
+  const performerName = pickStringField(em, [
+    'performerNameSnapshot',
+    'performerName',
+    'taskerNameSnapshot',
+    'taskerName',
+    'assigneeName',
+    'helperName',
+  ]);
+  const posterName = pickStringField(em, [
+    'posterNameSnapshot',
+    'posterName',
+    'customerName',
+    'requesterName',
+  ]);
+  const performerPhone = pickStringField(em, ['performerPhone', 'taskerPhone', 'assigneePhone']);
+  const posterPhone = pickStringField(em, ['posterPhone', 'customerPhone', 'requesterPhone']);
+
+  const out: Record<string, string> = {};
+  if (performerName) {
+    out.performerName = performerName;
+    out.performerNameSnapshot = performerName;
+    out.taskerName = performerName;
+    out.assigneeName = performerName;
+  }
+  if (posterName) {
+    out.posterName = posterName;
+    out.posterNameSnapshot = posterName;
+    out.customerName = posterName;
+    out.requesterName = posterName;
+  }
+  if (performerPhone) {
+    out.performerPhone = performerPhone;
+    out.taskerPhone = performerPhone;
+  }
+  if (posterPhone) out.posterPhone = posterPhone;
+  return out;
+}
+
+function resolveEscrowPaymentDate(escrow: { heldAt: Date | null; createdAt: Date }): string {
+  return (escrow.heldAt ?? escrow.createdAt).toISOString();
+}
+
+function withTransactionTimestamps(
+  row: Transaction,
+  eventDate: string,
+  extraMeta?: Record<string, unknown>
+): Transaction {
+  const metadata = {
+    ...(row.metadata || {}),
+    ...(extraMeta || {}),
+    date: eventDate,
+    transactionDate: eventDate,
+    paidAt: (extraMeta as Record<string, unknown>)?.paidAt ?? eventDate,
+  };
+  return {
+    ...row,
+    date: eventDate,
+    createdAt: eventDate,
+    metadata,
+  };
+}
+
+function resolvePosterPaymentKind(em: Record<string, unknown>): 'initial' | 'additional' {
+  if (em.type === 'additional_payment' || em.paymentKind === 'additional') {
+    return 'additional';
+  }
+  return 'initial';
+}
+
+function posterPaymentLabel(kind: 'initial' | 'additional'): string {
+  return kind === 'additional'
+    ? 'Additional payment (helper request)'
+    : 'Original task payment';
+}
+
+function buildPosterPaymentLineItem(row: Transaction): PosterPaymentLineItem {
+  const md = (row.metadata || {}) as Record<string, unknown>;
+  const kind = resolvePosterPaymentKind(md);
+  const amountNum = Number(row.amount);
+  const amount =
+    Number.isFinite(amountNum) && amountNum > 0
+      ? amountNum
+      : Number(md.totalPaid ?? md.amountInRupees ?? 0);
+  return {
+    escrowId: row.relatedEntityId,
+    amount: (Number.isFinite(amount) ? amount : 0).toFixed(2),
+    date: row.date,
+    paymentKind: kind,
+    paymentLabel:
+      typeof md.paymentLabel === 'string' && md.paymentLabel.trim().length > 0
+        ? md.paymentLabel.trim()
+        : posterPaymentLabel(kind),
+    requestId:
+      typeof md.requestId === 'string' && md.requestId.trim().length > 0
+        ? md.requestId.trim()
+        : null,
+  };
+}
+
+function sumLineItemsByKind(
+  items: PosterPaymentLineItem[],
+  kind: 'initial' | 'additional',
+): number {
+  return items
+    .filter((i) => i.paymentKind === kind)
+    .reduce((acc, i) => acc + Number(i.amount), 0);
 }
 
 /**
@@ -165,6 +294,30 @@ export async function getUserTransactions(
       skip: offset
     });
 
+    // Preload standalone payouts (escrowId = null) once so we can:
+    // 1) render them later
+    // 2) suppress duplicate performer "pending earnings" escrow rows for same task
+    const standalonePayouts =
+      !typeFilter || typeFilter === 'payout'
+        ? await prisma.payout.findMany({
+            where: {
+              performerUid: { in: uidList },
+              escrowId: null,
+              ...(statusFilter ? { status: statusFilter } : {}),
+              ...(startDate || endDate
+                ? {
+                    createdAt: {
+                      ...(startDate ? { gte: startDate } : {}),
+                      ...(endDate ? { lte: endDate } : {}),
+                    },
+                  }
+                : {}),
+            },
+            orderBy: { createdAt: 'desc' },
+            take: fetchLimit,
+          })
+        : [];
+
     // Convert escrows to transactions
     // IMPORTANT: Always add all transactions with their correct category, then filter after
     escrows.forEach((escrow) => {
@@ -196,6 +349,11 @@ export async function getUserTransactions(
         return value.greaterThan(one) ? value.div(hundred) : value;
       };
       const totalPaid = new Prisma.Decimal(escrow.amountInRupees.toString());
+      const extraCoinsDiscount =
+        toDecimal(escrowMeta.pendingCustomerCoinDiscountRupees) ||
+        toDecimal(escrowMeta.customerCoinDiscountRupees) ||
+        toDecimal(amountBreakdown.extraCoinsDiscount) ||
+        new Prisma.Decimal('0');
       const configuredPlatformPct = normalizePercent(toDecimal(escrow.appliedPlatformFeePercent));
       const configuredGstPct = normalizePercent(toDecimal(escrow.appliedGstPercent));
       const derivedTaskAmount = (() => {
@@ -211,6 +369,7 @@ export async function getUserTransactions(
         toDecimal((escrow as { taskAmount?: unknown }).taskAmount) ||
         toDecimal(amountBreakdown.taskAmount) ||
         toDecimal(escrowMeta.taskAmount) ||
+        (extraCoinsDiscount.greaterThan(0) ? totalPaid.plus(extraCoinsDiscount).toDecimalPlaces(2) : null) ||
         derivedTaskAmount ||
         totalPaid;
       const platformFee =
@@ -274,48 +433,187 @@ export async function getUserTransactions(
         isPoster &&
         includePosterEscrowInDefaultList
       ) {
+        const paymentKind = resolvePosterPaymentKind(em);
+        const paymentLabel = posterPaymentLabel(paymentKind);
+        const lineAmount = totalPaid.toString();
+        const lineTaskAmount = taskAmount.toString();
+        const lineCoinDiscount = extraCoinsDiscount.toDecimalPlaces(2).toString();
+        const requestId =
+          typeof em.requestId === 'string' && em.requestId.trim().length > 0
+            ? em.requestId.trim()
+            : undefined;
+        const paymentEventDate = resolveEscrowPaymentDate(escrow);
+        const partySnapshot = partySnapshotFromEscrowMeta(em);
+        const paymentLineItems: PosterPaymentLineItem[] = [
+          {
+            escrowId: escrow.escrowId,
+            amount: lineAmount,
+            date: paymentEventDate,
+            paymentKind,
+            paymentLabel,
+            requestId: requestId ?? null,
+          },
+        ];
+
         // Always add payment transactions when user is the poster (they paid)
-        transactions.push({
-          id: escrow.id,
-          transactionId: escrow.escrowId,
-          type: 'escrow',
-          amount: escrow.amountInRupees.toString(),
-          status: escrow.status,
-          description: taskTitleSnapshot
-            ? `Payment — ${taskTitleSnapshot.length > 120 ? `${taskTitleSnapshot.slice(0, 117)}...` : taskTitleSnapshot}`
-            : `Payment for task`,
-          date: escrow.createdAt.toISOString(),
-          relatedEntityId: escrow.escrowId,
-          category: 'payments', // Money spent
-          metadata: {
-            taskId: escrow.taskId,
-            ...(taskTitleSnapshot
-              ? {
-                  taskTitle: taskTitleSnapshot,
-                  taskTitleSnapshot,
-                }
-              : {}),
-            ...(taskCategorySnapshot ? { taskCategory: taskCategorySnapshot, taskCategorySnapshot } : {}),
-            ...(taskDescriptionSnapshot ? { taskDescription: taskDescriptionSnapshot } : {}),
-            ...(typeof em.snapshotVersion === 'number' ? { snapshotVersion: em.snapshotVersion } : {}),
-            ...(typeof em.capturedAt === 'string' ? { capturedAt: em.capturedAt } : {}),
-            role: 'poster',
-            razorpayOrderId: escrow.razorpayOrderId,
-            amountInRupees: escrow.amountInRupees.toString(),
-            escrowStatus: escrow.status,
-            taskAmount: taskAmount.toString(),
-            platformFee: finalPlatformFee.toString(),
-            gstAmount: finalGst.toString(),
-            totalPaid: totalPaid.toString(),
-            refundedAmount: latestCompletedRefund?.refundAmount?.toString() || '0',
-            latestRefundAmount: latestRefund?.refundAmount?.toString() || '0',
-            latestRefundStatus: latestRefund?.status || null,
-            latestCancellationFee: latestRefund?.cancellationFee?.toString() || '0',
-            latestCancelledBy: latestRefund?.cancelledBy || null,
-            appliedPlatformFeePercent: configuredPlatformPct?.toString() || null,
-            appliedGstPercent: configuredGstPct?.toString() || null,
-          }
+        transactions.push(
+          withTransactionTimestamps(
+            {
+              id: escrow.id,
+              transactionId: escrow.escrowId,
+              type: 'escrow',
+              amount: escrow.amountInRupees.toString(),
+              status: escrow.status,
+              description: taskTitleSnapshot
+                ? paymentKind === 'additional'
+                  ? `Additional payment — ${
+                      taskTitleSnapshot.length > 100
+                        ? `${taskTitleSnapshot.slice(0, 97)}...`
+                        : taskTitleSnapshot
+                    }`
+                  : `Original payment — ${
+                      taskTitleSnapshot.length > 100
+                        ? `${taskTitleSnapshot.slice(0, 97)}...`
+                        : taskTitleSnapshot
+                    }`
+                : paymentLabel,
+              date: paymentEventDate,
+              relatedEntityId: escrow.escrowId,
+              category: 'payments', // Money spent
+              metadata: {
+                taskId: escrow.taskId,
+                ...(taskTitleSnapshot
+                  ? {
+                      taskTitle: taskTitleSnapshot,
+                      taskTitleSnapshot,
+                    }
+                  : {}),
+                ...(taskCategorySnapshot ? { taskCategory: taskCategorySnapshot, taskCategorySnapshot } : {}),
+                ...(taskDescriptionSnapshot ? { taskDescription: taskDescriptionSnapshot } : {}),
+                ...(typeof em.snapshotVersion === 'number' ? { snapshotVersion: em.snapshotVersion } : {}),
+                ...(typeof em.capturedAt === 'string' ? { capturedAt: em.capturedAt } : {}),
+                ...(em.type ? { type: em.type } : {}),
+                paymentKind,
+                paymentLabel,
+                paymentLineItems,
+                ...(paymentKind === 'initial'
+                  ? { originalTaskPaymentAmount: lineAmount }
+                  : { additionalPaymentAmount: lineAmount }),
+                ...(requestId ? { requestId } : {}),
+                ...(escrow.applicationId ? { applicationId: escrow.applicationId } : {}),
+                role: 'poster',
+                performerUid: escrow.performerUid,
+                posterUid: escrow.posterUid,
+                razorpayOrderId: escrow.razorpayOrderId,
+                razorpayPaymentId: escrow.razorpayPaymentId ?? undefined,
+                amountInRupees: escrow.amountInRupees.toString(),
+                escrowStatus: escrow.status,
+                heldAt: escrow.heldAt?.toISOString() ?? undefined,
+                // Customer pays work amount only; platform fee + GST are deducted from helper payout.
+                taskAmount: lineTaskAmount,
+                platformFee: '0',
+                gstAmount: '0',
+                totalPaid: lineAmount,
+                extraCoinsDiscount: lineCoinDiscount,
+                extraCoinsDiscountRupees: lineCoinDiscount,
+                amountBreakdown: {
+                  taskAmount: lineTaskAmount,
+                  platformFee: '0',
+                  gst: '0',
+                  extraCoinsDiscount: lineCoinDiscount,
+                  totalPaid: lineAmount,
+                },
+                refundedAmount: latestCompletedRefund?.refundAmount?.toString() || '0',
+                latestRefundAmount: latestRefund?.refundAmount?.toString() || '0',
+                latestRefundStatus: latestRefund?.status || null,
+                latestCancellationFee: latestRefund?.cancellationFee?.toString() || '0',
+                latestCancelledBy: latestRefund?.cancelledBy || null,
+                appliedPlatformFeePercent: configuredPlatformPct?.toString() || null,
+                appliedGstPercent: configuredGstPct?.toString() || null,
+                ...partySnapshot,
+              },
+            },
+            paymentEventDate,
+            {
+              paidAt: escrow.heldAt?.toISOString() ?? paymentEventDate,
+              heldAt: escrow.heldAt?.toISOString(),
+            }
+          )
+        );
+      }
+
+      // Performer: poster payment is visible as an escrow row, but performers only received
+      // payout-derived lines. If payout records are missing or lag behind task completion,
+      // the tasker's Transactions tab looked empty. Show a single earnings row for funded escrows.
+      const performerHasEscrowLinkedPayoutLine = escrow.payouts.some((p) =>
+        uidList.includes(p.performerUid),
+      );
+      const performerHasStandalonePayoutForTask =
+        !typeFilter &&
+        standalonePayouts.some((payout) => {
+          if (!uidList.includes(payout.performerUid)) return false;
+          const rawMeta = (payout as { metadata?: unknown }).metadata;
+          if (!rawMeta || typeof rawMeta !== 'object' || Array.isArray(rawMeta)) return false;
+          const taskIdFromMeta = (rawMeta as Record<string, unknown>).taskId;
+          return typeof taskIdFromMeta === 'string' && taskIdFromMeta === escrow.taskId;
         });
+      const performerHasPayoutLine =
+        performerHasEscrowLinkedPayoutLine || performerHasStandalonePayoutForTask;
+      if (
+        (!typeFilter || typeFilter === 'escrow') &&
+        isPerformer &&
+        !performerHasPayoutLine &&
+        SUCCESSFUL_ESCROW_PAYMENT_STATUSES.has(escrowStatusNormalized) &&
+        (!categoryFilter || categoryFilter === 'all' || categoryFilter === 'earnings')
+      ) {
+        const pendingEarningsDate = resolveEscrowPaymentDate(escrow);
+        const partySnapshotPerformer = partySnapshotFromEscrowMeta(em);
+        transactions.push(
+          withTransactionTimestamps(
+            {
+              id: `${escrow.id}_performer_escrow`,
+              transactionId: `${escrow.escrowId}_performer`,
+              type: 'escrow',
+              amount: taskAmount.toString(),
+              status: escrow.status,
+              description: taskTitleSnapshot
+                ? `Earnings (payout pending) — ${
+                    taskTitleSnapshot.length > 100
+                      ? `${taskTitleSnapshot.slice(0, 97)}...`
+                      : taskTitleSnapshot
+                  }`
+                : `Earnings pending for task`,
+              date: pendingEarningsDate,
+              relatedEntityId: escrow.escrowId,
+              category: 'earnings',
+              metadata: {
+                taskId: escrow.taskId,
+                ...(taskTitleSnapshot
+                  ? { taskTitle: taskTitleSnapshot, taskTitleSnapshot }
+                  : {}),
+                ...(taskCategorySnapshot
+                  ? { taskCategory: taskCategorySnapshot, taskCategorySnapshot }
+                  : {}),
+                ...(taskDescriptionSnapshot ? { taskDescription: taskDescriptionSnapshot } : {}),
+                role: 'performer',
+                pendingPayout: true,
+                razorpayOrderId: escrow.razorpayOrderId,
+                amountInRupees: escrow.amountInRupees.toString(),
+                escrowStatus: escrow.status,
+                taskAmount: taskAmount.toString(),
+                platformFee: finalPlatformFee.toString(),
+                gstAmount: finalGst.toString(),
+                totalPaid: totalPaid.toString(),
+                posterUid: escrow.posterUid,
+                performerUid: escrow.performerUid,
+                heldAt: escrow.heldAt?.toISOString() ?? undefined,
+                ...partySnapshotPerformer,
+              },
+            },
+            pendingEarningsDate,
+            { paidAt: escrow.heldAt?.toISOString() ?? pendingEarningsDate }
+          )
+        );
       }
 
       // Payouts from this escrow (money earned)
@@ -332,56 +630,66 @@ export async function getUserTransactions(
           const penaltyDeducted = payoutMetadata.penaltyDeducted || '0.00';
           const penaltyLines = Array.isArray(payoutMetadata.penaltyLines) ? payoutMetadata.penaltyLines : [];
           
-          transactions.push({
-            id: payout.id,
-            transactionId: payout.payoutId,
-            type: 'payout',
-            amount: payout.netAmount.toString(),
-            status: payout.status,
-            description: taskTitleSnapshot
-              ? `Money received — ${taskTitleSnapshot.length > 100 ? `${taskTitleSnapshot.slice(0, 97)}...` : taskTitleSnapshot}`
-              : `Money received from task ${escrow.taskId}`,
-            date: payout.createdAt.toISOString(),
-            relatedEntityId: payout.escrowId || undefined,
-            category: 'earnings', // Money received
-            metadata: {
-              taskId: escrow.taskId,
-              ...(taskTitleSnapshot
-                ? {
-                    taskTitle: taskTitleSnapshot,
-                    taskTitleSnapshot,
-                  }
-                : {}),
-              ...(taskCategorySnapshot
-                ? { taskCategory: taskCategorySnapshot, taskCategorySnapshot }
-                : {}),
-              ...(taskDescriptionSnapshot ? { taskDescription: taskDescriptionSnapshot } : {}),
-              taskAmount: payout.amount.toString(),
-              totalPaid: payout.amount.toString(),
-              grossAmount: payout.amount.toString(),
-              platformFee: payout.platformCommission.toString(),
-              platformFeeGst: payout.gstOnCommission.toString(),
-              gstAmount: payout.gstOnCommission.toString(),
-              platformCommission: payout.platformCommission.toString(),
-              gstOnCommission: payout.gstOnCommission.toString(),
-              tds: payout.tds?.toString() || '0',
-              netAmount: payout.netAmount.toString(),
-              amountBreakdown: {
-                taskAmount: payout.amount.toString(),
-                platformFee: payout.platformCommission.toString(),
-                gst: payout.gstOnCommission.toString(),
-                totalDeductions: payout.platformCommission
-                  .add(payout.gstOnCommission)
-                  .add(payout.tds || 0)
-                  .toString(),
-                netAmount: payout.netAmount.toString(),
+          const payoutDate = (payout.completedAt ?? payout.createdAt).toISOString();
+          const partySnapshotPayout = partySnapshotFromEscrowMeta(em);
+          transactions.push(
+            withTransactionTimestamps(
+              {
+                id: payout.id,
+                transactionId: payout.payoutId,
+                type: 'payout',
+                amount: payout.netAmount.toString(),
+                status: payout.status,
+                description: taskTitleSnapshot
+                  ? `Money received — ${taskTitleSnapshot.length > 100 ? `${taskTitleSnapshot.slice(0, 97)}...` : taskTitleSnapshot}`
+                  : `Money received from task ${escrow.taskId}`,
+                date: payoutDate,
+                relatedEntityId: payout.escrowId || undefined,
+                category: 'earnings', // Money received
+                metadata: {
+                  taskId: escrow.taskId,
+                  ...(taskTitleSnapshot
+                    ? {
+                        taskTitle: taskTitleSnapshot,
+                        taskTitleSnapshot,
+                      }
+                    : {}),
+                  ...(taskCategorySnapshot
+                    ? { taskCategory: taskCategorySnapshot, taskCategorySnapshot }
+                    : {}),
+                  ...(taskDescriptionSnapshot ? { taskDescription: taskDescriptionSnapshot } : {}),
+                  taskAmount: payout.amount.toString(),
+                  totalPaid: payout.amount.toString(),
+                  grossAmount: payout.amount.toString(),
+                  platformFee: payout.platformCommission.toString(),
+                  platformFeeGst: payout.gstOnCommission.toString(),
+                  gstAmount: payout.gstOnCommission.toString(),
+                  platformCommission: payout.platformCommission.toString(),
+                  gstOnCommission: payout.gstOnCommission.toString(),
+                  tds: payout.tds?.toString() || '0',
+                  netAmount: payout.netAmount.toString(),
+                  amountBreakdown: {
+                    taskAmount: payout.amount.toString(),
+                    platformFee: payout.platformCommission.toString(),
+                    gst: payout.gstOnCommission.toString(),
+                    totalDeductions: payout.platformCommission
+                      .add(payout.gstOnCommission)
+                      .add(payout.tds || 0)
+                      .toString(),
+                    netAmount: payout.netAmount.toString(),
+                  },
+                  penaltyDeducted: penaltyDeducted,
+                  penaltyLines: penaltyLines,
+                  penaltiesAppliedAt: payoutMetadata.penaltiesAppliedAt || null,
+                  posterUid: escrow.posterUid,
+                  performerUid: escrow.performerUid,
+                  role: 'performer',
+                  ...partySnapshotPayout,
+                },
               },
-              penaltyDeducted: penaltyDeducted,
-              penaltyLines: penaltyLines,
-              penaltiesAppliedAt: payoutMetadata.penaltiesAppliedAt || null,
-              posterUid: escrow.posterUid,
-            }
-          });
+              payoutDate
+            )
+          );
         }
       });
 
@@ -521,24 +829,6 @@ export async function getUserTransactions(
     // Include payouts that are not linked to an escrow (RazorpayX-only flow)
     if (!typeFilter || typeFilter === 'payout') {
       try {
-        const standalonePayouts = await prisma.payout.findMany({
-          where: {
-            performerUid: { in: uidList },
-            escrowId: null,
-            ...(statusFilter ? { status: statusFilter } : {}),
-            ...(startDate || endDate
-              ? {
-                  createdAt: {
-                    ...(startDate ? { gte: startDate } : {}),
-                    ...(endDate ? { lte: endDate } : {}),
-                  },
-                }
-              : {}),
-          },
-          orderBy: { createdAt: 'desc' },
-          take: fetchLimit,
-        });
-
         standalonePayouts.forEach((payout) => {
           const payoutStandaloneMeta = (payout as { metadata?: unknown }).metadata;
           const pm =
@@ -678,6 +968,7 @@ export async function getTransactionSummary(
     totalRefunds: string;
     totalCompensation: string;
     totalFees: string;
+    totalSpent: string;
     netEarnings: string;
     transactionCount: number;
   };

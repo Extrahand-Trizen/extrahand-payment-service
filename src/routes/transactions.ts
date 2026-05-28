@@ -15,6 +15,12 @@ const router = express.Router();
 router.use(serviceAuthMiddleware);
 
 /**
+ * POST /api/v1/transactions/issue-grants
+ * Issue idempotent ExtraCoin grants (service-auth).
+ */
+router.post('/issue-grants', asyncHandler(TransactionController.issueGrants));
+
+/**
  * GET /api/v1/transactions/:userId
  * Get all transactions for a user
  * Query params: limit, offset, startDate, endDate, type, status, category
@@ -33,13 +39,6 @@ router.get('/:userId/wallet', asyncHandler(TransactionController.getExtraCoinsWa
  * Query params: startDate, endDate (ISO date strings)
  */
 router.get('/:userId/summary', asyncHandler(TransactionController.getTransactionSummary));
-
-/**
- * POST /api/v1/transactions/award-referral-coins
- * Award ExtraCoins for referral events (signup bonus or task completion bonus).
- * Called by user-service via service auth.
- */
-router.post('/award-referral-coins', asyncHandler(TransactionController.awardReferralCoins));
 
 export default router;
 

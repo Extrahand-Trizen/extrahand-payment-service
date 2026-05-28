@@ -34,6 +34,13 @@ export type EscrowSnapshotMergeOptions = {
   taskCategory?: string | null;
 };
 
+function normalizePersonNameSnapshot(raw: unknown, maxLen = 200): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const t = raw.trim();
+  if (!t.length) return undefined;
+  return t.length > maxLen ? t.slice(0, maxLen) : t;
+}
+
 /**
  * Merges client metadata with server-enforced snapshot fields (version, capturedAt, title/category aliases).
  */
@@ -53,6 +60,18 @@ export function buildEscrowMetadataSnapshot(
 
   const description = normalizeDescriptionSnapshot(metadata.taskDescription);
 
+  const performerName =
+    normalizePersonNameSnapshot(metadata.performerNameSnapshot) ??
+    normalizePersonNameSnapshot(metadata.performerName) ??
+    normalizePersonNameSnapshot(metadata.taskerName) ??
+    normalizePersonNameSnapshot(metadata.assigneeName) ??
+    normalizePersonNameSnapshot(metadata.helperName);
+  const posterName =
+    normalizePersonNameSnapshot(metadata.posterNameSnapshot) ??
+    normalizePersonNameSnapshot(metadata.posterName) ??
+    normalizePersonNameSnapshot(metadata.customerName) ??
+    normalizePersonNameSnapshot(metadata.requesterName);
+
   return {
     ...metadata,
     ...(title
@@ -68,6 +87,22 @@ export function buildEscrowMetadataSnapshot(
         }
       : {}),
     ...(description ? { taskDescription: description } : {}),
+    ...(performerName
+      ? {
+          performerName,
+          performerNameSnapshot: performerName,
+          taskerName: performerName,
+          assigneeName: performerName,
+        }
+      : {}),
+    ...(posterName
+      ? {
+          posterName,
+          posterNameSnapshot: posterName,
+          customerName: posterName,
+          requesterName: posterName,
+        }
+      : {}),
     snapshotVersion: ESCROW_SNAPSHOT_VERSION,
     capturedAt: new Date().toISOString(),
   };

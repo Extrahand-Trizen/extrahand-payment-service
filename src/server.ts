@@ -2,6 +2,7 @@ import { createApp } from './app';
 import { validateEnv } from './config/env';
 import logger from './config/logger';
 import { connectDatabase, disconnectDatabase } from './config/database';
+import { validatePaymentRewardsConfiguration } from './config/rewardsFlags';
 // Payouts/escrow release/auto-release disabled - handled elsewhere
 // import { startAutoReleaseScheduler, stopAutoReleaseScheduler } from './services/autoReleaseScheduler';
 
@@ -10,6 +11,8 @@ const env = validateEnv();
 async function startServer() {
   logger.info('Starting payment service...');
   try {
+    validatePaymentRewardsConfiguration();
+
     // Create Express app first
     const app = createApp();
     logger.info('Express app created, binding to 0.0.0.0');
@@ -20,6 +23,9 @@ async function startServer() {
       logger.info(`🚀 Payment Service running on 0.0.0.0:${port}`);
       logger.info(`📝 Environment: ${env.NODE_ENV}`);
       logger.info(`🔗 Health: http://localhost:${port}/api/v1/health`);
+      logger.info(
+        '[REFERRAL_COINS] payment-service ready — issue-grants logs use tag [REFERRAL_COINS]'
+      );
       logger.info(`💳 Razorpay Key ID: ${env.RAZORPAY_KEY_ID.substring(0, 10)}...`);
       if (env.NODE_ENV === 'production') {
         logger.info(`⚠️ CapRover: set "Container HTTP Port" to ${port} to avoid 502`);

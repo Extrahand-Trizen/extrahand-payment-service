@@ -27,6 +27,7 @@ const envSchema = z.object({
   SERVICE_AUTH_TOKEN: z.string().min(1, 'SERVICE_AUTH_TOKEN is required').optional(),
 
   TASK_SERVICE_URL: z.string().url(),
+  USER_SERVICE_URL: z.string().url().default('http://localhost:4001'),
   
   // Logging
   LOG_LEVEL: z.enum(['error', 'warn', 'info', 'debug']).default('info'),

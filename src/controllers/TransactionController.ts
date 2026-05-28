@@ -1,8 +1,11 @@
 import { Response, Request } from 'express';
 import { getUserTransactions, getTransactionSummary } from '../services/transactionHistoryService';
-import { getExtraCoinsWallet, awardReferralSignupCoins, awardReferralTaskBonus } from '../services/extraCoinsService';
-import { Prisma } from '@prisma/client';
+import { getExtraCoinsWallet } from '../services/extraCoinsService';
+import { issueGrants } from '../rewards/grants/GrantExecutor';
+import type { GrantSpec } from '../rewards/types/GrantSpec';
 import { BadRequestError } from '../errors/AppError';
+import { logPaymentReferralCoins } from '../rewards/referralCoinsLogger';
+import { parseWalletRole } from '../rewards/utils/walletRole';
 
 export class TransactionController {
   /**
@@ -91,7 +94,7 @@ export class TransactionController {
    */
   static async getExtraCoinsWallet(req: Request, res: Response): Promise<void> {
     const { userId } = req.params;
-    const { linkedUserIds } = req.query;
+    const { linkedUserIds, walletRole } = req.query;
 
     if (!userId) {
       throw new BadRequestError('User ID is required');
@@ -105,7 +108,11 @@ export class TransactionController {
             .filter(Boolean)
         : undefined;
 
-    const result = await getExtraCoinsWallet(userId, linkedParsed);
+    const result = await getExtraCoinsWallet(
+      userId,
+      linkedParsed,
+      parseWalletRole(walletRole)
+    );
 
     if (!result.success) {
       throw new Error(result.error || 'Failed to get ExtraCoins wallet');
@@ -118,39 +125,30 @@ export class TransactionController {
   }
 
   /**
-   * POST /api/v1/transactions/award-referral-coins
-   * Award ExtraCoins for referral signup or task completion.
-   * Body: { type: 'signup' | 'task_bonus', referrerUid, refereeUid, referralCode, platformFeeRupees?, taskId? }
+   * POST /api/v1/transactions/issue-grants
    */
-  static async awardReferralCoins(req: Request, res: Response): Promise<void> {
-    const { type, referrerUid, refereeUid, referralCode, platformFeeRupees, taskId } = req.body;
-
-    if (!type || !referrerUid || !refereeUid || !referralCode) {
-      throw new BadRequestError('type, referrerUid, refereeUid, referralCode are required');
+  static async issueGrants(req: Request, res: Response): Promise<void> {
+    const { grants } = req.body as { grants?: GrantSpec[] };
+    if (!Array.isArray(grants) || grants.length === 0) {
+      throw new BadRequestError('grants array is required');
     }
-
-    if (type === 'signup') {
-      const result = await awardReferralSignupCoins({ referrerUid, refereeUid, referralCode });
-      res.json(result);
-      return;
-    }
-
-    if (type === 'task_bonus') {
-      if (!taskId || !platformFeeRupees) {
-        throw new BadRequestError('taskId and platformFeeRupees are required for task_bonus');
-      }
-      const result = await awardReferralTaskBonus({
-        referrerUid,
-        refereeUid,
-        taskId,
-        platformFeeRupees: new Prisma.Decimal(String(platformFeeRupees)),
-        referralCode,
-      });
-      res.json(result);
-      return;
-    }
-
-    throw new BadRequestError(`Unknown type: ${type}`);
+    logPaymentReferralCoins('issue_grants_request', {
+      grantCount: grants.length,
+      recipients: grants.map((g) => ({
+        recipientUid: g.recipientUid,
+        walletRole: g.walletRole || 'tasker',
+        coins: g.coins,
+        source: g.metadata?.source,
+        idempotencyKey: g.idempotencyKey,
+      })),
+    });
+    const result = await issueGrants(grants);
+    logPaymentReferralCoins('issue_grants_response', {
+      success: result.success,
+      partial: result.partial,
+      results: result.results,
+    }, result.success && !result.partial ? 'info' : 'warn');
+    res.json(result);
   }
 }
 

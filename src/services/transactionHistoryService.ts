@@ -271,10 +271,9 @@ export async function getUserTransactions(
       escrowWhere.status = statusFilter;
     }
 
-    // For proper pagination, we need to fetch more escrows initially
-    // but we'll apply category/type filters at database level where possible
-    // Fetch more to account for filtering (but not too many - use reasonable limit)
-    const fetchLimit = Math.min(limit * 3, 500); // Cap at 500 to prevent memory issues
+    // Keep a small headroom for post-merge in-memory filters/dedupe without
+    // allowing unbounded overfetch windows under high traffic.
+    const fetchLimit = Math.min(Math.max(limit + 20, 50), 120);
 
     const escrows = await prisma.escrow.findMany({
       where: escrowWhere,
@@ -904,7 +903,7 @@ export async function getUserTransactions(
     // But we've already applied status filter at database level where possible
     let filteredTransactions = dedupedTransactions;
 
-    logger.info(`[TransactionHistory] Total transactions before filtering: ${filteredTransactions.length}`);
+    logger.debug(`[TransactionHistory] Total transactions before filtering: ${filteredTransactions.length}`);
     
     // Apply category filter (earnings/payments) - in memory due to complexity
     if (categoryFilter && categoryFilter !== 'all') {

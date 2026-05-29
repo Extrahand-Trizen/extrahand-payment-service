@@ -7,7 +7,7 @@ WORKDIR /app
 
 # Copy package file (no package-lock.json - see .gitignore)
 COPY package.json ./
-
+COPY package-lock.json ./
 # Install dependencies (including devDependencies for build)
 RUN npm install --include=dev
 

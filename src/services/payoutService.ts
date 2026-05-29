@@ -29,6 +29,17 @@ function generatePayoutId(): string {
   return `payout_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
 }
 
+/** Skip RazorpayX API; queue payout for operations portal / manual transfer. */
+function isPayoutManualOpsMode(): boolean {
+  const raw = process.env.PAYOUT_MANUAL_OPS_MODE;
+  return raw === 'true' || raw === '1';
+}
+
+function payoutMetadataIndicatesManualOps(metadata: unknown): boolean {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return false;
+  return (metadata as Record<string, unknown>).payoutMode === 'manual_ops';
+}
+
 async function ensureExtraCoinsAwardedForTaskCompletionPayout(params: {
   payoutId: string;
   performerUid: string;
@@ -904,6 +915,7 @@ export async function processTaskCompletionPayout(params: {
           netAmount: existing.netAmount.toString(),
           status: existing.status,
           completedAt: existing.completedAt,
+          manualOps: payoutMetadataIndicatesManualOps(existing.metadata),
         },
       };
     }
@@ -939,7 +951,7 @@ export async function processTaskCompletionPayout(params: {
     }
 
     const { fundAccountId } = parseVerificationRef(selectedBankAccount.verificationRef);
-    if (!fundAccountId) {
+    if (!fundAccountId && !isPayoutManualOpsMode()) {
       if (enqueueOnMissingBank) {
         await enqueuePendingTaskCompletionPayout({ taskId, performerUid, amount, taskTitle });
       }
@@ -1152,6 +1164,7 @@ export async function processTaskCompletionPayout(params: {
     });
 
     let status: string = 'completed';
+    let recordedManualOps = false;
 
     if (netAmount.lte(0)) {
       status = 'completed';
@@ -1189,7 +1202,60 @@ export async function processTaskCompletionPayout(params: {
         payoutId,
         deductionLineCount: penaltyPlan.lines.length,
       });
+    } else if (isPayoutManualOpsMode()) {
+      status = 'processing';
+      recordedManualOps = true;
+      const postgresEscrowId = taskEscrow?.id ?? null;
+      const manualMetadata = {
+        ...metadataPayload,
+        payoutMode: 'manual_ops',
+        manualOpsRequestedAt: new Date().toISOString(),
+        fundAccountId: fundAccountId || null,
+        bankAccountId: paymentProfile.defaultBankAccountId,
+        bankAccountLast4: selectedBankAccount.accountNumber?.slice(-4) || null,
+        bankIfsc: selectedBankAccount.ifscCode || null,
+        penaltiesAppliedAt:
+          penaltyPlan.lines.length > 0 ? new Date().toISOString() : metadataPayload.penaltiesAppliedAt,
+      };
+
+      await prisma.$transaction(async (tx) => {
+        await tx.payout.create({
+          data: {
+            payoutId,
+            escrowId: postgresEscrowId,
+            performerUid,
+            amount: grossAmount,
+            netAmount,
+            platformCommission,
+            gstOnCommission,
+            tds,
+            bankTransferId: null,
+            status,
+            type: 'task_completion',
+            description: duplicateDescription,
+            metadata: manualMetadata as Prisma.InputJsonValue,
+          },
+        });
+        if (penaltyPlan.lines.length > 0) {
+          await applyPenaltyLinesInTx(tx, penaltyPlan.lines);
+        }
+      });
+
+      logger.info('[payoutService] Manual ops payout request stored (RazorpayX skipped)', {
+        performerUid,
+        taskId,
+        payoutId,
+        netAmount: netAmount.toString(),
+        escrowId: taskEscrow?.escrowId,
+      });
     } else {
+      if (!fundAccountId) {
+        return {
+          success: false,
+          requiresBankAccount: true,
+          error: 'Selected bank account is not linked to RazorpayX fund account',
+        };
+      }
       logger.debug('[payoutService] Creating RazorpayX payout with penalty deduction applied', {
         performerUid,
         taskId,
@@ -1301,6 +1367,7 @@ export async function processTaskCompletionPayout(params: {
         amount: grossAmount.toString(),
         netAmount: netAmount.toString(),
         status,
+        manualOps: recordedManualOps,
         penaltyDeducted: totalPenaltyDeducted.toString(),
         extraCoinsBonus: redeemedRupees.toString(),
         extraCoinsBonusCoins: redeemedCoins.toString(),
@@ -1577,6 +1644,8 @@ export async function getPayoutsByEscrowId(escrowId: string): Promise<{
         description: payout.description,
         createdAt: payout.createdAt,
         completedAt: payout.completedAt,
+        manualOps: payoutMetadataIndicatesManualOps(payout.metadata),
+        metadata: payout.metadata,
       })),
     };
   } catch (error: any) {

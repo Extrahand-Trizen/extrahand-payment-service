@@ -27,6 +27,9 @@ async function startServer() {
         '[REFERRAL_COINS] payment-service ready — issue-grants logs use tag [REFERRAL_COINS]'
       );
       logger.info(`💳 Razorpay Key ID: ${env.RAZORPAY_KEY_ID.substring(0, 10)}...`);
+      if (env.PAYOUT_MANUAL_OPS_MODE) {
+        logger.info('PAYOUT_MANUAL_OPS_MODE enabled — task payouts queued for operations (RazorpayX skipped)');
+      }
       if (env.NODE_ENV === 'production') {
         logger.info(`⚠️ CapRover: set "Container HTTP Port" to ${port} to avoid 502`);
       }

@@ -46,6 +46,15 @@ const envSchema = z.object({
   PLAY_REVIEW_BYPASS_PHONES: z.string().optional(),
   /** Optional: poster Firebase UIDs that skip Razorpay on escrow create (Play review / demo). */
   PLAY_REVIEW_BYPASS_UIDS: z.string().optional(),
+
+  /**
+   * When true, task-completion payouts are recorded as processing in DB without calling RazorpayX.
+   * Operations team completes transfers manually until live payout API is enabled.
+   */
+  PAYOUT_MANUAL_OPS_MODE: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true' || v === '1'),
 });
 
 export function validateEnv() {

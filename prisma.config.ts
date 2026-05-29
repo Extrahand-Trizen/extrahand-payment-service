@@ -1,5 +1,8 @@
 import "dotenv/config";
-import { defineConfig, env } from "prisma/config";
+import { defineConfig } from "prisma/config";
+
+const buildTimeFallback =
+  "postgresql://build:build@127.0.0.1:5432/build";
 
 export default defineConfig({
   schema: "prisma/schema.prisma",
@@ -7,6 +10,7 @@ export default defineConfig({
     path: "prisma/migrations",
   },
   datasource: {
-    url: env("POSTGRESDB_URI"),
+    // env() throws during Docker build when POSTGRESDB_URI is unset; use process.env.
+    url: process.env.POSTGRESDB_URI ?? buildTimeFallback,
   },
 });

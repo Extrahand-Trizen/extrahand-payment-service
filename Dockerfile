@@ -3,6 +3,8 @@
 # Stage 1: Dependencies
 FROM node:20-alpine AS dependencies
 
+RUN apk add --no-cache openssl
+
 WORKDIR /app
 
 COPY package.json package-lock.json ./
@@ -11,6 +13,8 @@ RUN npm ci
 # Stage 2: Build
 FROM node:20-alpine AS build
 
+RUN apk add --no-cache openssl
+
 WORKDIR /app
 
 COPY --from=dependencies /app/node_modules ./node_modules
@@ -18,13 +22,14 @@ COPY package.json package-lock.json tsconfig.json prisma.config.ts ./
 COPY prisma ./prisma
 COPY src ./src
 
-# Prisma 7 loads prisma.config.ts for every CLI command; POSTGRESDB_URI is not
-# available at image build time (.env excluded). Dummy URL is enough for generate.
-RUN POSTGRESDB_URI="postgresql://build:build@127.0.0.1:5432/build" npx prisma generate
+ENV POSTGRESDB_URI=postgresql://build:build@127.0.0.1:5432/build
+RUN npx prisma generate
 RUN npm run build
 
 # Stage 3: Production
 FROM node:20-alpine AS production
+
+RUN apk add --no-cache openssl
 
 ENV NODE_ENV=production
 
@@ -34,6 +39,8 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
 COPY prisma ./prisma
+# Generated client lands in @prisma/client (and .prisma) — copy both from build.
+COPY --from=build /app/node_modules/@prisma/client ./node_modules/@prisma/client
 COPY --from=build /app/node_modules/.prisma ./node_modules/.prisma
 COPY --from=build /app/dist ./dist
 

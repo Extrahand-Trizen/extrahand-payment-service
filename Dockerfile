@@ -14,12 +14,13 @@ FROM node:20-alpine AS build
 WORKDIR /app
 
 COPY --from=dependencies /app/node_modules ./node_modules
-COPY package.json package-lock.json tsconfig.json ./
+COPY package.json package-lock.json tsconfig.json prisma.config.ts ./
 COPY prisma ./prisma
 COPY src ./src
 
-# Single prisma generate (copied into production stage)
-RUN npx prisma generate
+# Prisma 7 loads prisma.config.ts for every CLI command; POSTGRESDB_URI is not
+# available at image build time (.env excluded). Dummy URL is enough for generate.
+RUN POSTGRESDB_URI="postgresql://build:build@127.0.0.1:5432/build" npx prisma generate
 RUN npm run build
 
 # Stage 3: Production

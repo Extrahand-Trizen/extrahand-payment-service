@@ -6,8 +6,7 @@ FROM node:20-alpine AS dependencies
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-RUN --mount=type=cache,target=/root/.npm \
-    npm ci
+RUN npm ci
 
 # Stage 2: Build
 FROM node:20-alpine AS build
@@ -26,12 +25,12 @@ RUN npm run build
 # Stage 3: Production
 FROM node:20-alpine AS production
 
+ENV NODE_ENV=production
 
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-RUN --mount=type=cache,target=/root/.npm \
-    npm ci --omit=dev && npm cache clean --force
+RUN npm ci --omit=dev && npm cache clean --force
 
 COPY prisma ./prisma
 COPY --from=build /app/node_modules/.prisma ./node_modules/.prisma

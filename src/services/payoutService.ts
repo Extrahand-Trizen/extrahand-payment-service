@@ -32,7 +32,9 @@ function generatePayoutId(): string {
 /** Skip RazorpayX API; queue payout for operations portal / manual transfer. */
 function isPayoutManualOpsMode(): boolean {
   const raw = process.env.PAYOUT_MANUAL_OPS_MODE;
-  return raw === 'true' || raw === '1';
+  if (raw === 'false' || raw === '0') return false;
+  if (raw === 'true' || raw === '1') return true;
+  return process.env.NODE_ENV === 'production';
 }
 
 function payoutMetadataIndicatesManualOps(metadata: unknown): boolean {
@@ -1651,6 +1653,116 @@ export async function getPayoutsByEscrowId(escrowId: string): Promise<{
   } catch (error: any) {
     logger.error('❌ Error getting payouts by escrow ID:', error);
     return { success: false, error: error.message || 'Failed to get payouts' };
+  }
+}
+
+function mapPayoutToOpsQueueRow(payout: {
+  payoutId: string;
+  taskId: string | null;
+  performerUid: string;
+  amount: Prisma.Decimal;
+  netAmount: Prisma.Decimal;
+  platformCommission: Prisma.Decimal;
+  gstOnCommission: Prisma.Decimal;
+  tds: Prisma.Decimal | null;
+  status: string;
+  description: string | null;
+  metadata: Prisma.JsonValue | null;
+  createdAt: Date;
+  updatedAt: Date;
+  escrow?: { escrowId: string; taskId: string | null } | null;
+}) {
+  const metadata =
+    payout.metadata && typeof payout.metadata === 'object' && !Array.isArray(payout.metadata)
+      ? (payout.metadata as Record<string, unknown>)
+      : {};
+
+  return {
+    payoutId: payout.payoutId,
+    taskId: typeof metadata.taskId === 'string' ? metadata.taskId : payout.taskId,
+    taskTitle: typeof metadata.taskTitle === 'string' ? metadata.taskTitle : null,
+    performerUid: payout.performerUid,
+    amount: payout.amount.toString(),
+    netAmount: payout.netAmount.toString(),
+    platformCommission: payout.platformCommission.toString(),
+    gstOnCommission: payout.gstOnCommission.toString(),
+    tds: payout.tds?.toString() ?? '0',
+    status: payout.status,
+    manualOps: payoutMetadataIndicatesManualOps(payout.metadata),
+    bankAccountLast4:
+      typeof metadata.bankAccountLast4 === 'string' ? metadata.bankAccountLast4 : null,
+    bankIfsc: typeof metadata.bankIfsc === 'string' ? metadata.bankIfsc : null,
+    manualOpsRequestedAt:
+      typeof metadata.manualOpsRequestedAt === 'string' ? metadata.manualOpsRequestedAt : null,
+    useExtraCoins: metadata.useExtraCoins === true,
+    requestedCoinRedeemRupees:
+      metadata.requestedCoinRedeemRupees != null
+        ? String(metadata.requestedCoinRedeemRupees)
+        : null,
+    escrowId: payout.escrow?.escrowId ?? null,
+    description: payout.description,
+    createdAt: payout.createdAt.toISOString(),
+    updatedAt: payout.updatedAt.toISOString(),
+  };
+}
+
+/**
+ * List payout requests queued for manual operations processing (ops portal).
+ */
+export async function listManualOpsPayoutQueue(params?: {
+  status?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<{
+  success: boolean;
+  payouts?: ReturnType<typeof mapPayoutToOpsQueueRow>[];
+  total?: number;
+  error?: string;
+}> {
+  try {
+    if (!isPostgresConnected()) {
+      return { success: false, error: 'Postgres not connected' };
+    }
+
+    const status = String(params?.status || 'processing').trim().toLowerCase();
+    const limit = Math.min(Math.max(Number(params?.limit ?? 50) || 50, 1), 200);
+    const offset = Math.max(Number(params?.offset ?? 0) || 0, 0);
+
+    const where = {
+      type: 'task_completion',
+      status,
+      metadata: {
+        path: ['payoutMode'],
+        equals: 'manual_ops',
+      },
+    } as const;
+
+    const [rows, total] = await Promise.all([
+      prisma.payout.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        take: limit,
+        skip: offset,
+        include: {
+          escrow: {
+            select: { escrowId: true, taskId: true },
+          },
+        },
+      }),
+      prisma.payout.count({ where }),
+    ]);
+
+    return {
+      success: true,
+      payouts: rows.map(mapPayoutToOpsQueueRow),
+      total,
+    };
+  } catch (error: any) {
+    logger.error('Error listing manual ops payout queue', error);
+    return {
+      success: false,
+      error: error.message || 'Failed to list manual ops payout queue',
+    };
   }
 }
 

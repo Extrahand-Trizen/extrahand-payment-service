@@ -4,6 +4,7 @@ import {
   getPayoutStatus,
   getPayoutsByEscrowId,
   processTaskCompletionPayout,
+  listManualOpsPayoutQueue,
 } from '../services/payoutService';
 import { BadRequestError, NotFoundError } from '../errors/AppError';
 
@@ -102,7 +103,11 @@ export class PayoutController {
       amount: result.payout?.amount,
       netAmount: result.payout?.netAmount,
       fees: result.payout?.fees,
-      message: 'Payout processed for task completion',
+      manualOps: result.payout?.manualOps === true,
+      message:
+        result.payout?.manualOps || result.payout?.status === 'processing'
+          ? 'Payout request queued for manual processing'
+          : 'Payout processed for task completion',
     });
   }
 
@@ -149,6 +154,30 @@ export class PayoutController {
     res.json({
       success: true,
       payouts: result.payouts,
+    });
+  }
+
+  /**
+   * GET /api/v1/payouts/ops/manual-queue
+   * List payout requests queued for manual operations processing.
+   */
+  static async listManualOpsQueue(req: Request, res: Response): Promise<void> {
+    const status = typeof req.query.status === 'string' ? req.query.status : 'processing';
+    const limit =
+      typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined;
+    const offset =
+      typeof req.query.offset === 'string' ? Number(req.query.offset) : undefined;
+
+    const result = await listManualOpsPayoutQueue({ status, limit, offset });
+
+    if (!result.success) {
+      throw new BadRequestError(result.error || 'Failed to list payout queue');
+    }
+
+    res.json({
+      success: true,
+      payouts: result.payouts ?? [],
+      total: result.total ?? 0,
     });
   }
 }

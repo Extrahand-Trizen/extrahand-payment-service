@@ -50,11 +50,16 @@ const envSchema = z.object({
   /**
    * When true, task-completion payouts are recorded as processing in DB without calling RazorpayX.
    * Operations team completes transfers manually until live payout API is enabled.
+   * Defaults to true in production when unset.
    */
   PAYOUT_MANUAL_OPS_MODE: z
     .string()
     .optional()
-    .transform((v) => v === 'true' || v === '1'),
+    .transform((v) => {
+      if (v === 'false' || v === '0') return false;
+      if (v === 'true' || v === '1') return true;
+      return process.env.NODE_ENV === 'production';
+    }),
 });
 
 export function validateEnv() {

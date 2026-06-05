@@ -277,20 +277,26 @@ model Reconciliation {
 model BankAccount {
   id                String    @id @default(uuid())
   userId            String // User UID (reference only, no FK - user data in User Service)
-  accountNumber     String // Encrypted or masked (last 4 digits visible)
+  accountNumber     String // Masked display only (XXXX1234) for tasker-facing APIs
   ifscCode          String
   bankName          String
-  accountHolderName String
+  accountHolderName String // Masked display for tasker-facing APIs
+  /** AES-256-GCM ciphertext (base64 envelope). Full number for admin/ops decrypt only. */
+  accountNumberEncrypted    String? @db.Text
+  accountHolderNameEncrypted String? @db.Text
+  accountNumberLast4        String?
+  encryptionKeyVersion      String? @default("v1")
   isVerified        Boolean   @default(false)
   isDefault         Boolean   @default(false)
   verifiedAt        DateTime?
-  verificationRef   String? // Reference from bank verification service
+  verificationRef   String? // RazorpayX contactId + fundAccountId JSON
   createdAt         DateTime  @default(now())
   updatedAt         DateTime  @updatedAt
 
   // Duplicates are allowed intentionally to support repeated account onboarding entries.
   // The app layer can still apply business checks if needed.
   @@index([userId, accountNumber, ifscCode])
+  @@index([userId, accountNumberLast4])
   @@index([userId])
   @@index([userId, isDefault])
 }

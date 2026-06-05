@@ -11,6 +11,7 @@ import { createLedgerEntry, getEscrowBalance } from './ledgerService';
 import { Prisma } from '@prisma/client';
 import { EmailServiceClient } from '../clients/EmailServiceClient';
 import { InAppNotificationClient } from '../clients/InAppNotificationClient';
+import { fireWhatsAppNotify } from '../clients/WhatsAppClient';
 import { logEscrowCreated, logPaymentCaptured, logPaymentFailed } from './auditLogService';
 import mongoose from 'mongoose';
 import { buildEscrowMetadataSnapshot, getTaskDisplayTitleFromEscrow } from '../utils/escrowMetadataSnapshot';
@@ -892,6 +893,41 @@ export async function releaseEscrow(
                 actionUrl: '/profile?section=payments'
               }
             });
+
+            fireWhatsAppNotify({
+              uid: postgresEscrow.performerUid,
+              templateKey: 'wa_earnings_credited',
+              category: 'payments',
+              templateBody: {
+                var_1: amountStr,
+                var_2: getTaskDisplayTitleFromEscrow(postgresEscrow) || 'your task',
+              },
+              idempotencyKey: `escrow-released:${postgresEscrow.escrowId}`,
+              metadata: {
+                workId: postgresEscrow.taskId,
+                triggerType: 'escrow_released',
+                recipientRole: 'helper',
+              },
+            });
+
+            // Customer invoice ready — once per escrow after funds are released/settled.
+            if (postgresEscrow.posterUid) {
+              fireWhatsAppNotify({
+                uid: postgresEscrow.posterUid,
+                templateKey: 'wa_invoice_ready',
+                category: 'payments',
+                templateBody: {
+                  var_1: getTaskDisplayTitleFromEscrow(postgresEscrow) || 'your task',
+                },
+                idempotencyKey: `wa_invoice_ready:${postgresEscrow.escrowId}`,
+                metadata: {
+                  workId: postgresEscrow.taskId,
+                  invoiceId: postgresEscrow.escrowId,
+                  triggerType: 'invoice_ready',
+                  recipientRole: 'customer',
+                },
+              });
+            }
 
             // Email Notification
             if (performerProfile.email) {

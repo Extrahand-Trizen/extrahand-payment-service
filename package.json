@@ -16,7 +16,10 @@
     "prod": "NODE_ENV=production node dist/server.js",
     "test": "echo \"No tests specified\" && exit 0",
     "lint": "eslint src --ext .ts",
-    "health": "curl -f http://localhost:4003/api/v1/health || exit 1"
+    "health": "curl -f http://localhost:4003/api/v1/health || exit 1",
+    "test:bank-crypto": "npm run build && node --test dist/utils/bankFieldCrypto.test.js",
+    "migrate:bank-encryption": "ts-node --require dotenv/config scripts/run-bank-encryption-migration.ts",
+    "sync:postgres-dev-to-prod": "ts-node --require dotenv/config scripts/sync-dev-postgres-to-prod.ts"
   },
   "engines": {
     "node": ">=18"

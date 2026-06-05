@@ -4,6 +4,7 @@ import { Prisma } from '@prisma/client';
 import { BadRequestError, NotFoundError } from '../errors/AppError';
 import { createRefundAmountPaise } from '../services/paymentService';
 import { createLedgerEntry, getEscrowBalance } from '../services/ledgerService';
+import { toAdminBankAccount } from '../services/bankAccountSecrets';
 
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
@@ -514,7 +515,11 @@ export class AdminFinanceController {
       prisma.bankAccount.findMany({ where: { userId: id }, orderBy: { createdAt: 'desc' } }),
     ]);
 
-    res.json({ success: true, profile, bankAccounts });
+    res.json({
+      success: true,
+      profile,
+      bankAccounts: bankAccounts.map((row) => toAdminBankAccount(row)),
+    });
   }
 
   static async getReconciliation(req: Request, res: Response): Promise<void> {

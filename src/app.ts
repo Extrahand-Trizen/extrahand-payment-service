@@ -11,6 +11,7 @@ import routes from './routes';
 import logger from './config/logger';
 import { EmailServiceClient } from './clients/EmailServiceClient';
 import { InAppNotificationClient } from './clients/InAppNotificationClient';
+import { WhatsAppClient } from './clients/WhatsAppClient';
 import { Fast2SMSClient } from './clients/Fast2SMSClient';
 
 const env = validateEnv();
@@ -18,6 +19,7 @@ const env = validateEnv();
 // Initialize service clients
 EmailServiceClient.initialize();
 InAppNotificationClient.initialize();
+WhatsAppClient.initialize();
 Fast2SMSClient.initialize();
 
 export function createApp(): Application {

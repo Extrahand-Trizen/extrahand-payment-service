@@ -21,6 +21,12 @@ import { getFeeStructure } from './feeConfigService';
 import { applyExtraCoinsForPayout, awardExtraCoinsForCompletedTask } from './extraCoinsService';
 import { paymentRewardsFlags } from '../config/rewardsFlags';
 import { CoinUsageConfigProvider } from '../rewards/config/CoinUsageConfigProvider';
+import {
+  buildEncryptedBankAccountPersistFields,
+  resolveDisplayLast4,
+  resolvePayoutBankDetails,
+  toAdminBankAccount,
+} from './bankAccountSecrets';
 
 /**
  * Generate unique payout ID
@@ -323,10 +329,18 @@ export async function processPayout(params: {
         };
       }
 
-      accountNumber = bankAccount.accountNumber;
-      ifscCode = bankAccount.ifscCode;
-      accountHolderName = bankAccount.accountHolderName;
-      bankName = bankAccount.bankName;
+      const resolved = resolvePayoutBankDetails(bankAccount);
+      if (!resolved) {
+        return {
+          success: false,
+          error:
+            'Stored bank account cannot be used for transfer (missing encrypted details). User should re-add bank account.',
+        };
+      }
+      accountNumber = resolved.accountNumber;
+      ifscCode = resolved.ifscCode;
+      accountHolderName = resolved.accountHolderName;
+      bankName = resolved.bankName;
     } else if (providedAccountNumber && providedIfscCode && providedAccountHolderName) {
       // Use provided account details (backward compatible)
       accountNumber = providedAccountNumber;
@@ -355,17 +369,27 @@ export async function processPayout(params: {
             },
           });
         } else {
-          await prisma.bankAccount.create({
-            data: {
-              id: `bank_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
-              userId: performerUid,
+          try {
+            const encryptedFields = buildEncryptedBankAccountPersistFields({
               accountNumber,
-              ifscCode,
               accountHolderName,
-              bankName: bankName || 'Unknown',
-              isVerified: false, // Would need verification in production
-            },
-          });
+            });
+            await prisma.bankAccount.create({
+              data: {
+                id: `bank_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
+                userId: performerUid,
+                ...encryptedFields,
+                ifscCode,
+                bankName: bankName || 'Unknown',
+                isVerified: false,
+              },
+            });
+          } catch (encryptError: unknown) {
+            logger.warn('Could not store encrypted bank account:', {
+              message:
+                encryptError instanceof Error ? encryptError.message : String(encryptError),
+            });
+          }
         }
       } catch (error: any) {
         // Log but don't fail - bank account storage is optional
@@ -383,10 +407,18 @@ export async function processPayout(params: {
         });
 
         if (bankAccount) {
-          accountNumber = bankAccount.accountNumber;
-          ifscCode = bankAccount.ifscCode;
-          accountHolderName = bankAccount.accountHolderName;
-          bankName = bankAccount.bankName;
+          const resolved = resolvePayoutBankDetails(bankAccount);
+          if (!resolved) {
+            return {
+              success: false,
+              error:
+                'Default bank account cannot be used for transfer (missing encrypted details). User should re-add bank account.',
+            };
+          }
+          accountNumber = resolved.accountNumber;
+          ifscCode = resolved.ifscCode;
+          accountHolderName = resolved.accountHolderName;
+          bankName = resolved.bankName;
         } else {
           return {
             success: false,
@@ -1214,7 +1246,7 @@ export async function processTaskCompletionPayout(params: {
         manualOpsRequestedAt: new Date().toISOString(),
         fundAccountId: fundAccountId || null,
         bankAccountId: paymentProfile.defaultBankAccountId,
-        bankAccountLast4: selectedBankAccount.accountNumber?.slice(-4) || null,
+        bankAccountLast4: resolveDisplayLast4(selectedBankAccount),
         bankIfsc: selectedBankAccount.ifscCode || null,
         penaltiesAppliedAt:
           penaltyPlan.lines.length > 0 ? new Date().toISOString() : metadataPayload.penaltiesAppliedAt,
@@ -1752,9 +1784,36 @@ export async function listManualOpsPayoutQueue(params?: {
       prisma.payout.count({ where }),
     ]);
 
+    const payouts = await Promise.all(
+      rows.map(async (payout) => {
+        const base = mapPayoutToOpsQueueRow(payout);
+        const metadata =
+          payout.metadata && typeof payout.metadata === 'object' && !Array.isArray(payout.metadata)
+            ? (payout.metadata as Record<string, unknown>)
+            : {};
+        const bankAccountId =
+          typeof metadata.bankAccountId === 'string' ? metadata.bankAccountId : null;
+        if (!bankAccountId) return base;
+
+        const bankRow = await prisma.bankAccount.findUnique({
+          where: { id: bankAccountId },
+        });
+        if (!bankRow) return base;
+
+        const adminBank = toAdminBankAccount(bankRow);
+        return {
+          ...base,
+          bankAccountNumber: adminBank.accountNumber,
+          bankAccountHolderName: adminBank.accountHolderName,
+          bankIfsc: adminBank.ifscCode ?? base.bankIfsc,
+          bankName: adminBank.bankName,
+        };
+      })
+    );
+
     return {
       success: true,
-      payouts: rows.map(mapPayoutToOpsQueueRow),
+      payouts,
       total,
     };
   } catch (error: any) {

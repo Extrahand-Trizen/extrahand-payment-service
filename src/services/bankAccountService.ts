@@ -5,7 +5,6 @@ import {
   createRazorpayXFundAccount,
   parseRazorpayApiError,
 } from './razorpayxService';
-import { processPendingTaskCompletionPayouts } from './payoutService';
 
 function maskAccountNumber(accountNumber: string): string {
   if (accountNumber.length <= 4) return accountNumber;
@@ -20,25 +19,6 @@ function maskAccountHolderName(name: string): string {
   const lastInitial = parts.length > 1 ? parts[parts.length - 1]?.[0] : '';
   const firstMasked = first.length <= 2 ? first[0] + '*' : first.slice(0, 2) + '*'.repeat(Math.min(6, first.length - 2));
   return lastInitial ? `${firstMasked} ${lastInitial}.` : firstMasked;
-}
-
-async function processPendingPayoutsAfterBankAdd(userId: string): Promise<void> {
-  return processPendingTaskCompletionPayouts(userId)
-    .then((result) => {
-      if (result.processed > 0 || result.failed > 0) {
-        logger.info('Processed pending task completion payouts after bank account add', {
-          userId,
-          processed: result.processed,
-          failed: result.failed,
-        });
-      }
-    })
-    .catch((error: any) => {
-      logger.warn('Failed to process pending payouts after bank account add', {
-        userId,
-        error: error?.message || 'Unknown error',
-      });
-    });
 }
 
 export async function upsertTaskerBankAccount(params: {
@@ -119,8 +99,6 @@ export async function upsertTaskerBankAccount(params: {
         },
       });
     }
-
-    await processPendingPayoutsAfterBankAdd(params.userId);
 
     return {
       success: true,

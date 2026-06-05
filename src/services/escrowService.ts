@@ -14,6 +14,9 @@ import { InAppNotificationClient } from '../clients/InAppNotificationClient';
 import { logEscrowCreated, logPaymentCaptured, logPaymentFailed } from './auditLogService';
 import mongoose from 'mongoose';
 import { buildEscrowMetadataSnapshot, getTaskDisplayTitleFromEscrow } from '../utils/escrowMetadataSnapshot';
+import { applyExtraCoinsForBooking, previewExtraCoinsRedemption } from './extraCoinsService';
+import { paymentRewardsFlags } from '../config/rewardsFlags';
+import { CoinUsageConfigProvider } from '../rewards/config/CoinUsageConfigProvider';
 
 /**
  * Generate unique escrow ID
@@ -24,6 +27,72 @@ function generateEscrowId(): string {
 
 function generatePaymentTransactionId(): string {
   return `txn_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+}
+
+function readPendingCustomerCoinDiscountRupees(metadata: unknown): Prisma.Decimal {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
+    return new Prisma.Decimal('0.00');
+  }
+  const record = metadata as Record<string, unknown>;
+  const raw =
+    record.pendingCustomerCoinDiscountRupees ??
+    record.customerCoinDiscountRupees ??
+    0;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return new Prisma.Decimal('0.00');
+  }
+  return new Prisma.Decimal(parsed.toFixed(2));
+}
+
+async function redeemCustomerCoinsOnEscrowCapture(postgresEscrow: {
+  escrowId: string;
+  taskId: string;
+  posterUid: string;
+  metadata: unknown;
+}): Promise<void> {
+  const escrowMetadata = postgresEscrow.metadata;
+  const pendingRupees = readPendingCustomerCoinDiscountRupees(escrowMetadata);
+  if (pendingRupees.lessThanOrEqualTo(0)) {
+    return;
+  }
+
+  try {
+    const redeem = await applyExtraCoinsForBooking({
+      userId: postgresEscrow.posterUid,
+      bookingId: postgresEscrow.escrowId,
+      taskId: postgresEscrow.taskId,
+      maxRedeemRupees: pendingRupees,
+    });
+
+    if (!redeem.success) {
+      logger.error('[escrowService] customer coin redeem failed after payment capture', {
+        escrowId: postgresEscrow.escrowId,
+        taskId: postgresEscrow.taskId,
+        posterUid: postgresEscrow.posterUid,
+        pendingRupees: pendingRupees.toString(),
+        error: redeem.error,
+      });
+      return;
+    }
+
+    logger.info('[escrowService] customer coins redeemed after payment capture', {
+      escrowId: postgresEscrow.escrowId,
+      taskId: postgresEscrow.taskId,
+      posterUid: postgresEscrow.posterUid,
+      redeemedRupees: redeem.redeemedRupees,
+      redeemedCoins: redeem.redeemedCoins,
+      duplicate: redeem.duplicate === true,
+    });
+  } catch (coinError: any) {
+    logger.error('[escrowService] customer coin redeem threw after payment capture', {
+      escrowId: postgresEscrow.escrowId,
+      taskId: postgresEscrow.taskId,
+      posterUid: postgresEscrow.posterUid,
+      pendingRupees: pendingRupees.toString(),
+      error: coinError?.message || 'Unknown error',
+    });
+  }
 }
 
 /**
@@ -162,8 +231,53 @@ export async function createEscrow(params: {
       return { success: false, error: 'Invalid amount' };
     }
 
+    const escrowId = generateEscrowId();
+    const coinCaps = await CoinUsageConfigProvider.getCapPercents();
+    const posterCapPercent = paymentRewardsFlags.CUSTOMER_BOOKING_COIN_CAP_ENABLED
+      ? coinCaps.posterBooking.toFixed(4)
+      : '1.0000';
+    const maxCustomerCoinDiscount = new Prisma.Decimal(amount.toFixed(2))
+      .mul(new Prisma.Decimal(posterCapPercent))
+      .toDecimalPlaces(2);
+    const requestedCoinDiscountRaw = Number(metadata?.requestedCoinDiscountRupees || 0);
+    const requestedCoinDiscount = Number.isFinite(requestedCoinDiscountRaw)
+      ? new Prisma.Decimal(Math.max(requestedCoinDiscountRaw, 0).toFixed(2))
+      : new Prisma.Decimal('0.00');
+
+    // Reserve discount for Razorpay order only; wallet is debited after payment capture.
+    let pendingCoinRupees = new Prisma.Decimal('0.00');
+    let pendingCoinUnits = new Prisma.Decimal('0.00');
+    if ((metadata?.useExtraCoins === true || requestedCoinDiscount.gt(0)) && maxCustomerCoinDiscount.gt(0)) {
+      const cap = requestedCoinDiscount.gt(0)
+        ? (requestedCoinDiscount.lessThan(maxCustomerCoinDiscount)
+            ? requestedCoinDiscount
+            : maxCustomerCoinDiscount
+          ).toDecimalPlaces(2)
+        : maxCustomerCoinDiscount;
+      try {
+        const preview = await previewExtraCoinsRedemption({
+          userId: posterUid,
+          maxRedeemRupees: cap,
+          walletRole: 'poster',
+        });
+        pendingCoinRupees = new Prisma.Decimal(preview.redeemableRupees);
+        pendingCoinUnits = new Prisma.Decimal(preview.redeemableCoins);
+      } catch (coinError: any) {
+        logger.warn('[escrowService] customer coin preview failed, continuing without discount', {
+          taskId,
+          posterUid,
+          error: coinError?.message || 'Unknown error',
+        });
+      }
+    }
+
+    const finalChargeAmount = Prisma.Decimal.max(
+      new Prisma.Decimal(amount.toFixed(2)).sub(pendingCoinRupees).toDecimalPlaces(2),
+      new Prisma.Decimal('0.00')
+    );
+
     // Convert to paise for Razorpay
-    const amountInPaise = Math.round(amount * 100);
+    const amountInPaise = Math.round(Number(finalChargeAmount.toString()) * 100);
 
     // Create Razorpay order
     const orderResult = await createOrder(amountInPaise, currency, {
@@ -173,6 +287,11 @@ export async function createEscrow(params: {
       performerUid,
       type: 'escrow',
       ...metadata,
+      pendingCustomerCoinDiscountRupees: pendingCoinRupees.toString(),
+      customerCoinDiscountRupees: pendingCoinRupees.toString(),
+      customerCoinDiscountCoins: pendingCoinUnits.toString(),
+      customerCoinDiscountCapRupees: maxCustomerCoinDiscount.toString(),
+      originalAmountRupees: Number(amount.toFixed(2)),
     });
 
     if (!orderResult.success || !orderResult.order) {
@@ -184,6 +303,10 @@ export async function createEscrow(params: {
     const escrowMetadata = buildEscrowMetadataSnapshot(
       {
         ...metadata,
+        pendingCustomerCoinDiscountRupees: pendingCoinRupees.toString(),
+        customerCoinDiscountRupees: pendingCoinRupees.toString(),
+        customerCoinDiscountCoins: pendingCoinUnits.toString(),
+        customerCoinDiscountCapRupees: maxCustomerCoinDiscount.toString(),
         ...(String(razorpayOrder.id).startsWith(REVIEW_ORDER_ID_PREFIX)
           ? { reviewBypass: true }
           : {}),
@@ -211,11 +334,9 @@ export async function createEscrow(params: {
     const sanitizedOrderData = sanitizeRazorpayOrderData(razorpayOrder);
 
     // Create escrow record
-    const escrowId = generateEscrowId();
-
     // Convert amounts to Prisma Decimal
     const amountDecimal = new Prisma.Decimal(amountInPaise.toString());
-    const amountInRupeesDecimal = new Prisma.Decimal(amount.toFixed(2));
+    const amountInRupeesDecimal = finalChargeAmount;
     const taskAmountDecimal = taskAmount 
       ? new Prisma.Decimal(taskAmount.toFixed(2))
       : null;
@@ -338,6 +459,7 @@ export async function updateEscrowOnPaymentCapture(
       postgresEscrow.paymentStatus === 'captured' &&
       postgresEscrow.razorpayPaymentId === razorpayPaymentId
     ) {
+      await redeemCustomerCoinsOnEscrowCapture(postgresEscrow);
       logger.info('ℹ️ Escrow payment already captured (idempotent)', {
         escrowId: postgresEscrow.escrowId,
         razorpayOrderId,
@@ -512,12 +634,34 @@ export async function updateEscrowOnPaymentCapture(
     });
 
     if (paymentStatus === 'captured') {
+      await redeemCustomerCoinsOnEscrowCapture(postgresEscrow);
+
       logPaymentCaptured({
         escrowId: postgresEscrow.id,
         razorpayOrderId,
         razorpayPaymentId,
         actorId: postgresEscrow.posterUid,
       }).catch(() => {});
+
+      const { paymentRewardsFlags } = await import('../config/rewardsFlags');
+      if (paymentRewardsFlags.EMIT_PAYMENT_COMPLETED_EVENTS) {
+        const { UserServiceClient } = await import('../clients/UserServiceClient');
+        const taskAmount = Number(postgresEscrow.taskAmount || postgresEscrow.amountInRupees || 0);
+        const feePct = Number(postgresEscrow.appliedPlatformFeePercent || 0.05);
+        const platformFeeInr = Math.round(taskAmount * feePct * 100) / 100;
+        UserServiceClient.processRewardEvent({
+          eventType: 'PAYMENT_COMPLETED',
+          payload: {
+            taskId: postgresEscrow.taskId,
+            posterUid: postgresEscrow.posterUid,
+            refereeUid: postgresEscrow.posterUid,
+            performerUid: postgresEscrow.performerUid,
+            amountInr: taskAmount,
+            platformFeeInr,
+          },
+          correlationId: postgresEscrow.escrowId,
+        }).catch(() => undefined);
+      }
     } else if (paymentStatus === 'failed') {
       logPaymentFailed({
         escrowId: postgresEscrow.id,

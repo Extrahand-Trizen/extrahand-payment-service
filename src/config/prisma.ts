@@ -30,9 +30,7 @@ function getPrismaClient(): PrismaClient {
     // For Prisma 7+, pass the adapter to PrismaClient constructor
     prismaInstance = new PrismaClient({
       adapter,
-      log: env.NODE_ENV === 'development' 
-        ? ['query', 'error', 'warn'] 
-        : ['error'],
+      log: env.NODE_ENV === 'development' ? ['error', 'warn'] : ['error'],
     });
 
     logger.info('✅ Prisma Client initialized with Postgres adapter (Neon compatible)');

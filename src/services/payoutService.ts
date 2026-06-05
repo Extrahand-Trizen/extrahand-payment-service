@@ -19,12 +19,27 @@ import { applyPenaltyLinesInTx, planPenaltyDeductionsFromGross } from './perform
 import { notifyPayoutInitiated } from './paymentNotificationService';
 import { getFeeStructure } from './feeConfigService';
 import { applyExtraCoinsForPayout, awardExtraCoinsForCompletedTask } from './extraCoinsService';
+import { paymentRewardsFlags } from '../config/rewardsFlags';
+import { CoinUsageConfigProvider } from '../rewards/config/CoinUsageConfigProvider';
 
 /**
  * Generate unique payout ID
  */
 function generatePayoutId(): string {
   return `payout_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+}
+
+/** Skip RazorpayX API; queue payout for operations portal / manual transfer. */
+function isPayoutManualOpsMode(): boolean {
+  const raw = process.env.PAYOUT_MANUAL_OPS_MODE;
+  if (raw === 'false' || raw === '0') return false;
+  if (raw === 'true' || raw === '1') return true;
+  return process.env.NODE_ENV === 'production';
+}
+
+function payoutMetadataIndicatesManualOps(metadata: unknown): boolean {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return false;
+  return (metadata as Record<string, unknown>).payoutMode === 'manual_ops';
 }
 
 async function ensureExtraCoinsAwardedForTaskCompletionPayout(params: {
@@ -840,6 +855,8 @@ export async function processTaskCompletionPayout(params: {
   taskTitle?: string;
   userId?: string;
   enqueueOnMissingBank?: boolean;
+  useExtraCoins?: boolean;
+  requestedCoinRedeemRupees?: number;
 }): Promise<{
   success: boolean;
   payout?: any;
@@ -847,7 +864,15 @@ export async function processTaskCompletionPayout(params: {
   error?: string;
 }> {
   try {
-    const { taskId, performerUid, amount, taskTitle, enqueueOnMissingBank = true } = params;
+    const {
+      taskId,
+      performerUid,
+      amount,
+      taskTitle,
+      enqueueOnMissingBank = false,
+      useExtraCoins = false,
+      requestedCoinRedeemRupees,
+    } = params;
 
     if (!isPostgresConnected()) {
       return { success: false, error: 'Postgres not connected' };
@@ -892,6 +917,7 @@ export async function processTaskCompletionPayout(params: {
           netAmount: existing.netAmount.toString(),
           status: existing.status,
           completedAt: existing.completedAt,
+          manualOps: payoutMetadataIndicatesManualOps(existing.metadata),
         },
       };
     }
@@ -927,7 +953,7 @@ export async function processTaskCompletionPayout(params: {
     }
 
     const { fundAccountId } = parseVerificationRef(selectedBankAccount.verificationRef);
-    if (!fundAccountId) {
+    if (!fundAccountId && !isPayoutManualOpsMode()) {
       if (enqueueOnMissingBank) {
         await enqueuePendingTaskCompletionPayout({ taskId, performerUid, amount, taskTitle });
       }
@@ -947,6 +973,13 @@ export async function processTaskCompletionPayout(params: {
       .mul(feeStructure.platformFee.gstPercentage)
       .toDecimalPlaces(2);
     const platformFeeTotal = platformCommission.add(gstOnCommission).toDecimalPlaces(2);
+    const coinCaps = await CoinUsageConfigProvider.getCapPercents();
+    const taskerCapPercent = paymentRewardsFlags.TASKER_PLATFORM_FEE_COIN_CAP_ENABLED
+      ? coinCaps.taskerPlatformFee.toFixed(4)
+      : '1.0000';
+    const maxTaskerCoinRedeemRupees = platformCommission
+      .mul(new Prisma.Decimal(taskerCapPercent))
+      .toDecimalPlaces(2);
     const payoutBaseAmount = Prisma.Decimal.max(
       grossAmount.sub(platformFeeTotal).toDecimalPlaces(2),
       new Prisma.Decimal('0.00')
@@ -962,31 +995,44 @@ export async function processTaskCompletionPayout(params: {
       redeemedRupees: string;
     }> = [];
 
-    try {
-      const redeemResult = await applyExtraCoinsForPayout({
-        userId: performerUid,
-        payoutId,
-        taskId,
-        maxRedeemRupees: platformFeeTotal,
-      });
+    const requestedRedeemRupees = (() => {
+      if (!useExtraCoins) return new Prisma.Decimal('0.00');
+      const raw = Number(requestedCoinRedeemRupees ?? 0);
+      if (!Number.isFinite(raw) || raw <= 0) return maxTaskerCoinRedeemRupees;
+      const requested = new Prisma.Decimal(raw.toFixed(2));
+      return requested.lessThan(maxTaskerCoinRedeemRupees)
+        ? requested
+        : maxTaskerCoinRedeemRupees;
+    })();
 
-      if (redeemResult.success) {
-        redeemedCoins = new Prisma.Decimal(redeemResult.redeemedCoins);
-        redeemedRupees = new Prisma.Decimal(redeemResult.redeemedRupees);
-        redeemedSources = redeemResult.sources;
-      } else {
-        logger.warn('[payoutService] ExtraCoins redeem skipped due to service error', {
+    if (useExtraCoins && requestedRedeemRupees.gt(0)) {
+      try {
+        const redeemResult = await applyExtraCoinsForPayout({
+          userId: performerUid,
+          payoutId,
+          taskId,
+          maxRedeemRupees: requestedRedeemRupees,
+          walletRole: 'tasker',
+        });
+
+        if (redeemResult.success) {
+          redeemedCoins = new Prisma.Decimal(redeemResult.redeemedCoins);
+          redeemedRupees = new Prisma.Decimal(redeemResult.redeemedRupees);
+          redeemedSources = redeemResult.sources;
+        } else {
+          logger.warn('[payoutService] ExtraCoins redeem skipped due to service error', {
+            performerUid,
+            taskId,
+            error: redeemResult.error,
+          });
+        }
+      } catch (redeemError: any) {
+        logger.warn('[payoutService] ExtraCoins redeem failed unexpectedly, continuing payout without bonus', {
           performerUid,
           taskId,
-          error: redeemResult.error,
+          error: redeemError?.message || 'Unknown error',
         });
       }
-    } catch (redeemError: any) {
-      logger.warn('[payoutService] ExtraCoins redeem failed unexpectedly, continuing payout without bonus', {
-        performerUid,
-        taskId,
-        error: redeemError?.message || 'Unknown error',
-      });
     }
 
     const payoutBaseAfterExtraCoins = payoutBaseAmount
@@ -1092,8 +1138,10 @@ export async function processTaskCompletionPayout(params: {
         netAmount: netAmount.toString(),
       },
       extraCoins: {
-        coinToRupee: '0.20',
+        coinToRupee: '1.00',
         applied: redeemedRupees.gt(0),
+        requested: useExtraCoins,
+        requestedRedeemRupees: requestedRedeemRupees.toString(),
         redeemedCoins: redeemedCoins.toString(),
         redeemedRupees: redeemedRupees.toString(),
         redeemCapRupees: platformFeeTotal.toString(),
@@ -1104,7 +1152,7 @@ export async function processTaskCompletionPayout(params: {
         platformFeePercentage: feeStructure.platformFee.percentage,
         gstPercentage: feeStructure.platformFee.gstPercentage,
       },
-      coinFormula: '(platformFee * basePercent) * ratingMultiplier * bonuses / 0.20',
+      coinFormula: '(platformFee * basePercent) * ratingMultiplier * bonuses / 1.00 (1 coin = ₹1)',
       penaltiesAppliedAt: null as string | null,
     };
 
@@ -1118,6 +1166,7 @@ export async function processTaskCompletionPayout(params: {
     });
 
     let status: string = 'completed';
+    let recordedManualOps = false;
 
     if (netAmount.lte(0)) {
       status = 'completed';
@@ -1155,7 +1204,60 @@ export async function processTaskCompletionPayout(params: {
         payoutId,
         deductionLineCount: penaltyPlan.lines.length,
       });
+    } else if (isPayoutManualOpsMode()) {
+      status = 'processing';
+      recordedManualOps = true;
+      const postgresEscrowId = taskEscrow?.id ?? null;
+      const manualMetadata = {
+        ...metadataPayload,
+        payoutMode: 'manual_ops',
+        manualOpsRequestedAt: new Date().toISOString(),
+        fundAccountId: fundAccountId || null,
+        bankAccountId: paymentProfile.defaultBankAccountId,
+        bankAccountLast4: selectedBankAccount.accountNumber?.slice(-4) || null,
+        bankIfsc: selectedBankAccount.ifscCode || null,
+        penaltiesAppliedAt:
+          penaltyPlan.lines.length > 0 ? new Date().toISOString() : metadataPayload.penaltiesAppliedAt,
+      };
+
+      await prisma.$transaction(async (tx) => {
+        await tx.payout.create({
+          data: {
+            payoutId,
+            escrowId: postgresEscrowId,
+            performerUid,
+            amount: grossAmount,
+            netAmount,
+            platformCommission,
+            gstOnCommission,
+            tds,
+            bankTransferId: null,
+            status,
+            type: 'task_completion',
+            description: duplicateDescription,
+            metadata: manualMetadata as Prisma.InputJsonValue,
+          },
+        });
+        if (penaltyPlan.lines.length > 0) {
+          await applyPenaltyLinesInTx(tx, penaltyPlan.lines);
+        }
+      });
+
+      logger.info('[payoutService] Manual ops payout request stored (RazorpayX skipped)', {
+        performerUid,
+        taskId,
+        payoutId,
+        netAmount: netAmount.toString(),
+        escrowId: taskEscrow?.escrowId,
+      });
     } else {
+      if (!fundAccountId) {
+        return {
+          success: false,
+          requiresBankAccount: true,
+          error: 'Selected bank account is not linked to RazorpayX fund account',
+        };
+      }
       logger.debug('[payoutService] Creating RazorpayX payout with penalty deduction applied', {
         performerUid,
         taskId,
@@ -1267,6 +1369,7 @@ export async function processTaskCompletionPayout(params: {
         amount: grossAmount.toString(),
         netAmount: netAmount.toString(),
         status,
+        manualOps: recordedManualOps,
         penaltyDeducted: totalPenaltyDeducted.toString(),
         extraCoinsBonus: redeemedRupees.toString(),
         extraCoinsBonusCoins: redeemedCoins.toString(),
@@ -1543,11 +1646,123 @@ export async function getPayoutsByEscrowId(escrowId: string): Promise<{
         description: payout.description,
         createdAt: payout.createdAt,
         completedAt: payout.completedAt,
+        manualOps: payoutMetadataIndicatesManualOps(payout.metadata),
+        metadata: payout.metadata,
       })),
     };
   } catch (error: any) {
     logger.error('❌ Error getting payouts by escrow ID:', error);
     return { success: false, error: error.message || 'Failed to get payouts' };
+  }
+}
+
+function mapPayoutToOpsQueueRow(payout: {
+  payoutId: string;
+  taskId: string | null;
+  performerUid: string;
+  amount: Prisma.Decimal;
+  netAmount: Prisma.Decimal;
+  platformCommission: Prisma.Decimal;
+  gstOnCommission: Prisma.Decimal;
+  tds: Prisma.Decimal | null;
+  status: string;
+  description: string | null;
+  metadata: Prisma.JsonValue | null;
+  createdAt: Date;
+  updatedAt: Date;
+  escrow?: { escrowId: string; taskId: string | null } | null;
+}) {
+  const metadata =
+    payout.metadata && typeof payout.metadata === 'object' && !Array.isArray(payout.metadata)
+      ? (payout.metadata as Record<string, unknown>)
+      : {};
+
+  return {
+    payoutId: payout.payoutId,
+    taskId: typeof metadata.taskId === 'string' ? metadata.taskId : payout.taskId,
+    taskTitle: typeof metadata.taskTitle === 'string' ? metadata.taskTitle : null,
+    performerUid: payout.performerUid,
+    amount: payout.amount.toString(),
+    netAmount: payout.netAmount.toString(),
+    platformCommission: payout.platformCommission.toString(),
+    gstOnCommission: payout.gstOnCommission.toString(),
+    tds: payout.tds?.toString() ?? '0',
+    status: payout.status,
+    manualOps: payoutMetadataIndicatesManualOps(payout.metadata),
+    bankAccountLast4:
+      typeof metadata.bankAccountLast4 === 'string' ? metadata.bankAccountLast4 : null,
+    bankIfsc: typeof metadata.bankIfsc === 'string' ? metadata.bankIfsc : null,
+    manualOpsRequestedAt:
+      typeof metadata.manualOpsRequestedAt === 'string' ? metadata.manualOpsRequestedAt : null,
+    useExtraCoins: metadata.useExtraCoins === true,
+    requestedCoinRedeemRupees:
+      metadata.requestedCoinRedeemRupees != null
+        ? String(metadata.requestedCoinRedeemRupees)
+        : null,
+    escrowId: payout.escrow?.escrowId ?? null,
+    description: payout.description,
+    createdAt: payout.createdAt.toISOString(),
+    updatedAt: payout.updatedAt.toISOString(),
+  };
+}
+
+/**
+ * List payout requests queued for manual operations processing (ops portal).
+ */
+export async function listManualOpsPayoutQueue(params?: {
+  status?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<{
+  success: boolean;
+  payouts?: ReturnType<typeof mapPayoutToOpsQueueRow>[];
+  total?: number;
+  error?: string;
+}> {
+  try {
+    if (!isPostgresConnected()) {
+      return { success: false, error: 'Postgres not connected' };
+    }
+
+    const status = String(params?.status || 'processing').trim().toLowerCase();
+    const limit = Math.min(Math.max(Number(params?.limit ?? 50) || 50, 1), 200);
+    const offset = Math.max(Number(params?.offset ?? 0) || 0, 0);
+
+    const where = {
+      type: 'task_completion',
+      status,
+      metadata: {
+        path: ['payoutMode'],
+        equals: 'manual_ops',
+      },
+    } as const;
+
+    const [rows, total] = await Promise.all([
+      prisma.payout.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        take: limit,
+        skip: offset,
+        include: {
+          escrow: {
+            select: { escrowId: true, taskId: true },
+          },
+        },
+      }),
+      prisma.payout.count({ where }),
+    ]);
+
+    return {
+      success: true,
+      payouts: rows.map(mapPayoutToOpsQueueRow),
+      total,
+    };
+  } catch (error: any) {
+    logger.error('Error listing manual ops payout queue', error);
+    return {
+      success: false,
+      error: error.message || 'Failed to list manual ops payout queue',
+    };
   }
 }
 

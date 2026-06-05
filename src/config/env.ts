@@ -27,6 +27,7 @@ const envSchema = z.object({
   SERVICE_AUTH_TOKEN: z.string().min(1, 'SERVICE_AUTH_TOKEN is required').optional(),
 
   TASK_SERVICE_URL: z.string().url(),
+  USER_SERVICE_URL: z.string().url().default('http://localhost:4001'),
   
   // Logging
   LOG_LEVEL: z.enum(['error', 'warn', 'info', 'debug']).default('info'),
@@ -45,6 +46,20 @@ const envSchema = z.object({
   PLAY_REVIEW_BYPASS_PHONES: z.string().optional(),
   /** Optional: poster Firebase UIDs that skip Razorpay on escrow create (Play review / demo). */
   PLAY_REVIEW_BYPASS_UIDS: z.string().optional(),
+
+  /**
+   * When true, task-completion payouts are recorded as processing in DB without calling RazorpayX.
+   * Operations team completes transfers manually until live payout API is enabled.
+   * Defaults to true in production when unset.
+   */
+  PAYOUT_MANUAL_OPS_MODE: z
+    .string()
+    .optional()
+    .transform((v) => {
+      if (v === 'false' || v === '0') return false;
+      if (v === 'true' || v === '1') return true;
+      return process.env.NODE_ENV === 'production';
+    }),
 });
 
 export function validateEnv() {

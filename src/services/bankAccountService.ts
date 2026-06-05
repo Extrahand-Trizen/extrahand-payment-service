@@ -5,21 +5,8 @@ import {
   createRazorpayXFundAccount,
   parseRazorpayApiError,
 } from './razorpayxService';
-
-function maskAccountNumber(accountNumber: string): string {
-  if (accountNumber.length <= 4) return accountNumber;
-  return `XXXX${accountNumber.slice(-4)}`;
-}
-
-function maskAccountHolderName(name: string): string {
-  const v = (name || '').trim();
-  if (!v) return v;
-  const parts = v.split(/\s+/).filter(Boolean);
-  const first = parts[0] || '';
-  const lastInitial = parts.length > 1 ? parts[parts.length - 1]?.[0] : '';
-  const firstMasked = first.length <= 2 ? first[0] + '*' : first.slice(0, 2) + '*'.repeat(Math.min(6, first.length - 2));
-  return lastInitial ? `${firstMasked} ${lastInitial}.` : firstMasked;
-}
+import { buildEncryptedBankAccountPersistFields } from './bankAccountSecrets';
+import { maskAccountNumberForDisplay } from '../utils/bankFieldCrypto';
 
 export async function upsertTaskerBankAccount(params: {
   userId: string;
@@ -36,15 +23,12 @@ export async function upsertTaskerBankAccount(params: {
   maskedAccountNumber?: string;
   fundAccountId?: string;
   error?: string;
-  /** Razorpay returned 4xx — safe to show message to user; map to HTTP 400 */
   isRazorpayClientError?: boolean;
 }> {
   try {
     const accountNumber = params.accountNumber.trim();
-    const maskedAccountNumber = maskAccountNumber(accountNumber);
     const ifscCode = params.ifscCode.trim().toUpperCase();
     const accountHolderName = params.accountHolderName.trim();
-    const maskedAccountHolderName = maskAccountHolderName(accountHolderName);
 
     if (!accountNumber || !ifscCode || !accountHolderName) {
       return { success: false, error: 'accountNumber, ifscCode and accountHolderName are required' };
@@ -66,15 +50,16 @@ export async function upsertTaskerBankAccount(params: {
     const fundAccountId = fund.id;
 
     const verificationRef = JSON.stringify({ contactId: contact.id, fundAccountId });
+    const encryptedFields = buildEncryptedBankAccountPersistFields({
+      accountNumber,
+      accountHolderName,
+    });
 
     const created = await prisma.bankAccount.create({
       data: {
         userId: params.userId,
-        // Tokenization-first: never persist raw bank details. Store only masked display values + Razorpay tokens.
-        accountNumber: maskedAccountNumber,
-        // IFSC is intentionally stored fully (industry-standard display/operational format).
+        ...encryptedFields,
         ifscCode,
-        accountHolderName: maskedAccountHolderName,
         bankName: params.bankName?.trim() || 'Unknown Bank',
         isVerified: true,
         verifiedAt: new Date(),
@@ -103,20 +88,25 @@ export async function upsertTaskerBankAccount(params: {
     return {
       success: true,
       bankAccountId: created.id,
-      maskedAccountNumber,
+      maskedAccountNumber:
+        encryptedFields.accountNumber || maskAccountNumberForDisplay(accountNumber),
       fundAccountId,
     };
   } catch (error: unknown) {
     const parsed = parseRazorpayApiError(error);
+    const message =
+      parsed.message ||
+      (error instanceof Error ? error.message : 'Failed to save bank account');
+
     logger.error('Error upserting bank account for payout', {
       userId: params.userId,
-      error: parsed.message,
+      error: message,
       httpStatus: parsed.httpStatus,
       isRazorpayClientError: parsed.isClientError,
     });
     return {
       success: false,
-      error: parsed.message || 'Failed to save bank account',
+      error: message,
       isRazorpayClientError: parsed.isClientError,
     };
   }

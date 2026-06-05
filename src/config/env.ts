@@ -28,6 +28,7 @@ const envSchema = z.object({
 
   TASK_SERVICE_URL: z.string().url(),
   USER_SERVICE_URL: z.string().url().default('http://localhost:4001'),
+  MESSAGING_SERVICE_URL: z.string().url().default('http://localhost:4010'),
   
   // Logging
   LOG_LEVEL: z.enum(['error', 'warn', 'info', 'debug']).default('info'),

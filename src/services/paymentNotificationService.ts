@@ -1,5 +1,6 @@
 import { InAppNotificationClient } from '../clients/InAppNotificationClient';
 import { EmailServiceClient } from '../clients/EmailServiceClient';
+import { fireWhatsAppNotify } from '../clients/WhatsAppClient';
 import logger from '../config/logger';
 
 interface BasePayload {
@@ -57,6 +58,17 @@ export async function notifyPaymentReceived(params: {
     body: `We received ₹${amount} for${taskTitle ? ` ${taskTitle}` : ' your task'}.`,
     data: { taskId, amount },
   });
+
+  fireWhatsAppNotify({
+    uid: posterUid,
+    templateKey: 'wa_payment_released',
+    category: 'payments',
+    templateBody: {
+      var_1: String(amount),
+      var_2: taskTitle || 'your task',
+    },
+    idempotencyKey: taskId ? `payment-received:${taskId}` : undefined,
+  });
 }
 
 export async function notifyPayoutCompleted(params: {
@@ -77,6 +89,17 @@ export async function notifyPayoutCompleted(params: {
     title: 'Payout credited',
     body: `₹${amount} has been sent to your account${taskTitle ? ` for ${taskTitle}` : ''}.`,
     data: { taskId, amount },
+  });
+
+  fireWhatsAppNotify({
+    uid: performerUid,
+    templateKey: 'wa_earnings_credited',
+    category: 'payments',
+    templateBody: {
+      var_1: String(amount),
+      var_2: taskTitle || 'your task',
+    },
+    idempotencyKey: taskId ? `payout-completed:${taskId}` : undefined,
   });
 }
 
@@ -155,6 +178,17 @@ export async function notifyPayoutInitiated(params: {
       logger.warn('[paymentNotificationService] Payout initiated email not sent', { email });
     }
   }
+
+  fireWhatsAppNotify({
+    uid: performerUid,
+    templateKey: 'wa_withdrawal_processed',
+    category: 'payments',
+    templateBody: {
+      var_1: String(amount),
+      var_2: taskTitle || 'your task',
+    },
+    idempotencyKey: taskId ? `payout-initiated:${taskId}` : undefined,
+  });
 }
 
 export async function notifyRefundProcessed(params: {

@@ -2,12 +2,7 @@ import { Request, Response } from 'express';
 import { BadRequestError } from '../errors/AppError';
 import { upsertTaskerBankAccount } from '../services/bankAccountService';
 import { prisma } from '../config/prisma';
-
-function maskForResponse(accountNumber: string): string {
-  if (!accountNumber) return accountNumber;
-  if (accountNumber.startsWith('XXXX')) return accountNumber;
-  return accountNumber.length <= 4 ? accountNumber : `XXXX${accountNumber.slice(-4)}`;
-}
+import { toTaskerFacingBankAccount } from '../services/bankAccountSecrets';
 
 export class BankAccountController {
   static async upsertBankAccount(req: Request, res: Response): Promise<void> {
@@ -61,15 +56,6 @@ export class BankAccountController {
     const accounts = await prisma.bankAccount.findMany({
       where: { userId },
       orderBy: { createdAt: 'desc' },
-      select: {
-        id: true,
-        bankName: true,
-        accountHolderName: true,
-        accountNumber: true,
-        ifscCode: true,
-        isVerified: true,
-        createdAt: true,
-      },
     });
 
     const profile = await prisma.userPaymentProfile.findUnique({
@@ -80,14 +66,8 @@ export class BankAccountController {
     res.json({
       success: true,
       data: accounts.map((account) => ({
-        id: account.id,
-        bankName: account.bankName,
-        accountHolderName: account.accountHolderName,
-        accountNumber: maskForResponse(account.accountNumber),
-        ifscCode: account.ifscCode,
-        isVerified: account.isVerified,
+        ...toTaskerFacingBankAccount(account),
         isDefault: profile?.defaultBankAccountId === account.id,
-        createdAt: account.createdAt,
       })),
     });
   }

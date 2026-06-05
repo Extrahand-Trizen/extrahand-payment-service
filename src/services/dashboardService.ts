@@ -26,6 +26,12 @@ export async function getDashboardOverview(range: DateRange) {
       prisma.escrow.aggregate({
         where: {
           ...(createdAt ? { createdAt } : {}),
+          NOT: {
+            metadata: {
+              path: ["teamTest"],
+              equals: true,
+            },
+          },
         },
         _sum: { amountInRupees: true },
         _count: { id: true },
@@ -176,6 +182,19 @@ export async function getDashboardLedger(params: {
   const [items, total] = await Promise.all([
     prisma.ledger.findMany({
       where,
+      include: {
+        escrow: true,
+        payout: {
+          include: {
+            escrow: true,
+          },
+        },
+        refund: {
+          include: {
+            escrow: true,
+          },
+        },
+      },
       orderBy: { createdAt: 'desc' },
       take: params.limit,
       skip: params.offset,
@@ -183,7 +202,41 @@ export async function getDashboardLedger(params: {
     prisma.ledger.count({ where }),
   ]);
 
-  return { items, total };
+  const mappedItems = items.map((row: any) => {
+    const CustomerUid =
+      row.escrow?.posterUid ||
+      row.payout?.escrow?.posterUid ||
+      row.refund?.escrow?.posterUid ||
+      row.userId ||
+      null;
+
+    const performerUid =
+      row.escrow?.performerUid ||
+      row.payout?.performerUid ||
+      row.payout?.escrow?.performerUid ||
+      row.refund?.escrow?.performerUid ||
+      null;
+
+    const taskId =
+      row.taskId ||
+      row.escrow?.taskId ||
+      row.payout?.taskId ||
+      row.payout?.escrow?.taskId ||
+      row.refund?.taskId ||
+      row.refund?.escrow?.taskId ||
+      null;
+
+    const { escrow, payout, refund, ...rest } = row;
+
+    return {
+      ...rest,
+      CustomerUid,
+      performerUid,
+      taskId,
+    };
+  });
+
+  return { items: mappedItems, total };
 }
 
 export async function getDashboardAnomalies() {

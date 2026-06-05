@@ -90,6 +90,8 @@ export class AdminFinanceController {
 
   static async getTransactions(req: Request, res: Response): Promise<void> {
     const { status, q, startDate, endDate } = req.query;
+    const transactionType = typeof req.query.transactionType === 'string' ? req.query.transactionType : undefined;
+    const holdStatus = typeof req.query.holdStatus === 'string' ? req.query.holdStatus : undefined;
     const limit = parseLimit(req.query.limit);
     const offset = parseOffset(req.query.offset);
     const search = typeof q === 'string' && q.trim() ? q.trim() : undefined;
@@ -97,6 +99,17 @@ export class AdminFinanceController {
     const where: Prisma.EscrowWhereInput = {};
     if (status && typeof status === 'string') {
       where.status = status;
+    }
+
+    // Apply holdStatus filter if provided
+    if (holdStatus) {
+      where.status = holdStatus;
+    }
+
+    if (transactionType === 'real') {
+      where.NOT = { metadata: { path: ['teamTest'], equals: true } };
+    } else if (transactionType === 'team') {
+      where.metadata = { path: ['teamTest'], equals: true };
     }
 
     if (startDate || endDate) {
@@ -128,21 +141,33 @@ export class AdminFinanceController {
       }),
     ]);
 
-    const data = rows.map((escrow) => ({
-      escrowId: escrow.escrowId,
-      razorpayOrderId: escrow.razorpayOrderId,
-      razorpayPaymentId: escrow.razorpayPaymentId,
-      taskId: escrow.taskId,
-      applicationId: escrow.applicationId,
-      posterUid: escrow.posterUid,
-      performerUid: escrow.performerUid,
-      status: escrow.status,
-      paymentStatus: escrow.paymentStatus,
-      amountInRupees: toStringValue(escrow.amountInRupees),
-      createdAt: escrow.createdAt,
-    }));
+    const data = rows.map((escrow) => {
+      const metadata = escrow.metadata && typeof escrow.metadata === 'object' ? (escrow.metadata as Record<string, unknown>) : {};
+      return {
+        escrowId: escrow.escrowId,
+        razorpayOrderId: escrow.razorpayOrderId,
+        razorpayPaymentId: escrow.razorpayPaymentId,
+        taskId: escrow.taskId,
+        applicationId: escrow.applicationId,
+        CustomerUid: escrow.posterUid,
+        performerUid: escrow.performerUid,
+        status: escrow.status,
+        paymentStatus: escrow.paymentStatus,
+        amountInRupees: toStringValue(escrow.amountInRupees),
+        createdAt: escrow.createdAt,
+        teamTest: metadata.teamTest === true,
+        teamTestTransferred: metadata.teamTestTransferred === true,
+      };
+    });
 
-    res.json({ success: true, total, limit, offset, transactions: data });
+    const page = Math.floor(offset / limit) + 1;
+    const pages = Math.ceil(total / limit);
+
+    res.json({
+      success: true,
+      data,
+      pagination: { page, limit, total, pages },
+    });
   }
 
   static async getTransactionById(req: Request, res: Response): Promise<void> {
@@ -221,6 +246,98 @@ export class AdminFinanceController {
     });
   }
 
+  static async updateTransactionTeamTest(req: Request, res: Response): Promise<void> {
+    const { id } = req.params;
+    const { teamTest, teamTestTransferred } = req.body || {};
+    if (!id) throw new BadRequestError('Transaction id is required');
+    if (typeof teamTest !== 'boolean' && typeof teamTestTransferred !== 'boolean') {
+      throw new BadRequestError('teamTest or teamTestTransferred must be provided as boolean');
+    }
+
+    const escrow = await prisma.escrow.findFirst({
+      where: {
+        OR: [
+          { id },
+          { escrowId: id },
+          { razorpayOrderId: id },
+          { razorpayPaymentId: id },
+        ],
+      },
+    });
+    if (!escrow) throw new NotFoundError('Transaction not found');
+
+    const existingMetadata = escrow.metadata && typeof escrow.metadata === 'object' ? (escrow.metadata as Record<string, unknown>) : {};
+    const updatedMetadata: Record<string, unknown> = { ...existingMetadata };
+    if (typeof teamTest === 'boolean') {
+      updatedMetadata.teamTest = teamTest;
+    }
+    if (typeof teamTestTransferred === 'boolean') {
+      updatedMetadata.teamTestTransferred = teamTestTransferred;
+    }
+
+    const updated = await prisma.escrow.update({
+      where: { id: escrow.id },
+      data: {
+        metadata: updatedMetadata,
+      },
+    });
+
+    await prisma.auditLog.create({
+      data: {
+        entityType: 'escrow',
+        entityId: updated.id,
+        action: 'status_changed',
+        actorType: 'admin',
+        newValue: updatedMetadata,
+      },
+    });
+
+    res.json({
+      success: true,
+      escrow: {
+        escrowId: updated.escrowId,
+        teamTest: updatedMetadata.teamTest === true,
+        teamTestTransferred: updatedMetadata.teamTestTransferred === true,
+      },
+    });
+  }
+
+  static async updatePayoutStatus(req: Request, res: Response): Promise<void> {
+    const { id } = req.params;
+    const { status } = req.body || {};
+    if (!id) throw new BadRequestError('Payout id is required');
+    if (!status || typeof status !== 'string') {
+      throw new BadRequestError('status is required');
+    }
+
+    const allowedStatuses = ['pending', 'processing', 'completed', 'failed', 'held'];
+    if (!allowedStatuses.includes(status)) {
+      throw new BadRequestError(`Invalid payout status. Allowed values: ${allowedStatuses.join(', ')}`);
+    }
+
+    const payout = await prisma.payout.findFirst({
+      where: { OR: [{ id }, { payoutId: id }] },
+    });
+    if (!payout) throw new NotFoundError('Payout not found');
+
+    const updated = await prisma.payout.update({
+      where: { id: payout.id },
+      data: { status },
+    });
+
+    await prisma.auditLog.create({
+      data: {
+        entityType: 'payout',
+        entityId: updated.id,
+        action: 'status_changed',
+        actorType: 'admin',
+        newValue: { status },
+      },
+    });
+
+    res.json({ success: true, payout: updated });
+  }
+
   static async getPayouts(req: Request, res: Response): Promise<void> {
     const { status, q, startDate, endDate } = req.query;
     const limit = parseLimit(req.query.limit);
@@ -255,7 +372,26 @@ export class AdminFinanceController {
       }),
     ]);
 
-    res.json({ success: true, total, limit, offset, payouts: rows });
+    const data = rows.map((row) => ({
+      payoutId: row.payoutId,
+      performerUid: row.performerUid,
+      taskId: row.taskId || row.escrow?.taskId || null,
+      CustomerUid: row.escrow?.posterUid || null,
+      amount: toStringValue(row.amount),
+      netAmount: toStringValue(row.netAmount),
+      status: row.status,
+      source: row.source,
+      createdAt: row.createdAt,
+    }));
+
+    const page = Math.floor(offset / limit) + 1;
+    const pages = Math.ceil(total / limit);
+
+    res.json({
+      success: true,
+      data,
+      pagination: { page, limit, total, pages },
+    });
   }
 
   static async getPayoutById(req: Request, res: Response): Promise<void> {
@@ -373,7 +509,24 @@ export class AdminFinanceController {
       }),
     ]);
 
-    res.json({ success: true, total, limit, offset, refunds: rows });
+    const data = rows.map((row) => ({
+      refundId: row.refundId,
+      taskId: row.taskId,
+      CustomerUid: row.escrow?.posterUid,
+      performerUid: row.escrow?.performerUid,
+      refundAmount: toStringValue(row.refundAmount),
+      status: row.status,
+      createdAt: row.createdAt,
+    }));
+
+    const page = Math.floor(offset / limit) + 1;
+    const pages = Math.ceil(total / limit);
+
+    res.json({
+      success: true,
+      data,
+      pagination: { page, limit, total, pages },
+    });
   }
 
   static async getRefundById(req: Request, res: Response): Promise<void> {
@@ -489,10 +642,28 @@ export class AdminFinanceController {
         orderBy: { createdAt: 'desc' },
         take: limit,
         skip: offset,
+        include: { escrow: true },
       }),
     ]);
 
-    res.json({ success: true, total, limit, offset, ledger: rows });
+    const data = rows.map((row) => ({
+      transactionId: row.transactionId,
+      type: row.type,
+      amount: toStringValue(row.amount),
+      taskId: row.taskId,
+      CustomerUid: row.escrow?.posterUid,
+      performerUid: row.escrow?.performerUid,
+      createdAt: row.createdAt,
+    }));
+
+    const page = Math.floor(offset / limit) + 1;
+    const pages = Math.ceil(total / limit);
+
+    res.json({
+      success: true,
+      data,
+      pagination: { page, limit, total, pages },
+    });
   }
 
   static async getLedgerById(req: Request, res: Response): Promise<void> {

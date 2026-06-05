@@ -17,6 +17,8 @@ router.get('/payouts', asyncHandler(DashboardController.getPayouts));
 router.get('/payouts/:id', asyncHandler(AdminFinanceController.getPayoutById));
 router.post('/payouts/:id/retry', asyncHandler(DashboardController.retryPayout));
 router.post('/payouts/:id/hold', asyncHandler(AdminFinanceController.holdPayout));
+router.patch('/payouts/:id/status', asyncHandler(AdminFinanceController.updatePayoutStatus));
+router.patch('/transactions/:id/team-test', asyncHandler(AdminFinanceController.updateTransactionTeamTest));
 router.get('/refunds', asyncHandler(DashboardController.getRefunds));
 router.get('/refunds/:id', asyncHandler(AdminFinanceController.getRefundById));
 router.post('/refunds/manual', asyncHandler(AdminFinanceController.manualRefund));

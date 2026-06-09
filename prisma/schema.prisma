@@ -45,7 +45,8 @@ model Escrow {
   taskCategory      String? // e.g. "cleaning", "legal"; nullable for old escrows
   applicationId     String?
   posterUid         String
-  performerUid      String
+  performerUid      String?
+  bookingOrderId    String?
   amount            Decimal   @db.Decimal(12, 2) // Amount in paise
   currency          String    @default("INR")
   amountInRupees    Decimal   @db.Decimal(12, 2) // Amount in rupees (task + platform fee + GST)
@@ -80,6 +81,7 @@ model Escrow {
   disputes Dispute[]
 
   @@index([taskId, status])
+  @@index([bookingOrderId])
   @@index([posterUid, status])
   @@index([posterUid, status, createdAt(sort: Desc)])
   @@index([performerUid, status])

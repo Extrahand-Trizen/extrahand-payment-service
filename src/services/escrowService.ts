@@ -172,6 +172,7 @@ async function convertPostgresEscrowToFrontendFormat(postgresEscrow: any): Promi
     applicationId: postgresEscrow.applicationId,
     posterUid: postgresEscrow.posterUid,
     performerUid: postgresEscrow.performerUid,
+    bookingOrderId: postgresEscrow.bookingOrderId,
     amount: postgresEscrow.amount.toString(),
     amountInRupees: postgresEscrow.amountInRupees.toString(),
     currency: postgresEscrow.currency,
@@ -432,6 +433,149 @@ export async function createEscrow(params: {
 }
 
 /**
+ * Create escrow for Book Now — payment before helper assignment (no performer yet).
+ */
+export async function createBookingEscrow(params: {
+  taskId: string;
+  bookingOrderId: string;
+  posterUid: string;
+  amount: number;
+  taskAmount?: number;
+  currency?: string;
+  taskCategory?: string;
+  metadata?: Record<string, any>;
+}): Promise<{ success: boolean; escrow?: any; order?: any; error?: string }> {
+  const {
+    taskId,
+    bookingOrderId,
+    posterUid,
+    amount,
+    taskAmount,
+    currency = 'INR',
+    taskCategory,
+    metadata = {},
+  } = params;
+
+  if (!bookingOrderId?.trim()) {
+    return { success: false, error: 'bookingOrderId is required' };
+  }
+
+  return createEscrow({
+    taskId,
+    posterUid,
+    performerUid: 'pending_assignment',
+    amount,
+    taskAmount,
+    currency,
+    taskCategory,
+    metadata: {
+      ...metadata,
+      bookingMode: 'book_now',
+      bookingOrderId,
+    },
+  }).then(async (result) => {
+    if (!result.success || !result.escrow?.id) {
+      return result;
+    }
+
+    if (!isPostgresConnected()) {
+      return result;
+    }
+
+    try {
+      const updated = await prisma.escrow.update({
+        where: { id: result.escrow.id },
+        data: {
+          performerUid: null,
+          bookingOrderId,
+        },
+      });
+      const escrowForFrontend = await convertPostgresEscrowToFrontendFormat(updated);
+      return { ...result, escrow: escrowForFrontend };
+    } catch (err: any) {
+      logger.error('Failed to finalize book-now escrow row', {
+        bookingOrderId,
+        taskId,
+        error: err?.message,
+      });
+      return { success: false, error: err?.message || 'Failed to create booking escrow' };
+    }
+  });
+}
+
+/**
+ * Attach performer after ops assigns helper to a Book Now order.
+ */
+export async function attachPerformerToEscrow(params: {
+  escrowId: string;
+  performerUid: string;
+  applicationId?: string;
+}): Promise<{ success: boolean; escrow?: any; error?: string }> {
+  const { escrowId, performerUid, applicationId } = params;
+
+  if (!escrowId?.trim() || !performerUid?.trim()) {
+    return { success: false, error: 'escrowId and performerUid are required' };
+  }
+
+  if (!isPostgresConnected()) {
+    return { success: false, error: 'Postgres not connected' };
+  }
+
+  try {
+    const existing = await prisma.escrow.findFirst({
+      where: {
+        OR: [{ escrowId }, { id: escrowId }],
+      },
+    });
+
+    if (!existing) {
+      return { success: false, error: 'Escrow not found' };
+    }
+
+    if (!existing.bookingOrderId) {
+      return { success: false, error: 'Escrow is not a Book Now booking' };
+    }
+
+    if (existing.performerUid && existing.performerUid !== performerUid) {
+      return { success: false, error: 'Performer already attached to this escrow' };
+    }
+
+    const metadata =
+      existing.metadata && typeof existing.metadata === 'object' && !Array.isArray(existing.metadata)
+        ? { ...(existing.metadata as Record<string, unknown>) }
+        : {};
+
+    const updated = await prisma.escrow.update({
+      where: { id: existing.id },
+      data: {
+        performerUid,
+        applicationId: applicationId || existing.applicationId,
+        metadata: {
+          ...metadata,
+          performerAttachedAt: new Date().toISOString(),
+        } as any,
+      },
+    });
+
+    logger.info('Performer attached to book-now escrow', {
+      escrowId: updated.escrowId,
+      bookingOrderId: updated.bookingOrderId,
+      performerUid,
+    });
+
+    const escrowForFrontend = await convertPostgresEscrowToFrontendFormat(updated);
+    return { success: true, escrow: escrowForFrontend };
+  } catch (error: any) {
+    logger.error('Failed to attach performer to escrow', {
+      escrowId,
+      performerUid,
+      error: error?.message,
+    });
+    return { success: false, error: error.message || 'Failed to attach performer' };
+  }
+}
+
+/**
  * Update escrow status when payment is captured
  * Now uses Postgres only
  */
@@ -663,6 +807,22 @@ export async function updateEscrowOnPaymentCapture(
           correlationId: postgresEscrow.escrowId,
         }).catch(() => undefined);
       }
+
+      if (postgresEscrow.bookingOrderId) {
+        const { TaskServiceClient } = await import('../clients/TaskServiceClient');
+        TaskServiceClient.notifyBookingPaymentCaptured({
+          bookingOrderId: postgresEscrow.bookingOrderId,
+          escrowId: postgresEscrow.escrowId,
+          razorpayOrderId,
+          taskId: postgresEscrow.taskId,
+        }).catch((err) => {
+          logger.error('Book Now payment-captured callback failed', {
+            bookingOrderId: postgresEscrow.bookingOrderId,
+            taskId: postgresEscrow.taskId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
     } else if (paymentStatus === 'failed') {
       logPaymentFailed({
         escrowId: postgresEscrow.id,
@@ -872,17 +1032,18 @@ export async function releaseEscrow(
 
     (async () => {
       try {
-        if (mongoose.connection.readyState === 1) {
+        if (mongoose.connection.readyState === 1 && postgresEscrow.performerUid) {
           const Profile = mongoose.connection.collection('profiles');
           const posterProfile = await Profile.findOne({ uid: postgresEscrow.posterUid }) || await Profile.findOne({ _id: new mongoose.Types.ObjectId(postgresEscrow.posterUid) });
-          const performerProfile = await Profile.findOne({ uid: postgresEscrow.performerUid }) || await Profile.findOne({ _id: new mongoose.Types.ObjectId(postgresEscrow.performerUid) });
+          const performerUid = postgresEscrow.performerUid;
+          const performerProfile = await Profile.findOne({ uid: performerUid }) || await Profile.findOne({ _id: new mongoose.Types.ObjectId(performerUid) });
           
           if (performerProfile) {
             const amountStr = postgresEscrow.amountInRupees.toString();
             
             // In-app Notification
             await InAppNotificationClient.send({
-              userId: postgresEscrow.performerUid,
+              userId: performerUid,
               title: 'Amount credited',
               body: `Rs ${amountStr} payout credited.`,
               type: 'success',
@@ -895,7 +1056,7 @@ export async function releaseEscrow(
             });
 
             fireWhatsAppNotify({
-              uid: postgresEscrow.performerUid,
+              uid: performerUid,
               templateKey: 'wa_earnings_credited',
               category: 'payments',
               templateBody: {

@@ -134,6 +134,9 @@ export async function processRefund(params: {
       return { success: false, error: 'No capturable balance left to refund on this payment' };
     }
 
+    const isPreAssignmentBookNowCancel =
+      Boolean(postgresEscrow.bookingOrderId) && !postgresEscrow.performerUid;
+
     /** Actual INR captured on Razorpay (task + platform fee + GST, etc.) */
     const capturedRupees = new Prisma.Decimal((capturedPaise / 100).toFixed(2));
     const normalizePercent = (value?: Prisma.Decimal | null): Prisma.Decimal | null => {
@@ -170,8 +173,8 @@ export async function processRefund(params: {
       cancellationFee = new Prisma.Decimal('0.00');
       toOtherParty = new Prisma.Decimal('0.00');
       toPlatform = new Prisma.Decimal('0.00');
-    } else if (cancelledBy === 'performer') {
-      // Tasker cancel: poster gets full captured amount back (includes platform fee + GST)
+    } else if (cancelledBy === 'performer' || isPreAssignmentBookNowCancel) {
+      // Tasker cancel (or Book Now before helper assigned): full captured refund to poster
       // Policy penalty is recovered from performer's future payouts.
       const performerRefundAmount = new Prisma.Decimal((maxRefundablePaise / 100).toFixed(2));
       
@@ -448,7 +451,7 @@ export async function processRefund(params: {
         });
 
         // Performer gets compensation (if applicable)
-        if (toOtherParty.greaterThan(0)) {
+        if (toOtherParty.greaterThan(0) && postgresEscrow.performerUid) {
           updateUserPaymentProfile(postgresEscrow.performerUid, {
             type: 'compensation',
             amount: toOtherParty,

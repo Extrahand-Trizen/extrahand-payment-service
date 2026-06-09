@@ -132,16 +132,18 @@ export async function cancelPayment(params: {
                 feeBaseAmount: feeBase,
                 cancelledBy: refundCancelledBy,
               });
-              const penaltyResult = await createPerformerCancellationPenalty({
-                performerUid: latest.performerUid,
-                taskId: latest.taskId,
-                escrowId: latest.id,
-                taskStartDate: refundTaskStartDate,
-                cancelledAt: cancelledAtTs,
-                feeBaseAmount: feeBase,
-                reason,
-                taskTitle,
-              });
+              const penaltyResult = latest.performerUid
+                ? await createPerformerCancellationPenalty({
+                    performerUid: latest.performerUid,
+                    taskId: latest.taskId,
+                    escrowId: latest.id,
+                    taskStartDate: refundTaskStartDate,
+                    cancelledAt: cancelledAtTs,
+                    feeBaseAmount: feeBase,
+                    reason,
+                    taskTitle,
+                  })
+                : { success: false as const };
               if (penaltyResult.success) {
                 logger.info('[cancellationService] Performer penalty created successfully', {
                   performerUid: latest.performerUid,
@@ -268,16 +270,18 @@ export async function cancelPayment(params: {
           feeBaseAmount: feeBase,
           cancelledBy,
         });
-        const penaltyResult = await createPerformerCancellationPenalty({
-          performerUid: latest.performerUid,
-          taskId: latest.taskId,
-          escrowId: latest.id,
-          taskStartDate: tStart,
-          cancelledAt: cancelledAtTs,
-          feeBaseAmount: feeBase,
-          reason,
-          taskTitle,
-        });
+        const penaltyResult = latest.performerUid
+          ? await createPerformerCancellationPenalty({
+              performerUid: latest.performerUid,
+              taskId: latest.taskId,
+              escrowId: latest.id,
+              taskStartDate: tStart,
+              cancelledAt: cancelledAtTs,
+              feeBaseAmount: feeBase,
+              reason,
+              taskTitle,
+            })
+          : { success: false as const };
         if (penaltyResult.success) {
           logger.info('[cancellationService] Performer penalty created successfully', {
             performerUid: latest.performerUid,

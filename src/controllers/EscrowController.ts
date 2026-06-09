@@ -1,6 +1,8 @@
 import { Response, Request } from 'express';
 import {
   createEscrow,
+  createBookingEscrow,
+  attachPerformerToEscrow,
   getEscrowStatus,
   getEscrowByTaskId,
   releaseEscrow,
@@ -70,6 +72,94 @@ export class EscrowController {
       success: true,
       escrow: result.escrow,
       order: result.order, // Razorpay order for frontend
+    });
+  }
+
+  /**
+   * POST /api/v1/escrow/create-booking
+   * Book Now: create escrow before helper is assigned
+   */
+  static async createBookingEscrow(req: Request, res: Response): Promise<void> {
+    const {
+      taskId,
+      bookingOrderId,
+      posterUid,
+      amount,
+      taskAmount,
+      currency,
+      metadata,
+      taskCategory,
+      taskTitle: taskTitleBody,
+    } = req.body;
+
+    if (!taskId || !bookingOrderId || !posterUid || !amount) {
+      throw new BadRequestError(
+        'Missing required fields: taskId, bookingOrderId, posterUid, amount'
+      );
+    }
+
+    if (amount <= 0) {
+      throw new BadRequestError('Amount must be greater than 0');
+    }
+
+    const baseMeta =
+      metadata && typeof metadata === 'object' && !Array.isArray(metadata)
+        ? { ...(metadata as Record<string, unknown>) }
+        : {};
+    const titleFromBody =
+      typeof taskTitleBody === 'string' && taskTitleBody.trim().length > 0
+        ? taskTitleBody.trim()
+        : undefined;
+    if (titleFromBody && !baseMeta.taskTitle && !baseMeta.taskTitleSnapshot) {
+      baseMeta.taskTitle = titleFromBody;
+    }
+
+    const result = await createBookingEscrow({
+      taskId,
+      bookingOrderId,
+      posterUid,
+      amount,
+      taskAmount,
+      currency,
+      taskCategory,
+      metadata: baseMeta,
+    });
+
+    if (!result.success) {
+      throw new Error(result.error || 'Failed to create booking escrow');
+    }
+
+    res.status(201).json({
+      success: true,
+      escrow: result.escrow,
+      order: result.order,
+    });
+  }
+
+  /**
+   * PATCH /api/v1/escrow/:escrowId/attach-performer
+   */
+  static async attachPerformer(req: Request, res: Response): Promise<void> {
+    const { escrowId } = req.params;
+    const { performerUid, applicationId } = req.body;
+
+    if (!performerUid) {
+      throw new BadRequestError('performerUid is required');
+    }
+
+    const result = await attachPerformerToEscrow({
+      escrowId,
+      performerUid,
+      applicationId,
+    });
+
+    if (!result.success) {
+      throw new BadRequestError(result.error || 'Failed to attach performer');
+    }
+
+    res.json({
+      success: true,
+      escrow: result.escrow,
     });
   }
 

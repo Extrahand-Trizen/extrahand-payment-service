@@ -321,7 +321,7 @@ export async function getUserTransactions(
     // IMPORTANT: Always add all transactions with their correct category, then filter after
     escrows.forEach((escrow) => {
       const isPoster = uidList.includes(escrow.posterUid);
-      const isPerformer = uidList.includes(escrow.performerUid);
+      const isPerformer = escrow.performerUid ? uidList.includes(escrow.performerUid) : false;
       const escrowStatusNormalized = String(escrow.status || '').trim().toLowerCase();
       const escrowMeta =
         escrow.metadata && typeof escrow.metadata === 'object' && !Array.isArray(escrow.metadata)
@@ -624,7 +624,8 @@ export async function getUserTransactions(
           // Any refund credited to the poster (regardless of who cancelled the task)
           const isPosterRefund = uidList.includes(escrow.posterUid);
           const isPerformerCompensation =
-            uidList.includes(escrow.performerUid) &&
+            Boolean(escrow.performerUid) &&
+            uidList.includes(escrow.performerUid!) &&
             refund.cancelledBy === 'poster' &&
             refund.toOtherParty;
 

@@ -269,3 +269,60 @@ export function sanitizeRazorpayData(razorpayData: {
   return sanitized;
 }
 
+/** Razorpay orders.notes: max 15 keys, string values (256 chars each). */
+export const RAZORPAY_NOTES_MAX_KEYS = 15;
+const RAZORPAY_NOTE_VALUE_MAX_LEN = 256;
+
+const RAZORPAY_NOTE_PRIORITY_KEYS = [
+  'type',
+  'taskId',
+  'applicationId',
+  'posterUid',
+  'performerUid',
+  'bookingOrderId',
+  'bookingMode',
+  'originalAmountRupees',
+  'customerCoinDiscountRupees',
+  'pendingCustomerCoinDiscountRupees',
+  'taskCategory',
+  'taskTitle',
+] as const;
+
+function stringifyRazorpayNoteValue(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'object') return null;
+  const str = String(value).trim();
+  if (!str.length) return null;
+  return str.length > RAZORPAY_NOTE_VALUE_MAX_LEN
+    ? str.slice(0, RAZORPAY_NOTE_VALUE_MAX_LEN)
+    : str;
+}
+
+/**
+ * Build Razorpay order notes from metadata. Full metadata is stored on Escrow;
+ * only correlation ids and amounts are sent to Razorpay (15-key limit).
+ */
+export function buildRazorpayOrderNotes(
+  metadata: Record<string, unknown>,
+): Record<string, string> {
+  const notes: Record<string, string> = {};
+
+  const add = (key: string, value: unknown) => {
+    if (Object.keys(notes).length >= RAZORPAY_NOTES_MAX_KEYS) return;
+    if (key in notes) return;
+    const str = stringifyRazorpayNoteValue(value);
+    if (str != null) notes[key] = str;
+  };
+
+  for (const key of RAZORPAY_NOTE_PRIORITY_KEYS) {
+    if (key in metadata) add(key, metadata[key]);
+  }
+
+  for (const [key, value] of Object.entries(metadata)) {
+    if (Object.keys(notes).length >= RAZORPAY_NOTES_MAX_KEYS) break;
+    add(key, value);
+  }
+
+  return notes;
+}
+

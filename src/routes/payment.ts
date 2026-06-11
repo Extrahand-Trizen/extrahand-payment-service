@@ -26,5 +26,11 @@ router.post('/refund', asyncHandler(PaymentController.createRefund));
 // POST /api/v1/payment/cancel
 router.post('/cancel', asyncHandler(PaymentController.cancelPayment));
 
+// POST /api/v1/payment/book-now/cancel-line-item
+router.post(
+  '/book-now/cancel-line-item',
+  asyncHandler(PaymentController.cancelBookNowLineItem),
+);
+
 export default router;
 

@@ -33,6 +33,8 @@ export async function cancelPayment(params: {
   /** Task budget (rupees) for %-fee base; aligns refund with pre-cancel UI */
   feeBaseAmount?: number;
   taskTitle?: string;
+  catalogId?: string | null;
+  partnerReachedLocation?: boolean;
 }): Promise<{ success: boolean; cancelled?: boolean; refundRequired?: boolean; refund?: any; error?: string }> {
   try {
     const {
@@ -44,6 +46,8 @@ export async function cancelPayment(params: {
       assignedAt,
       feeBaseAmount,
       taskTitle,
+      catalogId,
+      partnerReachedLocation,
     } = params;
     const cancelledAtTs = new Date();
 
@@ -112,6 +116,8 @@ export async function cancelPayment(params: {
           userId: userId,
           assignedAt,
           feeBaseAmount,
+          catalogId,
+          partnerReachedLocation,
         });
 
         if (refundResult.success) {
@@ -339,10 +345,22 @@ export async function cancelEscrow(params: {
   assignedAt?: Date;
   feeBaseAmount?: number;
   taskTitle?: string;
+  catalogId?: string | null;
+  partnerReachedLocation?: boolean;
 }): Promise<{ success: boolean; cancelled?: boolean; refundRequired?: boolean; error?: string }> {
   try {
-    const { escrowId, reason, userId, cancelledBy, taskStartDate, assignedAt, feeBaseAmount, taskTitle } =
-      params;
+    const {
+      escrowId,
+      reason,
+      userId,
+      cancelledBy,
+      taskStartDate,
+      assignedAt,
+      feeBaseAmount,
+      taskTitle,
+      catalogId,
+      partnerReachedLocation,
+    } = params;
 
     // Get escrow from Postgres
     if (!isPostgresConnected()) {
@@ -367,6 +385,8 @@ export async function cancelEscrow(params: {
       assignedAt,
       feeBaseAmount,
       taskTitle,
+      catalogId,
+      partnerReachedLocation,
     });
   } catch (error: any) {
     logger.error('❌ Error cancelling escrow:', error);
@@ -391,10 +411,22 @@ export async function cancelEscrowByTaskId(params: {
   assignedAt?: Date;
   feeBaseAmount?: number;
   taskTitle?: string;
+  catalogId?: string | null;
+  partnerReachedLocation?: boolean;
 }): Promise<{ success: boolean; cancelled?: boolean; refundRequired?: boolean; refund?: any; error?: string }> {
   try {
-    const { taskId, reason, userId, cancelledBy, taskStartDate, assignedAt, feeBaseAmount, taskTitle } =
-      params;
+    const {
+      taskId,
+      reason,
+      userId,
+      cancelledBy,
+      taskStartDate,
+      assignedAt,
+      feeBaseAmount,
+      taskTitle,
+      catalogId,
+      partnerReachedLocation,
+    } = params;
 
     // Get escrow from Postgres
     if (!isPostgresConnected()) {
@@ -420,6 +452,8 @@ export async function cancelEscrowByTaskId(params: {
       assignedAt,
       feeBaseAmount,
       taskTitle,
+      catalogId,
+      partnerReachedLocation,
     });
   } catch (error: any) {
     logger.error('❌ Error cancelling escrow by task ID:', error);

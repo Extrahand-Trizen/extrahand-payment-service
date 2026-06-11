@@ -622,6 +622,26 @@ export async function getUserTransactions(
             : undefined;
         const paymentEventDate = resolveEscrowPaymentDate(escrow);
         const partySnapshot = partySnapshotFromEscrowMeta(em);
+        const bookNowLineItems = readBookNowLineItems(em);
+        const isBookNowPayment = isBookNowEscrowRecord(escrow);
+        const cancelledLineTaskIds = Array.isArray(em.cancelledLineTaskIds)
+          ? (em.cancelledLineTaskIds as unknown[]).map((id) => String(id)).filter(Boolean)
+          : [];
+        const cancelledLineDetails = readCancelledBookNowLineDetails(em);
+        const completedRefundsTotal = escrow.refunds
+          .filter((refund) => refund.status === 'completed')
+          .reduce(
+            (sum, refund) => sum + (parseFloat(refund.refundAmount.toString()) || 0),
+            0,
+          );
+        const activeBookNowLineCount = bookNowLineItems.filter(
+          (row) => row.taskId && !cancelledLineTaskIds.includes(String(row.taskId)),
+        ).length;
+        const bookNowPartiallyCancelled =
+          isBookNowPayment &&
+          bookNowLineItems.length > 1 &&
+          cancelledLineTaskIds.length > 0 &&
+          activeBookNowLineCount > 0;
         const paymentLineItems: PosterPaymentLineItem[] = [
           {
             escrowId: escrow.escrowId,
@@ -701,13 +721,32 @@ export async function getUserTransactions(
                   extraCoinsDiscount: lineCoinDiscount,
                   totalPaid: lineAmount,
                 },
-                refundedAmount: latestCompletedRefund?.refundAmount?.toString() || '0',
+                refundedAmount:
+                  completedRefundsTotal > 0
+                    ? completedRefundsTotal.toFixed(2)
+                    : latestCompletedRefund?.refundAmount?.toString() || '0',
                 latestRefundAmount: latestRefund?.refundAmount?.toString() || '0',
                 latestRefundStatus: latestRefund?.status || null,
                 latestCancellationFee: latestRefund?.cancellationFee?.toString() || '0',
                 latestCancelledBy: latestRefund?.cancelledBy || null,
                 appliedPlatformFeePercent: configuredPlatformPct?.toString() || null,
                 appliedGstPercent: configuredGstPct?.toString() || null,
+                ...(isBookNowPayment
+                  ? {
+                      bookingMode: 'book_now',
+                      ...(em.bookingOrderId ? { bookingOrderId: String(em.bookingOrderId) } : {}),
+                      itemCount:
+                        Number(em.itemCount) > 0
+                          ? Number(em.itemCount)
+                          : bookNowLineItems.length > 0
+                            ? bookNowLineItems.length
+                            : undefined,
+                      ...(bookNowLineItems.length > 0 ? { bookNowLineItems } : {}),
+                      ...(cancelledLineTaskIds.length > 0 ? { cancelledLineTaskIds } : {}),
+                      ...(cancelledLineDetails.length > 0 ? { cancelledLineDetails } : {}),
+                      ...(bookNowPartiallyCancelled ? { bookNowPartiallyCancelled: true } : {}),
+                    }
+                  : {}),
                 ...partySnapshot,
               },
             },

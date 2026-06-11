@@ -814,7 +814,8 @@ export async function processBookNowLineItemRefund(params: {
     if (!isBookNowEscrowRecord(postgresEscrow)) {
       return { success: false, error: 'Not a Book Now escrow' };
     }
-    if (!postgresEscrow.razorpayPaymentId) {
+    const razorpayPaymentId = postgresEscrow.razorpayPaymentId;
+    if (!razorpayPaymentId) {
       return { success: false, error: 'Payment not captured — nothing to refund' };
     }
 
@@ -826,7 +827,7 @@ export async function processBookNowLineItemRefund(params: {
       return { success: false, error: 'This service was already refunded' };
     }
 
-    const paymentFetch = await getPaymentDetails(postgresEscrow.razorpayPaymentId);
+    const paymentFetch = await getPaymentDetails(razorpayPaymentId);
     if (!paymentFetch.success || !paymentFetch.payment) {
       return { success: false, error: 'Could not load payment for refund' };
     }
@@ -883,7 +884,7 @@ export async function processBookNowLineItemRefund(params: {
     const toOtherParty = feeResult.toOtherParty;
     const toPlatform = feeResult.toPlatform;
     const razorpayRefundResult = await createRefundAmountPaise(
-      postgresEscrow.razorpayPaymentId,
+      razorpayPaymentId,
       refundPaise,
     );
     if (!razorpayRefundResult.success || !razorpayRefundResult.refund) {
@@ -933,7 +934,7 @@ export async function processBookNowLineItemRefund(params: {
           refundId,
           escrowId: postgresEscrow.id,
           taskId,
-          paymentId: postgresEscrow.razorpayPaymentId,
+          paymentId: razorpayPaymentId,
           razorpayRefundId: razorpayRefund.id,
           refundAmount,
           cancellationFee: cancellationFee.greaterThan(0) ? cancellationFee : null,

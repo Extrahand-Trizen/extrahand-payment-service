@@ -4,6 +4,7 @@ import { razorpay, RAZORPAY_CONFIG } from '../config/razorpay';
 import logger from '../config/logger';
 import { prisma } from '../config/prisma';
 import { isPostgresConnected } from '../config/database';
+import { buildRazorpayOrderNotes } from '../utils/paymentSanitizer';
 import {
   isReviewBypassPhone,
   isReviewBypassUid,
@@ -47,7 +48,7 @@ export const createOrder = async (amount: number, currency: string = 'INR', meta
       amount: amount, // Convert to paise
       currency,
       receipt: `receipt_${Date.now()}`,
-      notes: metadata,
+      notes: buildRazorpayOrderNotes(metadata),
     };
 
     const order = await razorpay.orders.create(options);

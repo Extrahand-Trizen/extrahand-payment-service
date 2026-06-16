@@ -17,6 +17,7 @@ import logger from '../config/logger';
 import { prisma } from '../config/prisma';
 import { RAZORPAY_CONFIG } from '../config/razorpay';
 import { isReviewBypassOrderId } from '../utils/reviewBypass';
+import { processBookNowLineItemRefund } from '../services/refundService';
 
 export class PaymentController {
   /**
@@ -133,23 +134,31 @@ export class PaymentController {
     }
 
     // Update escrow with payment entity so razorpayPaymentData is stored (sanitized)
-    try {
-      const paymentResult = await getPaymentDetails(razorpay_payment_id);
-      const paymentEntity = paymentResult.success ? paymentResult.payment : undefined;
-      await updateEscrowOnPaymentCapture(
+    const paymentResult = await getPaymentDetails(razorpay_payment_id);
+    const paymentEntity = paymentResult.success ? paymentResult.payment : undefined;
+    const captureResult = await updateEscrowOnPaymentCapture(
+      razorpay_order_id,
+      razorpay_payment_id,
+      'captured',
+      paymentEntity,
+    );
+
+    if (!captureResult.success) {
+      logger.error('Escrow update failed after payment verification', {
         razorpay_order_id,
         razorpay_payment_id,
-        'captured',
-        paymentEntity
+        error: captureResult.error,
+      });
+      throw new BadRequestError(
+        captureResult.error ||
+          'Payment was received but escrow could not be saved. Please contact support with your payment ID.',
       );
-    } catch (escrowError: any) {
-      // Log error but don't fail the payment verification
-      logger.warn('Failed to update escrow on payment capture:', escrowError);
     }
 
     res.json({
       success: true,
       message: result.message,
+      escrowId: captureResult.escrow?.escrowId,
     });
   }
 
@@ -233,6 +242,8 @@ export class PaymentController {
       assignedAt,
       feeBaseAmount,
       taskTitle,
+      catalogId,
+      partnerReachedLocation,
     } = req.body;
 
     logger.info('[PaymentController.cancelPayment] Request received', {
@@ -265,6 +276,8 @@ export class PaymentController {
         assignedAt: assignedAtDate,
         feeBaseAmount: feeBaseToPass,
         taskTitle: typeof taskTitle === 'string' ? taskTitle : undefined,
+        catalogId: typeof catalogId === 'string' ? catalogId : undefined,
+        partnerReachedLocation: Boolean(partnerReachedLocation),
       });
     } else if (escrowId) {
       result = await cancelEscrow({
@@ -276,6 +289,8 @@ export class PaymentController {
         assignedAt: assignedAtDate,
         feeBaseAmount: feeBaseToPass,
         taskTitle: typeof taskTitle === 'string' ? taskTitle : undefined,
+        catalogId: typeof catalogId === 'string' ? catalogId : undefined,
+        partnerReachedLocation: Boolean(partnerReachedLocation),
       });
     } else if (taskId) {
       result = await cancelEscrowByTaskId({
@@ -287,6 +302,8 @@ export class PaymentController {
         assignedAt: assignedAtDate,
         feeBaseAmount: feeBaseToPass,
         taskTitle: typeof taskTitle === 'string' ? taskTitle : undefined,
+        catalogId: typeof catalogId === 'string' ? catalogId : undefined,
+        partnerReachedLocation: Boolean(partnerReachedLocation),
       });
     } else {
       throw new BadRequestError('Either razorpayOrderId, escrowId, or taskId is required');
@@ -325,6 +342,57 @@ export class PaymentController {
     });
 
     res.json(response);
+  }
+
+  /**
+   * POST /api/v1/payment/book-now/cancel-line-item
+   * Partial refund for one service in a multi-item Book Now checkout.
+   */
+  static async cancelBookNowLineItem(req: Request, res: Response): Promise<void> {
+    const {
+      bookingOrderId,
+      taskId,
+      lineAmountRupees,
+      taskStartDate,
+      assignedAt,
+      reason,
+      userId,
+      taskTitle,
+      isLastActiveItem,
+      catalogId,
+      partnerReachedLocation,
+    } = req.body;
+
+    if (!bookingOrderId || !taskId || lineAmountRupees == null || !taskStartDate) {
+      throw new BadRequestError(
+        'bookingOrderId, taskId, lineAmountRupees, and taskStartDate are required',
+      );
+    }
+
+    const amount = Number(lineAmountRupees);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      throw new BadRequestError('lineAmountRupees must be a positive number');
+    }
+
+    const result = await processBookNowLineItemRefund({
+      bookingOrderId: String(bookingOrderId),
+      taskId: String(taskId),
+      lineAmountRupees: amount,
+      taskStartDate: new Date(taskStartDate),
+      assignedAt: assignedAt ? new Date(assignedAt) : null,
+      reason: typeof reason === 'string' ? reason : undefined,
+      userId: typeof userId === 'string' ? userId : undefined,
+      taskTitle: typeof taskTitle === 'string' ? taskTitle : undefined,
+      isLastActiveItem: Boolean(isLastActiveItem),
+      catalogId: typeof catalogId === 'string' ? catalogId : undefined,
+      partnerReachedLocation: Boolean(partnerReachedLocation),
+    });
+
+    if (!result.success) {
+      throw new BadRequestError(result.error || 'Partial refund failed');
+    }
+
+    res.json({ success: true, refund: result.refund });
   }
 
   /**

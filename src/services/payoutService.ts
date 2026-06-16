@@ -1090,7 +1090,7 @@ export async function processTaskCompletionPayout(params: {
     });
 
     const linkedPerformerUids: string[] = [];
-    if (taskEscrow && taskEscrow.performerUid !== performerUid) {
+    if (taskEscrow?.performerUid && taskEscrow.performerUid !== performerUid) {
       linkedPerformerUids.push(taskEscrow.performerUid);
       logger.debug('[payoutService] Found different performer in escrow, will check linked accounts', {
         requestedPerformerUid: performerUid,

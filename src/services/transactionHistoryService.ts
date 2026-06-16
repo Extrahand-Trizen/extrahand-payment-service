@@ -1,6 +1,7 @@
 import { prisma } from '../config/prisma';
 import logger from '../config/logger';
 import { Prisma } from '@prisma/client';
+import { isBookNowEscrowRecord } from './escrowService';
 
 const SUCCESSFUL_ESCROW_PAYMENT_STATUSES = new Set(['held', 'released']);
 const SUCCESSFUL_PAYOUT_STATUSES = new Set(['completed', 'released']);
@@ -113,6 +114,184 @@ function posterPaymentLabel(kind: 'initial' | 'additional'): string {
   return kind === 'additional'
     ? 'Additional payment (helper request)'
     : 'Original task payment';
+}
+
+type CancelledBookNowLineDetail = {
+  taskId?: string;
+  taskTitle?: string;
+  lineAmountRupees?: number | string;
+  refundAmount?: string;
+  cancellationFee?: string;
+  cancellationFeePercentage?: number;
+  cancellationPolicyLabel?: string;
+  cancellationPolicyKey?: string;
+};
+
+type BookNowLineItemSnapshot = {
+  taskId?: string;
+  taskTitle?: string;
+  lineAmountRupees?: number | string;
+};
+
+function readCancelledBookNowLineDetails(em: Record<string, unknown>): CancelledBookNowLineDetail[] {
+  if (!Array.isArray(em.cancelledLineDetails)) return [];
+  return em.cancelledLineDetails as CancelledBookNowLineDetail[];
+}
+
+function readBookNowLineItems(em: Record<string, unknown>): BookNowLineItemSnapshot[] {
+  if (!Array.isArray(em.bookNowLineItems)) return [];
+  return em.bookNowLineItems as BookNowLineItemSnapshot[];
+}
+
+function isAggregateBookNowTitle(title?: string): boolean {
+  const text = String(title || '').trim();
+  if (!text) return false;
+  return /book\s*now/i.test(text) && /\(\s*\d+\s*services?\s*\)/i.test(text);
+}
+
+function parseBookNowLineTitleFromReason(reason: string | null | undefined): string | undefined {
+  const prefix = 'Book Now line cancelled:';
+  const text = String(reason || '').trim();
+  if (!text.startsWith(prefix)) return undefined;
+  const title = text.slice(prefix.length).trim();
+  return title || undefined;
+}
+
+function truncateTitle(title: string, max = 100): string {
+  return title.length > max ? `${title.slice(0, max - 3)}...` : title;
+}
+
+function resolveBookNowLineRefundDisplay(
+  refund: {
+    taskId: string | null;
+    reason: string | null;
+    refundAmount: { toString(): string };
+    cancellationFee: { toString(): string } | null;
+  },
+  escrow: { taskId: string; metadata: unknown; amountInRupees?: { toString(): string } },
+  escrowTitle?: string,
+): {
+  isLineItem: boolean;
+  taskId: string;
+  title?: string;
+  lineItemAmount?: string;
+  cancellationPolicyLabel?: string;
+  cancellationFeePercentage?: number;
+} {
+  const refundTaskId = String(refund.taskId || escrow.taskId);
+  const isBookNow = isBookNowEscrowRecord(escrow);
+  const em =
+    escrow.metadata && typeof escrow.metadata === 'object' && !Array.isArray(escrow.metadata)
+      ? (escrow.metadata as Record<string, unknown>)
+      : {};
+
+  const cancelledIds = Array.isArray(em.cancelledLineTaskIds)
+    ? (em.cancelledLineTaskIds as unknown[]).map((id) => String(id))
+    : [];
+  const lineDetail = readCancelledBookNowLineDetails(em).find(
+    (row) => String(row.taskId) === refundTaskId,
+  );
+  const lineSnapshot = readBookNowLineItems(em).find(
+    (row) => String(row.taskId) === refundTaskId,
+  );
+  const titleFromReason = parseBookNowLineTitleFromReason(refund.reason);
+  const fee = parseFloat(String(refund.cancellationFee?.toString() || '0')) || 0;
+  const refundAmt = parseFloat(refund.refundAmount.toString()) || 0;
+  const escrowTotal = parseFloat(String(escrow.amountInRupees?.toString() || '0')) || 0;
+  const itemCount = Number(em.itemCount) || 0;
+  const linePaidAmount = fee > 0 && refundAmt > 0 ? fee + refundAmt : 0;
+  const isPartialBookNowRefund =
+    isBookNow &&
+    (itemCount > 1 || readBookNowLineItems(em).length > 1) &&
+    linePaidAmount > 0 &&
+    escrowTotal > 0 &&
+    linePaidAmount + 0.01 < escrowTotal;
+
+  const isLineItem =
+    isBookNow &&
+    (cancelledIds.includes(refundTaskId) ||
+      Boolean(lineDetail) ||
+      Boolean(titleFromReason) ||
+      isPartialBookNowRefund ||
+      Boolean(refund.taskId && refund.taskId !== escrow.taskId));
+
+  if (!isLineItem) {
+    return { isLineItem: false, taskId: refundTaskId, title: escrowTitle };
+  }
+
+  const resolvedTitle =
+    (lineDetail?.taskTitle && String(lineDetail.taskTitle).trim()) ||
+    (lineSnapshot?.taskTitle && String(lineSnapshot.taskTitle).trim()) ||
+    titleFromReason ||
+    (!isAggregateBookNowTitle(escrowTitle) ? escrowTitle : undefined);
+
+  const lineItemAmount =
+    lineDetail?.lineAmountRupees != null
+      ? String(lineDetail.lineAmountRupees)
+      : lineSnapshot?.lineAmountRupees != null
+        ? String(lineSnapshot.lineAmountRupees)
+        : linePaidAmount > 0
+          ? linePaidAmount.toFixed(2)
+          : undefined;
+
+  return {
+    isLineItem: true,
+    taskId: refundTaskId,
+    title: resolvedTitle,
+    lineItemAmount,
+    cancellationPolicyLabel: lineDetail?.cancellationPolicyLabel,
+    cancellationFeePercentage: lineDetail?.cancellationFeePercentage,
+  };
+}
+
+function resolveRefundCancellationPolicyMeta(
+  refund: {
+    cancelledBy: string | null;
+    cancellationFee: { toString(): string } | null;
+    refundAmount: { toString(): string };
+  },
+  lineDisplay: ReturnType<typeof resolveBookNowLineRefundDisplay>,
+  paidAmount?: string,
+): {
+  cancellationPolicyLabel?: string;
+  cancellationFeePercentage?: number;
+} {
+  if (lineDisplay.cancellationPolicyLabel) {
+    return {
+      cancellationPolicyLabel: lineDisplay.cancellationPolicyLabel,
+      cancellationFeePercentage: lineDisplay.cancellationFeePercentage,
+    };
+  }
+
+  const fee = parseFloat(String(refund.cancellationFee?.toString() || '0')) || 0;
+  const refundAmt = parseFloat(refund.refundAmount.toString()) || 0;
+  const paid =
+    parseFloat(String(paidAmount || '0')) || (fee > 0 && refundAmt > 0 ? fee + refundAmt : 0);
+  if (fee <= 0) {
+    return { cancellationPolicyLabel: 'No cancellation fee applied', cancellationFeePercentage: 0 };
+  }
+
+  const pct = paid > 0 ? fee / paid : 0;
+  const feePercentDisplay = Math.round(pct * 100);
+  if (refund.cancelledBy === 'poster') {
+    if (feePercentDisplay === 10) {
+      return {
+        cancellationPolicyLabel: '10% cancellation fee — within 24 hours of service start',
+        cancellationFeePercentage: 0.1,
+      };
+    }
+    if (feePercentDisplay === 20) {
+      return {
+        cancellationPolicyLabel: '20% cancellation fee — within 1 hour of service start',
+        cancellationFeePercentage: 0.2,
+      };
+    }
+  }
+
+  return {
+    cancellationPolicyLabel: `${feePercentDisplay}% cancellation fee applied`,
+    cancellationFeePercentage: pct,
+  };
 }
 
 function buildPosterPaymentLineItem(row: Transaction): PosterPaymentLineItem {
@@ -321,7 +500,7 @@ export async function getUserTransactions(
     // IMPORTANT: Always add all transactions with their correct category, then filter after
     escrows.forEach((escrow) => {
       const isPoster = uidList.includes(escrow.posterUid);
-      const isPerformer = uidList.includes(escrow.performerUid);
+      const isPerformer = escrow.performerUid ? uidList.includes(escrow.performerUid) : false;
       const escrowStatusNormalized = String(escrow.status || '').trim().toLowerCase();
       const escrowMeta =
         escrow.metadata && typeof escrow.metadata === 'object' && !Array.isArray(escrow.metadata)
@@ -443,6 +622,26 @@ export async function getUserTransactions(
             : undefined;
         const paymentEventDate = resolveEscrowPaymentDate(escrow);
         const partySnapshot = partySnapshotFromEscrowMeta(em);
+        const bookNowLineItems = readBookNowLineItems(em);
+        const isBookNowPayment = isBookNowEscrowRecord(escrow);
+        const cancelledLineTaskIds = Array.isArray(em.cancelledLineTaskIds)
+          ? (em.cancelledLineTaskIds as unknown[]).map((id) => String(id)).filter(Boolean)
+          : [];
+        const cancelledLineDetails = readCancelledBookNowLineDetails(em);
+        const completedRefundsTotal = escrow.refunds
+          .filter((refund) => refund.status === 'completed')
+          .reduce(
+            (sum, refund) => sum + (parseFloat(refund.refundAmount.toString()) || 0),
+            0,
+          );
+        const activeBookNowLineCount = bookNowLineItems.filter(
+          (row) => row.taskId && !cancelledLineTaskIds.includes(String(row.taskId)),
+        ).length;
+        const bookNowPartiallyCancelled =
+          isBookNowPayment &&
+          bookNowLineItems.length > 1 &&
+          cancelledLineTaskIds.length > 0 &&
+          activeBookNowLineCount > 0;
         const paymentLineItems: PosterPaymentLineItem[] = [
           {
             escrowId: escrow.escrowId,
@@ -522,13 +721,32 @@ export async function getUserTransactions(
                   extraCoinsDiscount: lineCoinDiscount,
                   totalPaid: lineAmount,
                 },
-                refundedAmount: latestCompletedRefund?.refundAmount?.toString() || '0',
+                refundedAmount:
+                  completedRefundsTotal > 0
+                    ? completedRefundsTotal.toFixed(2)
+                    : latestCompletedRefund?.refundAmount?.toString() || '0',
                 latestRefundAmount: latestRefund?.refundAmount?.toString() || '0',
                 latestRefundStatus: latestRefund?.status || null,
                 latestCancellationFee: latestRefund?.cancellationFee?.toString() || '0',
                 latestCancelledBy: latestRefund?.cancelledBy || null,
                 appliedPlatformFeePercent: configuredPlatformPct?.toString() || null,
                 appliedGstPercent: configuredGstPct?.toString() || null,
+                ...(isBookNowPayment
+                  ? {
+                      bookingMode: 'book_now',
+                      ...(em.bookingOrderId ? { bookingOrderId: String(em.bookingOrderId) } : {}),
+                      itemCount:
+                        Number(em.itemCount) > 0
+                          ? Number(em.itemCount)
+                          : bookNowLineItems.length > 0
+                            ? bookNowLineItems.length
+                            : undefined,
+                      ...(bookNowLineItems.length > 0 ? { bookNowLineItems } : {}),
+                      ...(cancelledLineTaskIds.length > 0 ? { cancelledLineTaskIds } : {}),
+                      ...(cancelledLineDetails.length > 0 ? { cancelledLineDetails } : {}),
+                      ...(bookNowPartiallyCancelled ? { bookNowPartiallyCancelled: true } : {}),
+                    }
+                  : {}),
                 ...partySnapshot,
               },
             },
@@ -624,48 +842,104 @@ export async function getUserTransactions(
           // Any refund credited to the poster (regardless of who cancelled the task)
           const isPosterRefund = uidList.includes(escrow.posterUid);
           const isPerformerCompensation =
-            uidList.includes(escrow.performerUid) &&
+            Boolean(escrow.performerUid) &&
+            uidList.includes(escrow.performerUid!) &&
             refund.cancelledBy === 'poster' &&
             refund.toOtherParty;
 
           if (isPosterRefund) {
+            const lineDisplay = resolveBookNowLineRefundDisplay(
+              refund,
+              escrow,
+              taskTitleSnapshot,
+            );
+            const refundTitle = lineDisplay.title;
+            const feeStr = refund.cancellationFee?.toString() || '0';
+            const refundAmtStr = refund.refundAmount.toString();
+            const lineItemAmount =
+              lineDisplay.lineItemAmount ||
+              (parseFloat(feeStr) > 0
+                ? (parseFloat(feeStr) + parseFloat(refundAmtStr)).toFixed(2)
+                : undefined);
+            const policyMeta = resolveRefundCancellationPolicyMeta(
+              refund,
+              lineDisplay,
+              lineDisplay.isLineItem ? lineItemAmount : totalPaid.toString(),
+            );
+
             // Poster gets refund (money back) - this is a payment-related transaction
             transactions.push({
               id: refund.id,
               transactionId: refund.refundId,
               type: 'refund',
-              amount: refund.refundAmount.toString(),
+              amount: refundAmtStr,
               status: refund.status,
-              description: taskTitleSnapshot
-                ? `Refund — ${taskTitleSnapshot.length > 100 ? `${taskTitleSnapshot.slice(0, 97)}...` : taskTitleSnapshot}`
-                : `Money returned for cancelled task ${escrow.taskId}`,
+              description: refundTitle
+                ? `Refund — ${truncateTitle(refundTitle)}`
+                : `Money returned for cancelled task ${lineDisplay.taskId}`,
               date: refund.createdAt.toISOString(),
               relatedEntityId: refund.escrowId || undefined,
               category: 'payments', // Money returned (related to payment)
               metadata: {
-                taskId: escrow.taskId,
-                ...(taskTitleSnapshot
+                taskId: lineDisplay.taskId,
+                ...(refundTitle
                   ? {
-                      taskTitle: taskTitleSnapshot,
-                      taskTitleSnapshot,
+                      taskTitle: refundTitle,
+                      taskTitleSnapshot: refundTitle,
+                      ...(lineDisplay.isLineItem
+                        ? { cancelledServiceTitle: refundTitle }
+                        : {}),
                     }
                   : {}),
-                ...(taskCategorySnapshot
+                ...(policyMeta.cancellationPolicyLabel
+                  ? {
+                      cancellationPolicyLabel: policyMeta.cancellationPolicyLabel,
+                      cancellationFeePercentage: policyMeta.cancellationFeePercentage,
+                    }
+                  : {}),
+                ...(taskCategorySnapshot && !lineDisplay.isLineItem
                   ? { taskCategory: taskCategorySnapshot, taskCategorySnapshot }
                   : {}),
-                ...(taskDescriptionSnapshot ? { taskDescription: taskDescriptionSnapshot } : {}),
-                cancellationFee: refund.cancellationFee?.toString() || '0',
-                refundAmount: refund.refundAmount.toString(),
+                ...(taskDescriptionSnapshot && !lineDisplay.isLineItem
+                  ? { taskDescription: taskDescriptionSnapshot }
+                  : {}),
+                cancellationFee: feeStr,
+                refundAmount: refundAmtStr,
                 toOtherParty: refund.toOtherParty?.toString() || '0',
                 toPlatform: refund.toPlatform?.toString() || '0',
                 cancelledBy: refund.cancelledBy,
                 reason: refund.reason,
-                originalAmount: escrow.amountInRupees.toString(),
-                taskAmount: taskAmount.toString(),
-                platformFee: finalPlatformFee.toString(),
-                gstAmount: finalGst.toString(),
-                totalPaid: totalPaid.toString(),
-              }
+                ...(lineDisplay.isLineItem
+                  ? {
+                      bookingMode: 'book_now',
+                      bookNowLineRefund: true,
+                      lineItemAmount,
+                      originalAmount: lineItemAmount,
+                      taskAmount: lineItemAmount,
+                      totalPaid: lineItemAmount,
+                      amountBreakdown: {
+                        lineItemAmount,
+                        cancellationFee: feeStr,
+                        refundAmount: refundAmtStr,
+                      },
+                    }
+                  : {
+                      originalAmount: escrow.amountInRupees.toString(),
+                      taskAmount: taskAmount.toString(),
+                      platformFee: finalPlatformFee.toString(),
+                      gstAmount: finalGst.toString(),
+                      totalPaid: totalPaid.toString(),
+                      ...(parseFloat(feeStr) > 0
+                        ? {
+                            amountBreakdown: {
+                              lineItemAmount: totalPaid.toString(),
+                              cancellationFee: feeStr,
+                              refundAmount: refundAmtStr,
+                            },
+                          }
+                        : {}),
+                    }),
+              },
             });
           } else if (isPerformerCompensation) {
             // Performer gets compensation (money earned) - this is an earnings transaction

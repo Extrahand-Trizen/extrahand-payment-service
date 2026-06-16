@@ -1,9 +1,9 @@
 import { razorpay } from '../config/razorpay';
 import logger from '../config/logger';
-import { isPostgresConnected } from '../config/database';
+import { ensurePostgresReady, isPostgresConnected } from '../config/database';
 import { REVIEW_ORDER_ID_PREFIX } from '../utils/reviewBypass';
 // PaymentTransaction model removed - using Postgres Ledger instead
-import { createOrder } from './paymentService';
+import { createOrder, getOrderDetails } from './paymentService';
 import { sanitizeRazorpayOrderData, sanitizeRazorpayData, sanitizeRazorpayPaymentData } from '../utils/paymentSanitizer';
 import { prisma } from '../config/prisma';
 import { getFeeStructureForCategory } from './feeConfigService';
@@ -24,6 +24,53 @@ import { CoinUsageConfigProvider } from '../rewards/config/CoinUsageConfigProvid
  */
 function generateEscrowId(): string {
   return `escrow_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+}
+
+/** Book Now order id — column when migrated, else metadata from createEscrow. */
+export function resolveEscrowBookingOrderId(escrow: {
+  bookingOrderId?: string | null;
+  metadata?: unknown;
+}): string | null {
+  const column = escrow.bookingOrderId?.trim();
+  if (column) return column;
+
+  if (!escrow.metadata || typeof escrow.metadata !== 'object' || Array.isArray(escrow.metadata)) {
+    return null;
+  }
+  const fromMeta = (escrow.metadata as Record<string, unknown>).bookingOrderId;
+  return typeof fromMeta === 'string' && fromMeta.trim() ? fromMeta.trim() : null;
+}
+
+export async function findEscrowByBookingOrderId(bookingOrderId: string) {
+  const id = bookingOrderId?.trim();
+  if (!id) return null;
+
+  const byColumn = await prisma.escrow.findFirst({
+    where: { bookingOrderId: id },
+    orderBy: { createdAt: 'desc' },
+  });
+  if (byColumn) return byColumn;
+
+  return prisma.escrow.findFirst({
+    where: {
+      metadata: {
+        path: ['bookingOrderId'],
+        equals: id,
+      },
+    },
+    orderBy: { createdAt: 'desc' },
+  });
+}
+
+export function isBookNowEscrowRecord(escrow: {
+  bookingOrderId?: string | null;
+  metadata?: unknown;
+}): boolean {
+  if (resolveEscrowBookingOrderId(escrow)) return true;
+  if (!escrow.metadata || typeof escrow.metadata !== 'object' || Array.isArray(escrow.metadata)) {
+    return false;
+  }
+  return (escrow.metadata as Record<string, unknown>).bookingMode === 'book_now';
 }
 
 function generatePaymentTransactionId(): string {
@@ -172,6 +219,7 @@ async function convertPostgresEscrowToFrontendFormat(postgresEscrow: any): Promi
     applicationId: postgresEscrow.applicationId,
     posterUid: postgresEscrow.posterUid,
     performerUid: postgresEscrow.performerUid,
+    bookingOrderId: resolveEscrowBookingOrderId(postgresEscrow),
     amount: postgresEscrow.amount.toString(),
     amountInRupees: postgresEscrow.amountInRupees.toString(),
     currency: postgresEscrow.currency,
@@ -232,6 +280,13 @@ export async function createEscrow(params: {
       return { success: false, error: 'Invalid amount' };
     }
 
+    if (!(await ensurePostgresReady())) {
+      return {
+        success: false,
+        error: 'Payment database not ready. Please try again in a moment.',
+      };
+    }
+
     const escrowId = generateEscrowId();
     const coinCaps = await CoinUsageConfigProvider.getCapPercents();
     const posterCapPercent = paymentRewardsFlags.CUSTOMER_BOOKING_COIN_CAP_ENABLED
@@ -287,6 +342,7 @@ export async function createEscrow(params: {
       posterUid,
       performerUid,
       type: 'escrow',
+      ...(taskCategory ? { taskCategory } : {}),
       ...metadata,
       pendingCustomerCoinDiscountRupees: pendingCoinRupees.toString(),
       customerCoinDiscountRupees: pendingCoinRupees.toString(),
@@ -314,15 +370,6 @@ export async function createEscrow(params: {
       } as Record<string, unknown>,
       { taskCategory: taskCategory ?? null }
     );
-
-    // If Postgres is not connected, return order without saving
-    if (!isPostgresConnected()) {
-      logger.warn('⚠️ Postgres not connected - Escrow created but not saved');
-      return {
-        success: true,
-        order: razorpayOrder,
-      };
-    }
 
     // Calculate auto-release date if enabled
     let autoReleaseDate: Date | null = null;
@@ -358,6 +405,11 @@ export async function createEscrow(params: {
         ? new Prisma.Decimal(feeForCategory.processingFees.razorpayFeeGstPercentage.toString())
         : undefined;
 
+      const bookingOrderIdColumn =
+        typeof metadata.bookingOrderId === 'string' && metadata.bookingOrderId.trim()
+          ? metadata.bookingOrderId.trim()
+          : null;
+
       // Create escrow in Postgres (all data - financial + metadata)
       const postgresEscrow = await prisma.escrow.create({
         data: {
@@ -367,6 +419,7 @@ export async function createEscrow(params: {
           applicationId: applicationId || null,
           posterUid,
           performerUid,
+          bookingOrderId: bookingOrderIdColumn,
           amount: amountDecimal,
           currency,
           amountInRupees: amountInRupeesDecimal,
@@ -401,6 +454,8 @@ export async function createEscrow(params: {
         escrowId,
         taskId,
         razorpayOrderId: razorpayOrder.id,
+        bookingOrderId: bookingOrderIdColumn,
+        bookingMode: (metadata as Record<string, unknown>)?.bookingMode,
         amount,
       });
 
@@ -432,6 +487,211 @@ export async function createEscrow(params: {
 }
 
 /**
+ * Create escrow for Book Now — payment before helper assignment (no performer yet).
+ */
+export async function createBookingEscrow(params: {
+  taskId: string;
+  bookingOrderId: string;
+  posterUid: string;
+  amount: number;
+  taskAmount?: number;
+  currency?: string;
+  taskCategory?: string;
+  metadata?: Record<string, any>;
+}): Promise<{ success: boolean; escrow?: any; order?: any; error?: string }> {
+  const {
+    taskId,
+    bookingOrderId,
+    posterUid,
+    amount,
+    taskAmount,
+    currency = 'INR',
+    taskCategory,
+    metadata = {},
+  } = params;
+
+  if (!bookingOrderId?.trim()) {
+    return { success: false, error: 'bookingOrderId is required' };
+  }
+
+  return createEscrow({
+    taskId,
+    posterUid,
+    performerUid: 'pending_assignment',
+    amount,
+    taskAmount,
+    currency,
+    taskCategory,
+    metadata: {
+      ...metadata,
+      bookingMode: 'book_now',
+      bookingOrderId,
+    },
+  });
+}
+
+/**
+ * Attach performer after ops assigns helper to a Book Now order.
+ */
+export async function attachPerformerToEscrow(params: {
+  escrowId: string;
+  performerUid: string;
+  applicationId?: string;
+}): Promise<{ success: boolean; escrow?: any; error?: string }> {
+  const { escrowId, performerUid, applicationId } = params;
+
+  if (!escrowId?.trim() || !performerUid?.trim()) {
+    return { success: false, error: 'escrowId and performerUid are required' };
+  }
+
+  if (!(await ensurePostgresReady())) {
+    return { success: false, error: 'Postgres not connected' };
+  }
+
+  try {
+    const existing = await prisma.escrow.findFirst({
+      where: {
+        OR: [{ escrowId }, { id: escrowId }],
+      },
+    });
+
+    if (!existing) {
+      return { success: false, error: 'Escrow not found' };
+    }
+
+    if (!isBookNowEscrowRecord(existing)) {
+      return { success: false, error: 'Escrow is not a Book Now booking' };
+    }
+
+    const pendingPerformer =
+      !existing.performerUid || existing.performerUid === 'pending_assignment';
+    if (!pendingPerformer && existing.performerUid !== performerUid) {
+      return { success: false, error: 'Performer already attached to this escrow' };
+    }
+
+    const metadata =
+      existing.metadata && typeof existing.metadata === 'object' && !Array.isArray(existing.metadata)
+        ? { ...(existing.metadata as Record<string, unknown>) }
+        : {};
+
+    const updated = await prisma.escrow.update({
+      where: { id: existing.id },
+      data: {
+        performerUid,
+        applicationId: applicationId || existing.applicationId,
+        metadata: {
+          ...metadata,
+          performerAttachedAt: new Date().toISOString(),
+        } as any,
+      },
+    });
+
+    logger.info('Performer attached to book-now escrow', {
+      escrowId: updated.escrowId,
+      bookingOrderId: resolveEscrowBookingOrderId(updated),
+      performerUid,
+    });
+
+    const escrowForFrontend = await convertPostgresEscrowToFrontendFormat(updated);
+    return { success: true, escrow: escrowForFrontend };
+  } catch (error: any) {
+    logger.error('Failed to attach performer to escrow', {
+      escrowId,
+      performerUid,
+      error: error?.message,
+    });
+    return { success: false, error: error.message || 'Failed to attach performer' };
+  }
+}
+
+/**
+ * Rebuild a missing Escrow row from Razorpay order notes (legacy race when Postgres was not ready).
+ */
+async function recoverEscrowFromRazorpayOrder(razorpayOrderId: string) {
+  const orderResult = await getOrderDetails(razorpayOrderId);
+  if (!orderResult.success || !orderResult.order) {
+    return null;
+  }
+
+  const order = orderResult.order as Record<string, unknown>;
+  const notes = (order.notes as Record<string, unknown>) || {};
+  const taskId = String(notes.taskId || '').trim();
+  const posterUid = String(notes.posterUid || '').trim();
+  if (!taskId || !posterUid) {
+    return null;
+  }
+
+  const performerUid = String(notes.performerUid || 'pending_assignment').trim() || 'pending_assignment';
+  const applicationId = String(notes.applicationId || '').trim() || null;
+  const bookingOrderId = String(notes.bookingOrderId || '').trim() || null;
+  const amountPaise = Number(order.amount);
+  if (!Number.isFinite(amountPaise) || amountPaise <= 0) {
+    return null;
+  }
+
+  const amountInRupees = new Prisma.Decimal((amountPaise / 100).toFixed(2));
+  const originalAmount = Number(notes.originalAmountRupees);
+  const taskAmountDecimal = Number.isFinite(originalAmount) && originalAmount > 0
+    ? new Prisma.Decimal(originalAmount.toFixed(2))
+    : amountInRupees;
+
+  const escrowMetadata = buildEscrowMetadataSnapshot(
+    {
+      ...notes,
+      recoveredFromRazorpayOrder: true,
+      recoveredAt: new Date().toISOString(),
+    } as Record<string, unknown>,
+    {
+      taskCategory:
+        typeof notes.taskCategory === 'string' ? notes.taskCategory : null,
+    },
+  );
+
+  const escrowId = generateEscrowId();
+  const sanitizedOrderData = sanitizeRazorpayOrderData(order);
+
+  const recovered = await prisma.escrow.create({
+    data: {
+      escrowId,
+      razorpayOrderId,
+      taskId,
+      applicationId,
+      posterUid,
+      performerUid,
+      bookingOrderId,
+      amount: new Prisma.Decimal(amountPaise.toString()),
+      currency: String(order.currency || 'INR'),
+      amountInRupees,
+      taskAmount: taskAmountDecimal,
+      status: 'pending',
+      razorpayOrderData: sanitizedOrderData as any,
+      metadata: escrowMetadata as any,
+      taskCategory:
+        typeof notes.taskCategory === 'string' ? notes.taskCategory : null,
+    },
+  });
+
+  await createLedgerEntry({
+    escrowId: recovered.id,
+    type: 'escrow',
+    amount: amountInRupees,
+    balanceBefore: new Prisma.Decimal('0.00'),
+    balanceAfter: amountInRupees,
+    description: `Escrow recovered for task ${taskId}`,
+    metadata: { escrowId, razorpayOrderId, taskId, recovered: true },
+  });
+
+  logger.warn('Recovered missing escrow from Razorpay order', {
+    escrowId: recovered.escrowId,
+    razorpayOrderId,
+    taskId,
+    bookingOrderId,
+  });
+
+  return recovered;
+}
+
+/**
  * Update escrow status when payment is captured
  * Now uses Postgres only
  */
@@ -442,13 +702,24 @@ export async function updateEscrowOnPaymentCapture(
   razorpayPaymentData?: any // Optional: Razorpay payment response
 ): Promise<{ success: boolean; escrow?: any; error?: string }> {
   try {
-    if (!isPostgresConnected()) {
+    if (!(await ensurePostgresReady())) {
       return { success: false, error: 'Postgres not connected' };
     }
 
-    const postgresEscrow = await prisma.escrow.findUnique({
+    let postgresEscrow = await prisma.escrow.findUnique({
       where: { razorpayOrderId },
     });
+
+    if (!postgresEscrow) {
+      try {
+        postgresEscrow = await recoverEscrowFromRazorpayOrder(razorpayOrderId);
+      } catch (recoverError: any) {
+        logger.error('Failed to recover escrow from Razorpay order', {
+          razorpayOrderId,
+          error: recoverError?.message,
+        });
+      }
+    }
 
     if (!postgresEscrow) {
       return { success: false, error: 'Escrow not found' };
@@ -663,6 +934,23 @@ export async function updateEscrowOnPaymentCapture(
           correlationId: postgresEscrow.escrowId,
         }).catch(() => undefined);
       }
+
+      const capturedBookingOrderId = resolveEscrowBookingOrderId(postgresEscrow);
+      if (capturedBookingOrderId) {
+        const { TaskServiceClient } = await import('../clients/TaskServiceClient');
+        TaskServiceClient.notifyBookingPaymentCaptured({
+          bookingOrderId: capturedBookingOrderId,
+          escrowId: postgresEscrow.escrowId,
+          razorpayOrderId,
+          taskId: postgresEscrow.taskId,
+        }).catch((err) => {
+          logger.error('Book Now payment-captured callback failed', {
+            bookingOrderId: capturedBookingOrderId,
+            taskId: postgresEscrow.taskId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
     } else if (paymentStatus === 'failed') {
       logPaymentFailed({
         escrowId: postgresEscrow.id,
@@ -872,17 +1160,18 @@ export async function releaseEscrow(
 
     (async () => {
       try {
-        if (mongoose.connection.readyState === 1) {
+        if (mongoose.connection.readyState === 1 && postgresEscrow.performerUid) {
           const Profile = mongoose.connection.collection('profiles');
           const posterProfile = await Profile.findOne({ uid: postgresEscrow.posterUid }) || await Profile.findOne({ _id: new mongoose.Types.ObjectId(postgresEscrow.posterUid) });
-          const performerProfile = await Profile.findOne({ uid: postgresEscrow.performerUid }) || await Profile.findOne({ _id: new mongoose.Types.ObjectId(postgresEscrow.performerUid) });
+          const performerUid = postgresEscrow.performerUid;
+          const performerProfile = await Profile.findOne({ uid: performerUid }) || await Profile.findOne({ _id: new mongoose.Types.ObjectId(performerUid) });
           
           if (performerProfile) {
             const amountStr = postgresEscrow.amountInRupees.toString();
             
             // In-app Notification
             await InAppNotificationClient.send({
-              userId: postgresEscrow.performerUid,
+              userId: performerUid,
               title: 'Amount credited',
               body: `Rs ${amountStr} payout credited.`,
               type: 'success',
@@ -895,7 +1184,7 @@ export async function releaseEscrow(
             });
 
             fireWhatsAppNotify({
-              uid: postgresEscrow.performerUid,
+              uid: performerUid,
               templateKey: 'wa_earnings_credited',
               category: 'payments',
               templateBody: {

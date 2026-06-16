@@ -1,7 +1,12 @@
 import { createApp } from './app';
 import { validateEnv } from './config/env';
 import logger from './config/logger';
-import { connectDatabase, disconnectDatabase } from './config/database';
+import {
+  connectDatabase,
+  disconnectDatabase,
+  ensurePostgresReady,
+  isPostgresConnected,
+} from './config/database';
 import { validatePaymentRewardsConfiguration } from './config/rewardsFlags';
 // Payouts/escrow release/auto-release disabled - handled elsewhere
 // import { startAutoReleaseScheduler, stopAutoReleaseScheduler } from './services/autoReleaseScheduler';
@@ -13,11 +18,23 @@ async function startServer() {
   try {
     validatePaymentRewardsConfiguration();
 
-    // Create Express app first
+    // Connect Postgres before accepting escrow/payment traffic (avoids orphan Razorpay orders)
+    await connectDatabase().catch((err) => {
+      logger.error('Database connection failed on startup:', err);
+    });
+
+    if (!isPostgresConnected()) {
+      const ready = await ensurePostgresReady();
+      if (!ready) {
+        logger.error(
+          'CRITICAL: Postgres (Neon) is not connected — Book Now / escrow rows will NOT be saved. Check POSTGRESDB_URI and run prisma migrate deploy.',
+        );
+      }
+    }
+
     const app = createApp();
     logger.info('Express app created, binding to 0.0.0.0');
 
-    // Start server immediately so proxy gets a response (avoids 502 while DB connects)
     const port = env.PORT;
     app.listen(port, '0.0.0.0', () => {
       logger.info(`🚀 Payment Service running on 0.0.0.0:${port}`);
@@ -33,11 +50,6 @@ async function startServer() {
       if (env.NODE_ENV === 'production') {
         logger.info(`⚠️ CapRover: set "Container HTTP Port" to ${port} to avoid 502`);
       }
-    });
-
-    // Connect to DBs after listening (graceful fallback if unavailable)
-    connectDatabase().catch((err) => {
-      logger.error('Database connection failed (service will run with limited features):', err);
     });
 
     // Graceful shutdown

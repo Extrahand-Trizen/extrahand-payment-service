@@ -431,6 +431,75 @@ export async function calculateRefundWithCancellationFee(params: {
   return await calculateCancellationFee(params);
 }
 
+/** Human-readable cancellation policy label for receipts and refund history. */
+export function describeCancellationPolicy(params: {
+  cancellationFeePercentage: number;
+  cancelledBy: 'poster' | 'performer';
+  assignedAt?: Date;
+  cancelledAt?: Date;
+  taskStartDate?: Date;
+}): { label: string; policyKey: string; feePercentDisplay: number } {
+  const pct = params.cancellationFeePercentage;
+  const feePercentDisplay = Math.round(pct * 100);
+
+  if (pct <= 0) {
+    if (
+      params.cancelledBy === 'poster' &&
+      params.assignedAt &&
+      params.cancelledAt
+    ) {
+      const minutes =
+        (params.cancelledAt.getTime() - params.assignedAt.getTime()) / (1000 * 60);
+      if (minutes <= 15) {
+        return {
+          label: 'Free cancellation within 15 minutes of helper assignment',
+          policyKey: 'poster_grace_15m',
+          feePercentDisplay: 0,
+        };
+      }
+    }
+    if (params.taskStartDate && params.cancelledAt) {
+      const hours =
+        (params.taskStartDate.getTime() - params.cancelledAt.getTime()) / (1000 * 60 * 60);
+      if (hours > 24) {
+        return {
+          label: 'Free cancellation — more than 24 hours before service start',
+          policyKey: 'poster_early',
+          feePercentDisplay: 0,
+        };
+      }
+    }
+    return {
+      label: 'No cancellation fee applied',
+      policyKey: 'none',
+      feePercentDisplay: 0,
+    };
+  }
+
+  if (params.cancelledBy === 'poster') {
+    if (feePercentDisplay === 10) {
+      return {
+        label: '10% cancellation fee — within 24 hours of service start',
+        policyKey: 'poster_medium',
+        feePercentDisplay,
+      };
+    }
+    if (feePercentDisplay === 20) {
+      return {
+        label: '20% cancellation fee — within 1 hour of service start',
+        policyKey: 'poster_late',
+        feePercentDisplay,
+      };
+    }
+  }
+
+  return {
+    label: `${feePercentDisplay}% cancellation fee applied`,
+    policyKey: 'custom',
+    feePercentDisplay,
+  };
+}
+
 /**
  * Get fee breakdown for display
  * 

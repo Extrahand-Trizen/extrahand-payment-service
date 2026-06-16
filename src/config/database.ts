@@ -142,5 +142,39 @@ export function isPostgresConnected(): boolean {
   return isPrismaConnected;
 }
 
+const POSTGRES_RETRY_MS = 2000;
+const POSTGRES_MAX_ATTEMPTS = 5;
+
+/**
+ * Ensure Postgres is reachable before escrow writes (Book Now + Post & Choose).
+ * Retries connection when the service started before Neon was ready.
+ */
+export async function ensurePostgresReady(): Promise<boolean> {
+  if (isPrismaConnected) {
+    return true;
+  }
+
+  for (let attempt = 1; attempt <= POSTGRES_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      await connectPrisma();
+      isPrismaConnected = true;
+      logger.info('✅ Postgres ready for escrow operations', { attempt });
+      return true;
+    } catch (error: any) {
+      isPrismaConnected = false;
+      logger.warn('Postgres connection attempt failed', {
+        attempt,
+        maxAttempts: POSTGRES_MAX_ATTEMPTS,
+        error: error?.message || String(error),
+      });
+      if (attempt < POSTGRES_MAX_ATTEMPTS) {
+        await new Promise((resolve) => setTimeout(resolve, POSTGRES_RETRY_MS));
+      }
+    }
+  }
+
+  return false;
+}
+
 
 

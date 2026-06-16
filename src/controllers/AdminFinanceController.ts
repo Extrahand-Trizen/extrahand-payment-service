@@ -1064,4 +1064,83 @@ export class AdminFinanceController {
 
     res.json({ success: true, total, limit, offset, users: data });
   }
+
+  static async deleteTransaction(req: Request, res: Response): Promise<void> {
+    const { id } = req.params;
+    if (!id) throw new BadRequestError('Transaction ID is required');
+
+    const escrow = await prisma.escrow.findFirst({
+      where: { OR: [{ id }, { escrowId: id }] },
+    });
+    if (!escrow) throw new NotFoundError('Transaction not found');
+
+    await prisma.escrow.delete({
+      where: { id: escrow.id },
+    });
+
+    await prisma.auditLog.create({
+      data: {
+        entityType: 'escrow',
+        entityId: escrow.id,
+        action: 'deleted',
+        actorType: 'admin',
+        newValue: { deleted: true, escrowId: escrow.escrowId } as Prisma.InputJsonValue,
+      },
+    });
+
+    res.json({ success: true, message: 'Transaction deleted successfully' });
+  }
+
+  static async deletePayout(req: Request, res: Response): Promise<void> {
+    const { id } = req.params;
+    if (!id) throw new BadRequestError('Payout ID is required');
+
+    const payout = await prisma.payout.findFirst({
+      where: { OR: [{ id }, { payoutId: id }] },
+    });
+    if (!payout) throw new NotFoundError('Payout not found');
+
+    await prisma.payout.delete({
+      where: { id: payout.id },
+    });
+
+    await prisma.auditLog.create({
+      data: {
+        entityType: 'payout',
+        entityId: payout.id,
+        action: 'deleted',
+        actorType: 'admin',
+        newValue: { deleted: true, payoutId: payout.payoutId } as Prisma.InputJsonValue,
+      },
+    });
+
+    res.json({ success: true, message: 'Payout deleted successfully' });
+  }
+
+  static async deleteRefund(req: Request, res: Response): Promise<void> {
+    const { id } = req.params;
+    if (!id) throw new BadRequestError('Refund ID is required');
+
+    const refund = await prisma.refund.findFirst({
+      where: { OR: [{ id }, { refundId: id }] },
+    });
+    if (!refund) throw new NotFoundError('Refund not found');
+
+    await prisma.refund.delete({
+      where: { id: refund.id },
+    });
+
+    await prisma.auditLog.create({
+      data: {
+        entityType: 'refund',
+        entityId: refund.id,
+        action: 'deleted',
+        actorType: 'admin',
+        newValue: { deleted: true, refundId: refund.refundId } as Prisma.InputJsonValue,
+      },
+    });
+
+    res.json({ success: true, message: 'Refund deleted successfully' });
+  }
 }
+

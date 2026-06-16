@@ -126,6 +126,7 @@ export function resolvePayoutBankDetails(row: BankAccountRow): {
 export function toAdminBankAccount(row: BankAccountRow) {
   const fullAccountNumber = resolveFullAccountNumber(row);
   const fullAccountHolderName = resolveFullAccountHolderName(row);
+  const maskedAccountNumber = toTaskerFacingBankAccount(row).accountNumber;
 
   if (fullAccountNumber) {
     logger.info('Admin bank account fields decrypted for ops', {
@@ -133,8 +134,15 @@ export function toAdminBankAccount(row: BankAccountRow) {
       userId: row.userId,
       accountNumberLast4: resolveDisplayLast4(row),
     });
+  } else if (row.accountNumberEncrypted) {
+    logger.warn('Admin bank account: encryption key not configured, falling back to masked value', {
+      bankAccountId: row.id,
+      userId: row.userId,
+    });
   }
 
+  // accountNumber: use full decrypted value if available, otherwise fall back to masked (e.g. XXXX8910)
+  // accountHolderName: use full decrypted value if available, otherwise use stored value (may be masked)
   return {
     id: row.id,
     userId: row.userId,
@@ -146,9 +154,10 @@ export function toAdminBankAccount(row: BankAccountRow) {
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
     accountNumberLast4: resolveDisplayLast4(row),
-    accountNumberMasked: toTaskerFacingBankAccount(row).accountNumber,
-    accountNumber: fullAccountNumber,
+    accountNumberMasked: maskedAccountNumber,
+    accountNumber: fullAccountNumber ?? maskedAccountNumber,
     accountHolderName: fullAccountHolderName ?? row.accountHolderName,
     hasEncryptedAccountNumber: Boolean(row.accountNumberEncrypted),
+    isDecrypted: Boolean(fullAccountNumber),
   };
 }

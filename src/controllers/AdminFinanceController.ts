@@ -303,6 +303,94 @@ export class AdminFinanceController {
     });
   }
 
+  static async updatePayoutTeamTest(req: Request, res: Response): Promise<void> {
+    const { id } = req.params;
+    const { teamTest } = req.body || {};
+    if (!id) throw new BadRequestError('Payout id is required');
+    if (typeof teamTest !== 'boolean') {
+      throw new BadRequestError('teamTest must be a boolean');
+    }
+
+    const payout = await prisma.payout.findFirst({
+      where: { OR: [{ id }, { payoutId: id }] },
+    });
+    if (!payout) throw new NotFoundError('Payout not found');
+
+    const existingMetadata = payout.metadata && typeof payout.metadata === 'object' ? (payout.metadata as Record<string, unknown>) : {};
+    const updatedMetadata: Record<string, unknown> = { ...existingMetadata, teamTest };
+
+    const updated = await prisma.payout.update({
+      where: { id: payout.id },
+      data: { metadata: updatedMetadata },
+    });
+
+    await prisma.auditLog.create({
+      data: {
+        entityType: 'payout',
+        entityId: updated.id,
+        action: 'status_changed',
+        actorType: 'admin',
+        newValue: updatedMetadata,
+      },
+    });
+
+    res.json({
+      success: true,
+      payout: {
+        payoutId: updated.payoutId,
+        teamTest: updatedMetadata.teamTest === true,
+      },
+    });
+  }
+
+  static async updateRefundTeamTest(req: Request, res: Response): Promise<void> {
+    const { id } = req.params;
+    const { teamTest } = req.body || {};
+    if (!id) throw new BadRequestError('Refund id is required');
+    if (typeof teamTest !== 'boolean') {
+      throw new BadRequestError('teamTest must be a boolean');
+    }
+
+    // Refund model has no metadata field — mirror the transactions (pay-ins) approach:
+    // store teamTest on the linked Escrow's metadata JSON field.
+    const refund = await prisma.refund.findFirst({
+      where: { OR: [{ id }, { refundId: id }] },
+      include: { escrow: true },
+    });
+    if (!refund) throw new NotFoundError('Refund not found');
+
+    // Update the linked escrow's metadata (same as how pay-in transactions work)
+    if (refund.escrow) {
+      const existingMeta =
+        refund.escrow.metadata && typeof refund.escrow.metadata === 'object'
+          ? (refund.escrow.metadata as Record<string, unknown>)
+          : {};
+      const updatedMeta: Record<string, unknown> = { ...existingMeta, teamTest };
+      await prisma.escrow.update({
+        where: { id: refund.escrow.id },
+        data: { metadata: updatedMeta },
+      });
+    }
+
+    await prisma.auditLog.create({
+      data: {
+        entityType: 'refund',
+        entityId: refund.id,
+        action: 'team_test_updated',
+        actorType: 'admin',
+        newValue: { teamTest },
+      },
+    });
+
+    res.json({
+      success: true,
+      refund: {
+        refundId: refund.refundId,
+        teamTest,
+      },
+    });
+  }
+
   static async updatePayoutStatus(req: Request, res: Response): Promise<void> {
     const { id } = req.params;
     const { status } = req.body || {};
@@ -383,6 +471,8 @@ export class AdminFinanceController {
       status: row.status,
       source: row.source,
       createdAt: row.createdAt,
+      // Include metadata so admin server can read teamTest flag (mirrors pay-ins approach)
+      metadata: row.metadata ?? null,
     }));
 
     const page = Math.floor(offset / limit) + 1;
@@ -510,15 +600,24 @@ export class AdminFinanceController {
       }),
     ]);
 
-    const data = rows.map((row) => ({
-      refundId: row.refundId,
-      taskId: row.taskId,
-      CustomerUid: row.escrow?.posterUid,
-      performerUid: row.escrow?.performerUid,
-      refundAmount: toStringValue(row.refundAmount),
-      status: row.status,
-      createdAt: row.createdAt,
-    }));
+    const data = rows.map((row) => {
+      // Read teamTest from the linked Escrow metadata (mirrors pay-ins/transactions approach)
+      const escrowMeta =
+        row.escrow?.metadata && typeof row.escrow.metadata === 'object'
+          ? (row.escrow.metadata as Record<string, unknown>)
+          : {};
+      return {
+        refundId: row.refundId,
+        taskId: row.taskId,
+        CustomerUid: row.escrow?.posterUid,
+        performerUid: row.escrow?.performerUid,
+        refundAmount: toStringValue(row.refundAmount),
+        status: row.status,
+        createdAt: row.createdAt,
+        // Expose teamTest from escrow metadata so the admin server can display it correctly
+        teamTest: escrowMeta.teamTest === true,
+      };
+    });
 
     const page = Math.floor(offset / limit) + 1;
     const pages = Math.ceil(total / limit);

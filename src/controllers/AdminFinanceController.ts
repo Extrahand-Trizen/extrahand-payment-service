@@ -279,7 +279,7 @@ export class AdminFinanceController {
     const updated = await prisma.escrow.update({
       where: { id: escrow.id },
       data: {
-        metadata: updatedMetadata,
+        metadata: updatedMetadata as Prisma.InputJsonValue,
       },
     });
 
@@ -289,7 +289,7 @@ export class AdminFinanceController {
         entityId: updated.id,
         action: 'status_changed',
         actorType: 'admin',
-        newValue: updatedMetadata,
+        newValue: updatedMetadata as Prisma.InputJsonValue,
       },
     });
 
@@ -321,7 +321,7 @@ export class AdminFinanceController {
 
     const updated = await prisma.payout.update({
       where: { id: payout.id },
-      data: { metadata: updatedMetadata },
+      data: { metadata: updatedMetadata as Prisma.InputJsonValue },
     });
 
     await prisma.auditLog.create({
@@ -330,7 +330,7 @@ export class AdminFinanceController {
         entityId: updated.id,
         action: 'status_changed',
         actorType: 'admin',
-        newValue: updatedMetadata,
+        newValue: updatedMetadata as Prisma.InputJsonValue,
       },
     });
 
@@ -368,7 +368,7 @@ export class AdminFinanceController {
       const updatedMeta: Record<string, unknown> = { ...existingMeta, teamTest };
       await prisma.escrow.update({
         where: { id: refund.escrow.id },
-        data: { metadata: updatedMeta },
+        data: { metadata: updatedMeta as Prisma.InputJsonValue },
       });
     }
 

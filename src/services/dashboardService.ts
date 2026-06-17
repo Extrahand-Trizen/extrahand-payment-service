@@ -21,62 +21,101 @@ function decimalToString(value: Prisma.Decimal | null | undefined): string {
 
 export async function getDashboardOverview(range: DateRange) {
   const createdAt = buildCreatedAtFilter(range);
-  const [escrowAgg, payoutAgg, refundAgg, ledgerRevenueAgg, paymentSuccessCount, paymentFailedCount, payoutSuccessCount, payoutFailedCount] =
-    await Promise.all([
-      prisma.escrow.aggregate({
-        where: {
-          ...(createdAt ? { createdAt } : {}),
+
+  // Filter clause to exclude team-test escrows (used for pay-in metrics and counts)
+  const realEscrowWhere = {
+    ...(createdAt ? { createdAt } : {}),
+    NOT: {
+      metadata: {
+        path: ['teamTest'],
+        equals: true,
+      },
+    },
+  };
+
+  // Filter clause to exclude team-test payouts (payout metadata.teamTest)
+  const realPayoutWhere = {
+    ...(createdAt ? { createdAt } : {}),
+    NOT: {
+      metadata: {
+        path: ['teamTest'],
+        equals: true,
+      },
+    },
+  };
+
+  // Refunds are linked to escrows — exclude refunds whose escrow is a team test
+  const realRefundWhere = {
+    ...(createdAt ? { createdAt } : {}),
+    status: 'completed',
+    escrow: {
+      NOT: {
+        metadata: {
+          path: ['teamTest'],
+          equals: true,
         },
-        _sum: { amountInRupees: true },
-        _count: { id: true },
-      }),
-      prisma.payout.aggregate({
-        where: {
-          ...(createdAt ? { createdAt } : {}),
+      },
+    },
+  };
+
+  // Ledger revenue: exclude entries linked to team-test escrows
+  const realLedgerWhere = {
+    ...(createdAt ? { createdAt } : {}),
+    type: 'platform_commission',
+    escrow: {
+      NOT: {
+        metadata: {
+          path: ['teamTest'],
+          equals: true,
         },
-        _sum: { netAmount: true },
-        _count: { id: true },
-      }),
-      prisma.refund.aggregate({
-        where: {
-          ...(createdAt ? { createdAt } : {}),
-          status: 'completed',
-        },
-        _sum: { refundAmount: true },
-        _count: { id: true },
-      }),
-      prisma.ledger.aggregate({
-        where: {
-          ...(createdAt ? { createdAt } : {}),
-          type: 'platform_commission',
-        },
-        _sum: { amount: true },
-      }),
-      prisma.escrow.count({
-        where: {
-          ...(createdAt ? { createdAt } : {}),
-          paymentStatus: 'captured',
-        },
-      }),
-      prisma.escrow.count({
-        where: {
-          ...(createdAt ? { createdAt } : {}),
-          paymentStatus: 'failed',
-        },
-      }),
-      prisma.payout.count({
-        where: {
-          ...(createdAt ? { createdAt } : {}),
-          status: 'completed',
-        },
-      }),
-      prisma.payout.count({
-        where: {
-          ...(createdAt ? { createdAt } : {}),
-          status: 'failed',
-        },
-      }),
-    ]);
+      },
+    },
+  };
+
+  const [
+    escrowAgg,
+    payoutAgg,
+    refundAgg,
+    ledgerRevenueAgg,
+    paymentSuccessCount,
+    paymentFailedCount,
+    payoutSuccessCount,
+    payoutFailedCount,
+  ] = await Promise.all([
+    prisma.escrow.aggregate({
+      where: realEscrowWhere,
+      _sum: { amountInRupees: true },
+      _count: { id: true },
+    }),
+    prisma.payout.aggregate({
+      where: realPayoutWhere,
+      _sum: { netAmount: true },
+      _count: { id: true },
+    }),
+    prisma.refund.aggregate({
+      where: realRefundWhere,
+      _sum: { refundAmount: true },
+      _count: { id: true },
+    }),
+    prisma.ledger.aggregate({
+      where: realLedgerWhere,
+      _sum: { amount: true },
+    }),
+    // Payment success/fail counts: only real escrows
+    prisma.escrow.count({
+      where: { ...realEscrowWhere, paymentStatus: 'captured' },
+    }),
+    prisma.escrow.count({
+      where: { ...realEscrowWhere, paymentStatus: 'failed' },
+    }),
+    // Payout success/fail counts: only real payouts
+    prisma.payout.count({
+      where: { ...realPayoutWhere, status: 'completed' },
+    }),
+    prisma.payout.count({
+      where: { ...realPayoutWhere, status: 'failed' },
+    }),
+  ]);
 
   const paymentTotal = paymentSuccessCount + paymentFailedCount;
   const payoutTotal = payoutSuccessCount + payoutFailedCount;
@@ -147,11 +186,24 @@ export async function getDashboardRefunds(params: {
       orderBy: { createdAt: 'desc' },
       take: params.limit,
       skip: params.offset,
+      include: { escrow: true }, // needed to read Escrow.metadata.teamTest (mirrors pay-ins approach)
     }),
     prisma.refund.count({ where }),
   ]);
 
-  return { items, total };
+  // Expose teamTest from the linked Escrow's metadata (same as transactions/pay-ins)
+  const itemsWithTeamTest = items.map((item: any) => {
+    const escrowMeta =
+      item.escrow?.metadata && typeof item.escrow.metadata === 'object'
+        ? (item.escrow.metadata as Record<string, unknown>)
+        : {};
+    return {
+      ...item,
+      teamTest: escrowMeta.teamTest === true,
+    };
+  });
+
+  return { items: itemsWithTeamTest, total };
 }
 
 export async function getDashboardLedger(params: {
@@ -176,6 +228,19 @@ export async function getDashboardLedger(params: {
   const [items, total] = await Promise.all([
     prisma.ledger.findMany({
       where,
+      include: {
+        escrow: true,
+        payout: {
+          include: {
+            escrow: true,
+          },
+        },
+        refund: {
+          include: {
+            escrow: true,
+          },
+        },
+      },
       orderBy: { createdAt: 'desc' },
       take: params.limit,
       skip: params.offset,
@@ -183,7 +248,41 @@ export async function getDashboardLedger(params: {
     prisma.ledger.count({ where }),
   ]);
 
-  return { items, total };
+  const mappedItems = items.map((row: any) => {
+    const CustomerUid =
+      row.escrow?.posterUid ||
+      row.payout?.escrow?.posterUid ||
+      row.refund?.escrow?.posterUid ||
+      row.userId ||
+      null;
+
+    const performerUid =
+      row.escrow?.performerUid ||
+      row.payout?.performerUid ||
+      row.payout?.escrow?.performerUid ||
+      row.refund?.escrow?.performerUid ||
+      null;
+
+    const taskId =
+      row.taskId ||
+      row.escrow?.taskId ||
+      row.payout?.taskId ||
+      row.payout?.escrow?.taskId ||
+      row.refund?.taskId ||
+      row.refund?.escrow?.taskId ||
+      null;
+
+    const { escrow, payout, refund, ...rest } = row;
+
+    return {
+      ...rest,
+      CustomerUid,
+      performerUid,
+      taskId,
+    };
+  });
+
+  return { items: mappedItems, total };
 }
 
 export async function getDashboardAnomalies() {

@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
-import { getFeeStructure, listCategoryFeeConfigs, upsertCategoryFeeConfig, getFeeStructureForCategory } from '../services/feeConfigService';
+import { CategoryFeeMode } from '@prisma/client';
+import { getFeeStructure, listCategoryFeeConfigs, upsertCategoryFeeConfig, deleteCategoryFeeConfig, getFeeStructureForCategory } from '../services/feeConfigService';
 import { calculatePosterFees } from '../services/feeCalculationService';
 import { asyncHandler } from '../middleware/errorHandler';
 import logger from '../config/logger';
@@ -109,7 +110,14 @@ export class FeeController {
    */
   static listCategories = asyncHandler(async (req: Request, res: Response) => {
     try {
-      const rows = await listCategoryFeeConfigs();
+      const modeParam = typeof req.query.mode === 'string' ? req.query.mode.trim().toUpperCase() : undefined;
+      const mode =
+        modeParam === 'BOOK_NOW'
+          ? CategoryFeeMode.BOOK_NOW
+          : modeParam === 'BIDDING'
+            ? CategoryFeeMode.BIDDING
+            : undefined;
+      const rows = await listCategoryFeeConfigs(mode);
       return res.status(200).json({ success: true, categories: rows });
     } catch (error: any) {
       logger.error('Error listing category fee configs:', error);
@@ -132,6 +140,40 @@ export class FeeController {
     } catch (error: any) {
       logger.error('Error upserting category fee config:', error);
       return res.status(500).json({ success: false, error: error.message || 'Failed to upsert category' });
+    }
+  });
+
+  /**
+   * DELETE /api/v1/fees/categories/:categoryKey?mode=BIDDING|BOOK_NOW
+   * Remove a category fee config (admin). `default` cannot be deleted.
+   */
+  static deleteCategory = asyncHandler(async (req: Request, res: Response) => {
+    try {
+      const { categoryKey } = req.params;
+      const modeParam = typeof req.query.mode === 'string' ? req.query.mode.trim().toUpperCase() : '';
+      const mode =
+        modeParam === 'BOOK_NOW'
+          ? CategoryFeeMode.BOOK_NOW
+          : modeParam === 'BIDDING'
+            ? CategoryFeeMode.BIDDING
+            : null;
+
+      if (!mode) {
+        return res.status(400).json({
+          success: false,
+          error: 'Query param mode is required (BIDDING or BOOK_NOW)',
+        });
+      }
+
+      await deleteCategoryFeeConfig(categoryKey, mode);
+      return res.status(200).json({ success: true });
+    } catch (error: any) {
+      logger.error('Error deleting category fee config:', error);
+      const status = error.message?.includes('not found') ? 404 : 400;
+      return res.status(status).json({
+        success: false,
+        error: error.message || 'Failed to delete category',
+      });
     }
   });
 }

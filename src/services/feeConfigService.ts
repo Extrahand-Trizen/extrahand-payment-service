@@ -1,6 +1,6 @@
 import logger from '../config/logger';
 import { prisma } from '../config/prisma';
-import { Prisma } from '@prisma/client';
+import { CategoryFeeMode, Prisma } from '@prisma/client';
 
 /**
  * Fee structure configuration interface
@@ -120,6 +120,18 @@ function getCategoryLookupKeys(categoryKey?: string): string[] {
   const normalized = normalizeCategoryLookupKey(raw);
   const aliases = CATEGORY_KEY_ALIASES[normalized] || CATEGORY_KEY_ALIASES[raw.toLowerCase()] || [];
   return Array.from(new Set([raw, normalized, ...aliases].filter(Boolean)));
+}
+
+export type CategoryFeeLookupOptions = {
+  mode?: CategoryFeeMode;
+  /** Task booking source — `book_now` maps to BOOK_NOW fee configs. */
+  bookingSource?: string;
+};
+
+function resolveCategoryFeeMode(options?: CategoryFeeLookupOptions): CategoryFeeMode {
+  if (options?.mode) return options.mode;
+  if (options?.bookingSource === 'book_now') return CategoryFeeMode.BOOK_NOW;
+  return CategoryFeeMode.BIDDING;
 }
 
 /**
@@ -253,8 +265,12 @@ export async function initializeDefaultFeeStructure(): Promise<void> {
  * Get fee structure merged with per-category overrides.
  * Falls back to base getFeeStructure() when no category config is found.
  */
-export async function getFeeStructureForCategory(categoryKey?: string): Promise<FeeStructure> {
+export async function getFeeStructureForCategory(
+  categoryKey?: string,
+  options?: CategoryFeeLookupOptions,
+): Promise<FeeStructure> {
   const base = await getFeeStructure();
+  const mode = resolveCategoryFeeMode(options);
 
   const key = categoryKey || 'default';
   const lookupKeys = getCategoryLookupKeys(key);
@@ -267,6 +283,7 @@ export async function getFeeStructureForCategory(categoryKey?: string): Promise<
       cfg = await prisma.categoryFeeConfig.findFirst({
         where: {
           categoryKey: lookupKey,
+          mode,
           OR: [
             { effectiveFrom: null, effectiveTo: null },
             { effectiveFrom: { lte: now }, effectiveTo: null },
@@ -279,8 +296,11 @@ export async function getFeeStructureForCategory(categoryKey?: string): Promise<
       if (cfg) break;
     }
 
-    // If not found, try to load the default row
-    const effectiveCfg = cfg ?? (await prisma.categoryFeeConfig.findUnique({ where: { categoryKey: 'default' } }) as any);
+    const effectiveCfg =
+      cfg ??
+      (await prisma.categoryFeeConfig.findUnique({
+        where: { categoryKey_mode: { categoryKey: 'default', mode } },
+      }) as any);
 
     if (!effectiveCfg) return base;
 
@@ -320,8 +340,17 @@ export async function getFeeStructureForCategory(categoryKey?: string): Promise<
 /**
  * List all category fee configs (for admin UI)
  */
-export async function listCategoryFeeConfigs(): Promise<any[]> {
-  return await prisma.categoryFeeConfig.findMany({ orderBy: { categoryKey: 'asc' } }) as any[];
+export async function listCategoryFeeConfigs(mode?: CategoryFeeMode): Promise<any[]> {
+  return await prisma.categoryFeeConfig.findMany({
+    where: mode ? { mode } : undefined,
+    orderBy: [{ mode: 'asc' }, { categoryKey: 'asc' }],
+  }) as any[];
+}
+
+function parseCategoryFeeMode(value: unknown): CategoryFeeMode {
+  const raw = String(value ?? '').trim().toUpperCase();
+  if (raw === 'BOOK_NOW') return CategoryFeeMode.BOOK_NOW;
+  return CategoryFeeMode.BIDDING;
 }
 
 /**
@@ -331,9 +360,14 @@ export async function upsertCategoryFeeConfig(payload: any, updatedBy?: string):
   const { categoryKey } = payload;
   if (!categoryKey) throw new Error('categoryKey is required');
 
+  const mode = parseCategoryFeeMode(payload.mode ?? CategoryFeeMode.BIDDING);
+
   const data = {
     categoryKey,
+    mode,
     displayName: payload.displayName ?? null,
+    sacCode: payload.sacCode ?? null,
+    sacHeading: payload.sacHeading ?? null,
     gstPercentage: payload.gstPercentage ?? undefined,
     platformFeePercentage: payload.platformFeePercentage ?? undefined,
     razorpayFeeGstPercentage: payload.razorpayFeeGstPercentage ?? undefined,
@@ -345,7 +379,7 @@ export async function upsertCategoryFeeConfig(payload: any, updatedBy?: string):
   } as any;
 
   const result = await prisma.categoryFeeConfig.upsert({
-    where: { categoryKey },
+    where: { categoryKey_mode: { categoryKey, mode } },
     create: { ...data },
     update: { ...data },
   });
@@ -356,4 +390,26 @@ export async function upsertCategoryFeeConfig(payload: any, updatedBy?: string):
   return result;
 }
 
+/**
+ * Delete category fee config row (admin). The `default` row cannot be removed.
+ */
+export async function deleteCategoryFeeConfig(
+  categoryKey: string,
+  mode: CategoryFeeMode,
+): Promise<void> {
+  const key = categoryKey?.trim();
+  if (!key) throw new Error('categoryKey is required');
+  if (key === 'default') throw new Error('The default category cannot be deleted');
+
+  const existing = await prisma.categoryFeeConfig.findUnique({
+    where: { categoryKey_mode: { categoryKey: key, mode } },
+  });
+  if (!existing) throw new Error(`Category config not found: ${mode}/${key}`);
+
+  await prisma.categoryFeeConfig.delete({
+    where: { categoryKey_mode: { categoryKey: key, mode } },
+  });
+
+  clearFeeStructureCache();
+}
 

@@ -20,6 +20,7 @@ router.get('/calculate', FeeController.calculateFees);
 /** Admin: list and upsert per-category fee configs */
 router.get('/categories', FeeController.listCategories);
 router.put('/categories/:categoryKey', FeeController.upsertCategory);
+router.delete('/categories/:categoryKey', FeeController.deleteCategory);
 
 export default router;
 

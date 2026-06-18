@@ -27,6 +27,8 @@ import {
   resolvePayoutBankDetails,
   toAdminBankAccount,
 } from './bankAccountSecrets';
+import { resolveEscrowTaskAmountForPayout } from '../utils/escrowFinanceUtils';
+import { enrichRecurringPayoutMetadata } from '../utils/recurringPayoutDisplay';
 
 /**
  * Generate unique payout ID
@@ -889,6 +891,8 @@ export async function processTaskCompletionPayout(params: {
   enqueueOnMissingBank?: boolean;
   useExtraCoins?: boolean;
   requestedCoinRedeemRupees?: number;
+  /** Recurring visit id when paying out a per-visit child task. */
+  visitId?: string;
 }): Promise<{
   success: boolean;
   payout?: any;
@@ -904,13 +908,17 @@ export async function processTaskCompletionPayout(params: {
       enqueueOnMissingBank = false,
       useExtraCoins = false,
       requestedCoinRedeemRupees,
+      visitId,
     } = params;
 
     if (!isPostgresConnected()) {
       return { success: false, error: 'Postgres not connected' };
     }
 
-    const duplicateDescription = `Task completion payout for task ${taskId}`;
+    const trimmedVisitId = typeof visitId === 'string' ? visitId.trim() : '';
+    const duplicateDescription = trimmedVisitId
+      ? `Task completion payout for task ${taskId} visit ${trimmedVisitId}`
+      : `Task completion payout for task ${taskId}`;
 
     const existing = await prisma.payout.findFirst({
       where: {
@@ -996,7 +1004,66 @@ export async function processTaskCompletionPayout(params: {
       };
     }
 
-    const grossAmount = new Prisma.Decimal(amount.toString()).toDecimalPlaces(2);
+    // Fetch escrow before fee math so recurring per-visit payouts use visit budget (taskAmount),
+    // not Razorpay capture (amountInRupees) which can be lower after coin discounts.
+    let taskEscrow = trimmedVisitId
+      ? await prisma.escrow.findFirst({
+          where: {
+            taskId,
+            metadata: {
+              path: ['visitId'],
+              equals: trimmedVisitId,
+            },
+          },
+          orderBy: { createdAt: 'desc' },
+        })
+      : await prisma.escrow.findFirst({
+          where: { taskId },
+          orderBy: { createdAt: 'desc' },
+        });
+
+    if (!taskEscrow && trimmedVisitId) {
+      taskEscrow = await prisma.escrow.findFirst({
+        where: {
+          performerUid,
+          metadata: {
+            path: ['visitId'],
+            equals: trimmedVisitId,
+          },
+        },
+        orderBy: { createdAt: 'desc' },
+      });
+    }
+
+    let grossAmount = resolveEscrowTaskAmountForPayout(taskEscrow, amount).toDecimalPlaces(2);
+    const clientAmount = new Prisma.Decimal(String(amount || '0')).toDecimalPlaces(2);
+    if (trimmedVisitId && clientAmount.gt(0) && clientAmount.gt(grossAmount)) {
+      logger.warn('[payoutService] Recurring visit payout base raised from client visit budget', {
+        taskId,
+        visitId: trimmedVisitId,
+        escrowResolvedAmount: grossAmount.toString(),
+        clientAmount: clientAmount.toString(),
+        escrowId: taskEscrow?.escrowId,
+      });
+      grossAmount = clientAmount;
+    }
+    if (grossAmount.lte(0)) {
+      return { success: false, error: 'Invalid payout amount for this task' };
+    }
+
+    if (
+      taskEscrow &&
+      new Prisma.Decimal(amount.toString()).toDecimalPlaces(2).lessThan(grossAmount)
+    ) {
+      logger.info('[payoutService] Using escrow task amount for payout (client amount was lower)', {
+        taskId,
+        visitId: trimmedVisitId || undefined,
+        clientAmount: amount,
+        escrowTaskAmount: grossAmount.toString(),
+        escrowId: taskEscrow.escrowId,
+      });
+    }
+
     const feeStructure = await getFeeStructure();
     const platformCommission = grossAmount
       .mul(feeStructure.platformFee.percentage)
@@ -1083,12 +1150,6 @@ export async function processTaskCompletionPayout(params: {
       payoutBaseAfterExtraCoins: payoutBaseAfterExtraCoins.toString(),
     });
 
-    // Fetch escrow associated with this task to check for the actual performer (may be different if linked account)
-    const taskEscrow = await prisma.escrow.findFirst({
-      where: { taskId },
-      orderBy: { createdAt: 'desc' },
-    });
-
     const linkedPerformerUids: string[] = [];
     if (taskEscrow?.performerUid && taskEscrow.performerUid !== performerUid) {
       linkedPerformerUids.push(taskEscrow.performerUid);
@@ -1141,8 +1202,17 @@ export async function processTaskCompletionPayout(params: {
     // RazorpayX narration max length is 30 chars.
     const payoutNarration = `Task ${taskId.slice(-8)} payout`;
 
-    const metadataPayload = {
+    const escrowMeta =
+      taskEscrow?.metadata &&
+      typeof taskEscrow.metadata === 'object' &&
+      !Array.isArray(taskEscrow.metadata)
+        ? (taskEscrow.metadata as Record<string, unknown>)
+        : {};
+
+    const metadataPayload = enrichRecurringPayoutMetadata(
+      {
       taskId,
+      visitId: trimmedVisitId || undefined,
       taskTitle,
       posterUid: taskEscrow?.posterUid,
       grossAmount: grossAmount.toString(),
@@ -1186,7 +1256,15 @@ export async function processTaskCompletionPayout(params: {
       },
       coinFormula: '(platformFee * basePercent) * ratingMultiplier * bonuses / 1.00 (1 coin = ₹1)',
       penaltiesAppliedAt: null as string | null,
-    };
+    },
+      escrowMeta,
+      {
+        visitId: trimmedVisitId || undefined,
+        parentTaskId:
+          typeof escrowMeta.parentTaskId === 'string' ? escrowMeta.parentTaskId : undefined,
+        taskTitle,
+      },
+    );
 
     await ensureExtraCoinsAwardedForTaskCompletionPayout({
       payoutId,

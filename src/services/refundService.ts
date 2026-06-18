@@ -316,6 +316,7 @@ export async function processRefund(params: {
             data: {
               refundId,
               escrowId: postgresEscrow.id,
+              taskId: postgresEscrow.taskId,
               paymentId: razorpayPaymentId,
               razorpayRefundId: razorpayRefund.id,
               cancellationFee: cancellationFee.greaterThan(0) ? cancellationFee : null,
@@ -327,6 +328,8 @@ export async function processRefund(params: {
               status: 'processing',
             },
           });
+
+          const ledgerRefundId = postgresRefund.id;
 
           // Update escrow status to 'refunded'
           await tx.escrow.update({
@@ -359,7 +362,7 @@ export async function processRefund(params: {
           ledgerEntries.push({
             transactionId: generateTxId(),
             escrowId: postgresEscrow.id,
-            refundId,
+            refundId: ledgerRefundId,
             type: 'refund',
             amount: refundAmount.neg(),
             balanceBefore: currentBalance,
@@ -387,7 +390,7 @@ export async function processRefund(params: {
             ledgerEntries.push({
               transactionId: generateTxId(),
               escrowId: postgresEscrow.id,
-              refundId,
+              refundId: ledgerRefundId,
               type: 'cancellation_fee',
               amount: cancellationFee.neg(),
               balanceBefore: balanceBeforeFee,
@@ -408,7 +411,7 @@ export async function processRefund(params: {
               ledgerEntries.push({
                 transactionId: generateTxId(),
                 escrowId: postgresEscrow.id,
-                refundId,
+                refundId: ledgerRefundId,
                 type: 'compensation',
                 amount: toOtherParty.neg(),
                 balanceBefore: balanceBeforeComp,
@@ -429,7 +432,7 @@ export async function processRefund(params: {
               ledgerEntries.push({
                 transactionId: generateTxId(),
                 escrowId: postgresEscrow.id,
-                refundId,
+                refundId: ledgerRefundId,
                 type: 'platform_fee',
                 amount: toPlatform.neg(),
                 balanceBefore: balanceBeforePlatform,

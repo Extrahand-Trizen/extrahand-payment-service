@@ -17,6 +17,12 @@ router.get('/structure', FeeController.getFeeStructure);
  */
 router.get('/calculate', FeeController.calculateFees);
 
+/**
+ * POST /api/v1/fees/book-now/calculate
+ * Book Now: per-category GST on service subtotals (customer payment only).
+ */
+router.post('/book-now/calculate', FeeController.calculateBookNowTotals);
+
 /** Admin: list and upsert per-category fee configs */
 router.get('/categories', FeeController.listCategories);
 router.put('/categories/:categoryKey', FeeController.upsertCategory);

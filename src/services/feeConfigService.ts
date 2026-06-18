@@ -115,7 +115,7 @@ function normalizeCategoryLookupKey(categoryKey?: string): string {
     .trim();
 }
 
-function getCategoryLookupKeys(categoryKey?: string): string[] {
+export function getCategoryLookupKeys(categoryKey?: string): string[] {
   const raw = (categoryKey || 'default').trim();
   const normalized = normalizeCategoryLookupKey(raw);
   const aliases = CATEGORY_KEY_ALIASES[normalized] || CATEGORY_KEY_ALIASES[raw.toLowerCase()] || [];

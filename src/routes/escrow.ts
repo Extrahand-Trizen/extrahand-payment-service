@@ -18,6 +18,11 @@ router.post('/create-booking', asyncHandler(EscrowController.createBookingEscrow
 
 router.patch('/:escrowId/attach-performer', asyncHandler(EscrowController.attachPerformer));
 
+router.patch(
+  '/:escrowId/reassign-recurring-visit',
+  asyncHandler(EscrowController.reassignRecurringVisit),
+);
+
 /**
  * GET /api/v1/escrow/status/:escrowId
  * Get escrow status by escrow ID

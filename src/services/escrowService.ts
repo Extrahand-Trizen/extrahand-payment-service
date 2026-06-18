@@ -1,5 +1,6 @@
 import { razorpay } from '../config/razorpay';
 import logger from '../config/logger';
+import { resolveEscrowTaskAmountForPayout } from '../utils/escrowFinanceUtils';
 import { ensurePostgresReady, isPostgresConnected } from '../config/database';
 import { REVIEW_ORDER_ID_PREFIX } from '../utils/reviewBypass';
 // PaymentTransaction model removed - using Postgres Ledger instead
@@ -210,6 +211,18 @@ async function convertPostgresEscrowToFrontendFormat(postgresEscrow: any): Promi
     });
   }
 
+  const payoutTaskAmount = resolveEscrowTaskAmountForPayout(postgresEscrow);
+  const escrowMeta =
+    postgresEscrow.metadata &&
+    typeof postgresEscrow.metadata === 'object' &&
+    !Array.isArray(postgresEscrow.metadata)
+      ? (postgresEscrow.metadata as Record<string, unknown>)
+      : {};
+  const taskTitle =
+    typeof escrowMeta.taskTitle === 'string' && escrowMeta.taskTitle.trim()
+      ? escrowMeta.taskTitle.trim()
+      : undefined;
+
   return {
     _id: postgresEscrow.id, // For backward compatibility
     id: postgresEscrow.id,
@@ -222,6 +235,10 @@ async function convertPostgresEscrowToFrontendFormat(postgresEscrow: any): Promi
     bookingOrderId: resolveEscrowBookingOrderId(postgresEscrow),
     amount: postgresEscrow.amount.toString(),
     amountInRupees: postgresEscrow.amountInRupees.toString(),
+    taskAmount: payoutTaskAmount.toString(),
+    appliedPlatformFeePercent: postgresEscrow.appliedPlatformFeePercent?.toString() ?? null,
+    appliedGstPercent: postgresEscrow.appliedGstPercent?.toString() ?? null,
+    taskTitle,
     currency: postgresEscrow.currency,
     status: postgresEscrow.status,
     razorpayPaymentId: postgresEscrow.razorpayPaymentId,
@@ -360,6 +377,14 @@ export async function createEscrow(params: {
     const escrowMetadata = buildEscrowMetadataSnapshot(
       {
         ...metadata,
+        ...(taskAmount
+          ? {
+              visitBudgetRupees: Number(taskAmount.toFixed(2)),
+              originalAmountRupees: Number(amount.toFixed(2)),
+            }
+          : {
+              originalAmountRupees: Number(amount.toFixed(2)),
+            }),
         pendingCustomerCoinDiscountRupees: pendingCoinRupees.toString(),
         customerCoinDiscountRupees: pendingCoinRupees.toString(),
         customerCoinDiscountCoins: pendingCoinUnits.toString(),
@@ -601,6 +626,154 @@ export async function attachPerformerToEscrow(params: {
       error: error?.message,
     });
     return { success: false, error: error.message || 'Failed to attach performer' };
+  }
+}
+
+/**
+ * Move recurring per-visit escrow from one visitId to the next when a paid visit is rescheduled.
+ */
+export async function reassignRecurringVisitEscrow(params: {
+  escrowId: string;
+  taskId: string;
+  fromVisitId: string;
+  toVisitId: string;
+}): Promise<{ success: boolean; escrow?: any; error?: string }> {
+  const { escrowId, taskId, fromVisitId, toVisitId } = params;
+
+  const trimmedEscrowId = escrowId?.trim();
+  const trimmedTaskId = taskId?.trim();
+  const trimmedFromVisitId = fromVisitId?.trim();
+  const trimmedToVisitId = toVisitId?.trim();
+
+  if (!trimmedEscrowId || !trimmedTaskId || !trimmedFromVisitId || !trimmedToVisitId) {
+    return {
+      success: false,
+      error: 'escrowId, taskId, fromVisitId, and toVisitId are required',
+    };
+  }
+
+  if (trimmedFromVisitId === trimmedToVisitId) {
+    logger.info('Reassign recurring visit: from and to match — will verify escrow after load', {
+      escrowId: trimmedEscrowId,
+      taskId: trimmedTaskId,
+      visitId: trimmedFromVisitId,
+    });
+  }
+
+  if (!(await ensurePostgresReady())) {
+    return { success: false, error: 'Postgres not connected' };
+  }
+
+  try {
+    const existing = await prisma.escrow.findFirst({
+      where: {
+        OR: [{ escrowId: trimmedEscrowId }, { id: trimmedEscrowId }],
+      },
+    });
+
+    if (!existing) {
+      return { success: false, error: 'Escrow not found' };
+    }
+
+    if (String(existing.taskId || '').trim() !== trimmedTaskId) {
+      return { success: false, error: 'Escrow does not belong to this task' };
+    }
+
+    const status = String(existing.status || '').toLowerCase();
+    const paymentStatus = String(existing.paymentStatus || '').toLowerCase();
+    const isPaid =
+      status === 'held' ||
+      status === 'released' ||
+      paymentStatus === 'captured' ||
+      paymentStatus === 'authorized';
+    if (!isPaid) {
+      return {
+        success: false,
+        error: `Escrow payment is not held. Current status: ${existing.status}`,
+      };
+    }
+
+    const metadata =
+      existing.metadata && typeof existing.metadata === 'object' && !Array.isArray(existing.metadata)
+        ? { ...(existing.metadata as Record<string, unknown>) }
+        : {};
+
+    const currentVisitId =
+      typeof metadata.visitId === 'string' ? metadata.visitId.trim() : '';
+    const reassignedFromVisitId = currentVisitId || trimmedFromVisitId;
+    if (currentVisitId && currentVisitId !== trimmedFromVisitId) {
+      logger.warn('Reassign recurring visit: fromVisitId differs from escrow metadata visitId; proceeding', {
+        escrowId: trimmedEscrowId,
+        taskId: trimmedTaskId,
+        metadataVisitId: currentVisitId,
+        requestedFromVisitId: trimmedFromVisitId,
+        toVisitId: trimmedToVisitId,
+      });
+    }
+
+    if (trimmedFromVisitId === trimmedToVisitId || currentVisitId === trimmedToVisitId) {
+      if (currentVisitId !== trimmedToVisitId) {
+        const updated = await prisma.escrow.update({
+          where: { id: existing.id },
+          data: {
+            metadata: {
+              ...metadata,
+              visitId: trimmedToVisitId,
+              recurringVisitReassignedFrom: reassignedFromVisitId || undefined,
+              recurringVisitReassignedAt: new Date().toISOString(),
+            } as any,
+          },
+        });
+
+        logger.info('Reassign recurring visit: bound missing visitId metadata to target visit', {
+          escrowId: updated.escrowId,
+          taskId: trimmedTaskId,
+          visitId: trimmedToVisitId,
+        });
+
+        const escrowForFrontend = await convertPostgresEscrowToFrontendFormat(updated);
+        return { success: true, escrow: escrowForFrontend };
+      }
+
+      logger.info('Reassign recurring visit: payment already on target visit — no-op', {
+        escrowId: trimmedEscrowId,
+        taskId: trimmedTaskId,
+        visitId: trimmedToVisitId,
+      });
+      const escrowForFrontend = await convertPostgresEscrowToFrontendFormat(existing);
+      return { success: true, escrow: escrowForFrontend };
+    }
+
+    const updated = await prisma.escrow.update({
+      where: { id: existing.id },
+      data: {
+        metadata: {
+          ...metadata,
+          visitId: trimmedToVisitId,
+          recurringVisitReassignedFrom: reassignedFromVisitId,
+          recurringVisitReassignedAt: new Date().toISOString(),
+        } as any,
+      },
+    });
+
+    logger.info('Reassigned recurring visit escrow to next visit', {
+      escrowId: updated.escrowId,
+      taskId: trimmedTaskId,
+      fromVisitId: trimmedFromVisitId,
+      toVisitId: trimmedToVisitId,
+    });
+
+    const escrowForFrontend = await convertPostgresEscrowToFrontendFormat(updated);
+    return { success: true, escrow: escrowForFrontend };
+  } catch (error: any) {
+    logger.error('Failed to reassign recurring visit escrow', {
+      escrowId,
+      taskId,
+      fromVisitId,
+      toVisitId,
+      error: error?.message,
+    });
+    return { success: false, error: error.message || 'Failed to reassign visit escrow' };
   }
 }
 
@@ -951,6 +1124,29 @@ export async function updateEscrowOnPaymentCapture(
           });
         });
       }
+
+      const escrowMetadata = (postgresEscrow.metadata || {}) as Record<string, unknown>;
+      const recurringVisitId =
+        typeof escrowMetadata.visitId === 'string' ? escrowMetadata.visitId.trim() : '';
+      const recurringParentTaskId =
+        typeof escrowMetadata.parentTaskId === 'string'
+          ? escrowMetadata.parentTaskId.trim()
+          : postgresEscrow.taskId;
+      if (recurringVisitId && (escrowMetadata.recurringPlan === true || recurringParentTaskId)) {
+        const { TaskServiceClient } = await import('../clients/TaskServiceClient');
+        TaskServiceClient.notifyRecurringVisitPaymentCaptured({
+          parentTaskId: recurringParentTaskId,
+          visitId: recurringVisitId,
+          escrowId: postgresEscrow.escrowId,
+        }).catch((err) => {
+          logger.error('Recurring visit payment-captured callback failed', {
+            parentTaskId: recurringParentTaskId,
+            visitId: recurringVisitId,
+            taskId: postgresEscrow.taskId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
     } else if (paymentStatus === 'failed') {
       logPaymentFailed({
         escrowId: postgresEscrow.id,
@@ -1028,13 +1224,48 @@ export async function getEscrowByTaskId(taskId: string): Promise<any | null> {
         taskId,
       },
       orderBy: {
-        createdAt: 'desc', // Get most recent escrow for the task
+        createdAt: 'desc',
       },
     });
 
     return postgresEscrow ? await convertPostgresEscrowToFrontendFormat(postgresEscrow) : null;
   } catch (error: any) {
     logger.error('❌ Error getting escrow by task ID:', error);
+    return null;
+  }
+}
+
+/** Per-visit escrow lookup for recurring v2 (metadata.visitId). */
+export async function getEscrowByTaskIdAndVisitId(
+  taskId: string,
+  visitId: string,
+): Promise<any | null> {
+  try {
+    if (!isPostgresConnected()) {
+      return null;
+    }
+
+    const trimmedVisitId = visitId?.trim();
+    if (!taskId?.trim() || !trimmedVisitId) {
+      return null;
+    }
+
+    const postgresEscrow = await prisma.escrow.findFirst({
+      where: {
+        taskId,
+        metadata: {
+          path: ['visitId'],
+          equals: trimmedVisitId,
+        },
+      },
+      orderBy: {
+        createdAt: 'desc',
+      },
+    });
+
+    return postgresEscrow ? await convertPostgresEscrowToFrontendFormat(postgresEscrow) : null;
+  } catch (error: any) {
+    logger.error('❌ Error getting escrow by task ID and visit ID:', error);
     return null;
   }
 }

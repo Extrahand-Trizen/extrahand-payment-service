@@ -125,7 +125,10 @@ export class FeeController {
           if (!categorySlug || !Number.isFinite(lineTotal) || lineTotal <= 0) return null;
           return { categorySlug, lineTotal };
         })
-        .filter((entry): entry is BookNowGstLineInput => entry != null);
+        .filter(
+          (entry: BookNowGstLineInput | null): entry is BookNowGstLineInput =>
+            entry != null,
+        );
 
       if (items.length === 0) {
         return res.status(400).json({

@@ -486,6 +486,14 @@ function buildPosterRefundTransaction(
     lineDisplay,
     lineDisplay.isLineItem ? lineItemAmount : totalPaid.toString(),
   );
+  const escrowEm =
+    escrow.metadata && typeof escrow.metadata === 'object' && !Array.isArray(escrow.metadata)
+      ? (escrow.metadata as Record<string, unknown>)
+      : {};
+  const recurringRefundDisplay = lineDisplay.isLineItem
+    ? null
+    : resolveRecurringPayoutDisplay(escrowEm);
+  const refundDisplayTitle = recurringRefundDisplay?.displayTitle || refundTitle;
 
   return {
     id: refund.id,
@@ -493,18 +501,19 @@ function buildPosterRefundTransaction(
     type: 'refund',
     amount: refundAmtStr,
     status: refund.status,
-    description: refundTitle
-      ? `Refund — ${truncateTitle(refundTitle)}`
+    description: refundDisplayTitle
+      ? `Refund — ${truncateTitle(refundDisplayTitle)}`
       : `Money returned for cancelled task ${lineDisplay.taskId}`,
     date: refund.createdAt.toISOString(),
     relatedEntityId: refund.escrowId || undefined,
     category: 'payments',
-    metadata: {
+    metadata: enrichRecurringPayoutMetadata(
+      {
       taskId: lineDisplay.taskId,
-      ...(refundTitle
+      ...(refundDisplayTitle
         ? {
-            taskTitle: refundTitle,
-            taskTitleSnapshot: refundTitle,
+            taskTitle: refundDisplayTitle,
+            taskTitleSnapshot: refundDisplayTitle,
             ...(lineDisplay.isLineItem ? { cancelledServiceTitle: refundTitle } : {}),
           }
         : {}),
@@ -556,7 +565,9 @@ function buildPosterRefundTransaction(
                 }
               : {}),
           }),
-    },
+      },
+      escrowEm,
+    ),
   };
 }
 
@@ -885,6 +896,8 @@ export async function getUserTransactions(
             requestId: requestId ?? null,
           },
         ];
+        const recurringPaymentDisplay = resolveRecurringPayoutDisplay(em);
+        const paymentDisplayTitle = recurringPaymentDisplay?.displayTitle || taskTitleSnapshot;
 
         // Always add payment transactions when user is the poster (they paid)
         transactions.push(
@@ -895,28 +908,21 @@ export async function getUserTransactions(
               type: 'escrow',
               amount: escrow.amountInRupees.toString(),
               status: escrow.status,
-              description: taskTitleSnapshot
+              description: paymentDisplayTitle
                 ? paymentKind === 'additional'
-                  ? `Additional payment — ${
-                      taskTitleSnapshot.length > 100
-                        ? `${taskTitleSnapshot.slice(0, 97)}...`
-                        : taskTitleSnapshot
-                    }`
-                  : `Original payment — ${
-                      taskTitleSnapshot.length > 100
-                        ? `${taskTitleSnapshot.slice(0, 97)}...`
-                        : taskTitleSnapshot
-                    }`
+                  ? `Additional payment — ${truncateTitle(paymentDisplayTitle)}`
+                  : `Original payment — ${truncateTitle(paymentDisplayTitle)}`
                 : paymentLabel,
               date: paymentEventDate,
               relatedEntityId: escrow.escrowId,
               category: 'payments', // Money spent
-              metadata: {
+              metadata: enrichRecurringPayoutMetadata(
+                {
                 taskId: escrow.taskId,
-                ...(taskTitleSnapshot
+                ...(paymentDisplayTitle
                   ? {
-                      taskTitle: taskTitleSnapshot,
-                      taskTitleSnapshot,
+                      taskTitle: paymentDisplayTitle,
+                      taskTitleSnapshot: paymentDisplayTitle,
                     }
                   : {}),
                 ...(taskCategorySnapshot ? { taskCategory: taskCategorySnapshot, taskCategorySnapshot } : {}),
@@ -982,6 +988,8 @@ export async function getUserTransactions(
                   : {}),
                 ...partySnapshot,
               },
+                em,
+              ),
             },
             paymentEventDate,
             {
@@ -1091,6 +1099,9 @@ export async function getUserTransactions(
             const ctx = resolveEscrowFinanceContext(escrow);
             transactions.push(buildPosterRefundTransaction(refund, escrow, ctx));
           } else if (isPerformerCompensation) {
+            const recurringCompDisplay = resolveRecurringPayoutDisplay(em);
+            const compensationDisplayTitle =
+              recurringCompDisplay?.displayTitle || taskTitleSnapshot;
             // Performer gets compensation (money earned) - this is an earnings transaction
             transactions.push({
               id: refund.id,
@@ -1098,31 +1109,34 @@ export async function getUserTransactions(
               type: 'compensation',
               amount: (refund.toOtherParty?.toString() || '0'),
               status: refund.status,
-              description: taskTitleSnapshot
-                ? `Compensation — ${taskTitleSnapshot.length > 100 ? `${taskTitleSnapshot.slice(0, 97)}...` : taskTitleSnapshot}`
+              description: compensationDisplayTitle
+                ? `Compensation — ${truncateTitle(compensationDisplayTitle)}`
                 : `Money from cancelled task ${escrow.taskId}`,
               date: refund.createdAt.toISOString(),
               relatedEntityId: refund.escrowId || undefined,
               category: 'earnings', // Money received
-              metadata: {
-                taskId: escrow.taskId,
-                ...(taskTitleSnapshot
-                  ? {
-                      taskTitle: taskTitleSnapshot,
-                      taskTitleSnapshot,
-                    }
-                  : {}),
-                ...(taskCategorySnapshot
-                  ? { taskCategory: taskCategorySnapshot, taskCategorySnapshot }
-                  : {}),
-                ...(taskDescriptionSnapshot ? { taskDescription: taskDescriptionSnapshot } : {}),
-                cancellationFee: refund.cancellationFee?.toString() || '0',
-                refundAmount: refund.refundAmount.toString(),
-                toOtherParty: refund.toOtherParty?.toString() || '0',
-                toPlatform: refund.toPlatform?.toString() || '0',
-                cancelledBy: refund.cancelledBy,
-                reason: refund.reason
-              }
+              metadata: enrichRecurringPayoutMetadata(
+                {
+                  taskId: escrow.taskId,
+                  ...(compensationDisplayTitle
+                    ? {
+                        taskTitle: compensationDisplayTitle,
+                        taskTitleSnapshot: compensationDisplayTitle,
+                      }
+                    : {}),
+                  ...(taskCategorySnapshot
+                    ? { taskCategory: taskCategorySnapshot, taskCategorySnapshot }
+                    : {}),
+                  ...(taskDescriptionSnapshot ? { taskDescription: taskDescriptionSnapshot } : {}),
+                  cancellationFee: refund.cancellationFee?.toString() || '0',
+                  refundAmount: refund.refundAmount.toString(),
+                  toOtherParty: refund.toOtherParty?.toString() || '0',
+                  toPlatform: refund.toPlatform?.toString() || '0',
+                  cancelledBy: refund.cancelledBy,
+                  reason: refund.reason,
+                },
+                em,
+              ),
             });
           }
         }

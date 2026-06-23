@@ -8,6 +8,8 @@
     "start": "node dist/server.js",
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
     "seed:categories": "ts-node src/scripts/seedCategoryFees.ts",
+    "seed:admin": "ts-node --require dotenv/config src/scripts/seedAdminUser.ts",
+    "seed:admin:prod": "ts-node --require dotenv/config src/scripts/seedAdminUser.ts --prod",
     "migrate:wallet-role:sql": "ts-node scripts/run-migrate-add-wallet-role.ts",
     "migrate:wallet-role:dry": "ts-node scripts/backfill-wallet-role.ts",
     "migrate:wallet-role:execute": "ts-node scripts/backfill-wallet-role.ts --execute",
@@ -19,7 +21,8 @@
     "health": "curl -f http://localhost:4003/api/v1/health || exit 1",
     "test:bank-crypto": "npm run build && node --test dist/utils/bankFieldCrypto.test.js",
     "migrate:bank-encryption": "ts-node --require dotenv/config scripts/run-bank-encryption-migration.ts",
-    "sync:postgres-dev-to-prod": "ts-node --require dotenv/config scripts/sync-dev-postgres-to-prod.ts"
+    "sync:postgres-dev-to-prod": "ts-node --require dotenv/config scripts/sync-dev-postgres-to-prod.ts",
+    "sync:category-fees-dev-to-prod": "ts-node --require dotenv/config scripts/sync-category-fees-dev-to-prod.ts"
   },
   "engines": {
     "node": ">=18"

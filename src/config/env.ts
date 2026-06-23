@@ -99,6 +99,7 @@ export function getCorsConfig(env: z.infer<typeof envSchema>) {
   const allowedOrigins = [
     'https://extrahand.in',
     'https://www.extrahand.in',
+    'https://extrahand-gst-admin-portal.apps.extrahand.in',
     'http://localhost:3000',
     'http://localhost:4000',
     'http://localhost:4001',

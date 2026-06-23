@@ -476,11 +476,21 @@ model PaymentOrderIdempotency {
   createdAt       DateTime @default(now())
 }
 
+enum CategoryFeeMode {
+  BOOK_NOW
+  BIDDING
+}
+
 // CategoryFeeConfig - Per-category fee overrides and optional guards
 model CategoryFeeConfig {
-  id          String  @id @default(uuid())
-  categoryKey String  @unique
+  id          String          @id @default(uuid())
+  categoryKey String
+  mode        CategoryFeeMode @default(BIDDING)
   displayName String?
+
+  // GST classification (SAC = Services Accounting Code)
+  sacCode     String?
+  sacHeading  String?
 
   // Core knobs
   gstPercentage            Decimal  @db.Decimal(5, 4)
@@ -498,7 +508,9 @@ model CategoryFeeConfig {
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
 
+  @@unique([categoryKey, mode])
   @@index([categoryKey])
+  @@index([mode])
   @@index([effectiveFrom, effectiveTo])
 }
 

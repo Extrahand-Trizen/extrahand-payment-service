@@ -3,8 +3,10 @@ import {
   createEscrow,
   createBookingEscrow,
   attachPerformerToEscrow,
+  reassignRecurringVisitEscrow,
   getEscrowStatus,
   getEscrowByTaskId,
+  getEscrowByTaskIdAndVisitId,
   releaseEscrow,
   updateEscrowAutoRelease,
 } from '../services/escrowService';
@@ -164,6 +166,34 @@ export class EscrowController {
   }
 
   /**
+   * PATCH /api/v1/escrow/:escrowId/reassign-recurring-visit
+   */
+  static async reassignRecurringVisit(req: Request, res: Response): Promise<void> {
+    const { escrowId } = req.params;
+    const { taskId, fromVisitId, toVisitId } = req.body;
+
+    if (!taskId || !fromVisitId || !toVisitId) {
+      throw new BadRequestError('taskId, fromVisitId, and toVisitId are required');
+    }
+
+    const result = await reassignRecurringVisitEscrow({
+      escrowId,
+      taskId,
+      fromVisitId,
+      toVisitId,
+    });
+
+    if (!result.success) {
+      throw new BadRequestError(result.error || 'Failed to reassign recurring visit escrow');
+    }
+
+    res.json({
+      success: true,
+      escrow: result.escrow,
+    });
+  }
+
+  /**
    * GET /api/v1/escrow/status/:escrowId
    * Get escrow status by escrow ID
    */
@@ -188,10 +218,20 @@ export class EscrowController {
    */
   static async getEscrowByTaskId(req: Request, res: Response): Promise<void> {
     const { taskId } = req.params;
+    const visitId =
+      typeof req.query.visitId === 'string' && req.query.visitId.trim()
+        ? req.query.visitId.trim()
+        : undefined;
 
-    const escrow = await getEscrowByTaskId(taskId);
+    const escrow = visitId
+      ? await getEscrowByTaskIdAndVisitId(taskId, visitId)
+      : await getEscrowByTaskId(taskId);
 
     if (!escrow) {
+      if (visitId) {
+        res.json({ success: true, escrow: null });
+        return;
+      }
       throw new NotFoundError('Escrow not found for this task');
     }
 

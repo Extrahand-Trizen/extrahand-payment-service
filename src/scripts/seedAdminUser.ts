@@ -1,12 +1,36 @@
-import { upsertAdminUser } from '../services/adminAuthService';
-import logger from '../config/logger';
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+const useProd = process.argv.includes('--prod');
+
+if (useProd) {
+  const prodUrl = process.env.PROD_POSTGRESDB_URI || '';
+  if (!prodUrl) {
+    console.error('PROD_POSTGRESDB_URI is required when using --prod');
+    process.exit(1);
+  }
+  process.env.POSTGRESDB_URI = prodUrl;
+  console.log('[seed:admin] Target: PROD');
+} else {
+  console.log('[seed:admin] Target: DEV (POSTGRESDB_URI)');
+}
+
+const USERNAME = process.env.ADMIN_SEED_USERNAME || 'admin';
+const PASSWORD = process.env.ADMIN_SEED_PASSWORD || 'admin@123';
 
 async function run() {
   try {
-    await upsertAdminUser('admin', 'admin@123');
-    logger.info('✅ Admin user upserted');
+    const { upsertAdminUser } = await import('../services/adminAuthService');
+    const { disconnectPrisma } = await import('../config/prisma');
+    const logger = (await import('../config/logger')).default;
+
+    await upsertAdminUser(USERNAME, PASSWORD);
+    logger.info(`✅ Admin user "${USERNAME}" upserted`);
+    await disconnectPrisma();
     process.exit(0);
-  } catch (err: any) {
+  } catch (err: unknown) {
+    const logger = (await import('../config/logger')).default;
     logger.error('❌ Admin user seed failed', err);
     process.exit(1);
   }

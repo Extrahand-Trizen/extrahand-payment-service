@@ -34,7 +34,7 @@ export async function upsertAdminUser(username: string, password: string) {
   const fallbackEmail = `${username}@internal.local`;
   return await prisma.adminUser.upsert({
     where: { username },
-    create: { username, email: fallbackEmail, passwordHash, status: 'active' },
-    update: { passwordHash },
+    create: { username, email: fallbackEmail, passwordHash, status: 'active', role: 'super_admin' },
+    update: { passwordHash, status: 'active' },
   });
 }

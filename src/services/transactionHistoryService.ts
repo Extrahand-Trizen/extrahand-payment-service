@@ -1,6 +1,12 @@
 import { prisma } from '../config/prisma';
 import logger from '../config/logger';
 import { Prisma } from '@prisma/client';
+import { resolveEscrowTaskAmountForPayout } from '../utils/escrowFinanceUtils';
+import {
+  enrichRecurringPayoutMetadata,
+  formatRecurringPayoutDescription,
+  resolveRecurringPayoutDisplay,
+} from '../utils/recurringPayoutDisplay';
 import { isBookNowEscrowRecord } from './escrowService';
 
 const SUCCESSFUL_ESCROW_PAYMENT_STATUSES = new Set(['held', 'released']);
@@ -325,6 +331,244 @@ function sumLineItemsByKind(
   return items
     .filter((i) => i.paymentKind === kind)
     .reduce((acc, i) => acc + Number(i.amount), 0);
+}
+
+type EscrowHistoryRow = {
+  id: string;
+  escrowId: string;
+  taskId: string;
+  posterUid: string;
+  performerUid?: string | null;
+  status: string;
+  metadata: unknown;
+  amountInRupees: { toString(): string };
+  taskAmount?: unknown;
+  taskCategory?: string | null;
+  appliedPlatformFeePercent?: unknown;
+  appliedGstPercent?: unknown;
+};
+
+type RefundHistoryRow = {
+  id: string;
+  refundId: string;
+  escrowId: string | null;
+  taskId?: string | null;
+  refundAmount: { toString(): string };
+  cancellationFee: { toString(): string } | null;
+  toOtherParty: { toString(): string } | null;
+  toPlatform: { toString(): string } | null;
+  cancelledBy: string | null;
+  reason: string | null;
+  status: string;
+  createdAt: Date;
+};
+
+type EscrowFinanceContext = {
+  taskTitleSnapshot?: string;
+  taskCategorySnapshot?: string;
+  taskDescriptionSnapshot?: string;
+  totalPaid: Prisma.Decimal;
+  taskAmount: Prisma.Decimal;
+  finalPlatformFee: Prisma.Decimal;
+  finalGst: Prisma.Decimal;
+};
+
+function resolveEscrowFinanceContext(escrow: EscrowHistoryRow): EscrowFinanceContext {
+  const escrowMeta =
+    escrow.metadata && typeof escrow.metadata === 'object' && !Array.isArray(escrow.metadata)
+      ? (escrow.metadata as Record<string, unknown>)
+      : {};
+  const amountBreakdown =
+    escrowMeta.amountBreakdown &&
+    typeof escrowMeta.amountBreakdown === 'object' &&
+    !Array.isArray(escrowMeta.amountBreakdown)
+      ? (escrowMeta.amountBreakdown as Record<string, unknown>)
+      : {};
+  const toDecimal = (value: unknown): Prisma.Decimal | null => {
+    if (value == null) return null;
+    try {
+      return new Prisma.Decimal(String(value));
+    } catch {
+      return null;
+    }
+  };
+  const normalizePercent = (value: Prisma.Decimal | null): Prisma.Decimal | null => {
+    if (!value) return null;
+    const one = new Prisma.Decimal('1');
+    const hundred = new Prisma.Decimal('100');
+    return value.greaterThan(one) ? value.div(hundred) : value;
+  };
+  const totalPaid = new Prisma.Decimal(escrow.amountInRupees.toString());
+  const configuredPlatformPct = normalizePercent(toDecimal(escrow.appliedPlatformFeePercent));
+  const configuredGstPct = normalizePercent(toDecimal(escrow.appliedGstPercent));
+  const taskAmount = resolveEscrowTaskAmountForPayout(escrow);
+  const platformFee =
+    toDecimal(amountBreakdown.platformFee) ||
+    toDecimal(escrowMeta.platformFee) ||
+    (configuredPlatformPct ? taskAmount.mul(configuredPlatformPct).toDecimalPlaces(2) : null) ||
+    new Prisma.Decimal('0');
+  const gstAmount =
+    toDecimal(amountBreakdown.gst) ||
+    toDecimal(escrowMeta.gstAmount) ||
+    toDecimal(escrowMeta.platformFeeGst) ||
+    ((configuredGstPct || configuredGstPct === null) && configuredPlatformPct
+      ? taskAmount.mul(configuredPlatformPct).mul(configuredGstPct || new Prisma.Decimal('0')).toDecimalPlaces(2)
+      : null) ||
+    new Prisma.Decimal('0');
+  const feesAndTaxes = platformFee.plus(gstAmount);
+  const inferredFeesAndTaxes = totalPaid.minus(taskAmount);
+  const normalizedFeesAndTaxes = inferredFeesAndTaxes.greaterThan(0)
+    ? inferredFeesAndTaxes
+    : new Prisma.Decimal('0');
+  const finalPlatformFee = feesAndTaxes.greaterThan(0) ? platformFee : normalizedFeesAndTaxes;
+  const finalGst = feesAndTaxes.greaterThan(0) ? gstAmount : new Prisma.Decimal('0');
+
+  const em = escrowMeta as Record<string, any>;
+  const taskTitleSnapshot =
+    typeof em.taskTitleSnapshot === 'string' && em.taskTitleSnapshot.trim().length > 0
+      ? em.taskTitleSnapshot.trim()
+      : typeof em.taskTitle === 'string' && em.taskTitle.trim().length > 0
+        ? em.taskTitle.trim()
+        : undefined;
+  const taskCategorySnapshot =
+    typeof em.taskCategorySnapshot === 'string' && em.taskCategorySnapshot.trim().length > 0
+      ? em.taskCategorySnapshot.trim()
+      : typeof escrow.taskCategory === 'string' && escrow.taskCategory.trim().length > 0
+        ? escrow.taskCategory.trim()
+        : typeof em.taskCategory === 'string' && em.taskCategory.trim().length > 0
+          ? em.taskCategory.trim()
+          : undefined;
+  const taskDescriptionSnapshot =
+    typeof em.taskDescription === 'string' && em.taskDescription.trim().length > 0
+      ? em.taskDescription.trim()
+      : undefined;
+
+  return {
+    taskTitleSnapshot,
+    taskCategorySnapshot,
+    taskDescriptionSnapshot,
+    totalPaid,
+    taskAmount,
+    finalPlatformFee,
+    finalGst,
+  };
+}
+
+function buildPosterRefundTransaction(
+  refund: RefundHistoryRow,
+  escrow: EscrowHistoryRow,
+  ctx: EscrowFinanceContext,
+): Transaction {
+  const {
+    taskTitleSnapshot,
+    taskCategorySnapshot,
+    taskDescriptionSnapshot,
+    totalPaid,
+    taskAmount,
+    finalPlatformFee,
+    finalGst,
+  } = ctx;
+  const lineDisplay = resolveBookNowLineRefundDisplay(
+    { ...refund, taskId: refund.taskId ?? null },
+    escrow,
+    taskTitleSnapshot,
+  );
+  const refundTitle = lineDisplay.title;
+  const feeStr = refund.cancellationFee?.toString() || '0';
+  const refundAmtStr = refund.refundAmount.toString();
+  const lineItemAmount =
+    lineDisplay.lineItemAmount ||
+    (parseFloat(feeStr) > 0
+      ? (parseFloat(feeStr) + parseFloat(refundAmtStr)).toFixed(2)
+      : undefined);
+  const policyMeta = resolveRefundCancellationPolicyMeta(
+    refund,
+    lineDisplay,
+    lineDisplay.isLineItem ? lineItemAmount : totalPaid.toString(),
+  );
+  const escrowEm =
+    escrow.metadata && typeof escrow.metadata === 'object' && !Array.isArray(escrow.metadata)
+      ? (escrow.metadata as Record<string, unknown>)
+      : {};
+  const recurringRefundDisplay = lineDisplay.isLineItem
+    ? null
+    : resolveRecurringPayoutDisplay(escrowEm);
+  const refundDisplayTitle = recurringRefundDisplay?.displayTitle || refundTitle;
+
+  return {
+    id: refund.id,
+    transactionId: refund.refundId,
+    type: 'refund',
+    amount: refundAmtStr,
+    status: refund.status,
+    description: refundDisplayTitle
+      ? `Refund — ${truncateTitle(refundDisplayTitle)}`
+      : `Money returned for cancelled task ${lineDisplay.taskId}`,
+    date: refund.createdAt.toISOString(),
+    relatedEntityId: refund.escrowId || undefined,
+    category: 'payments',
+    metadata: enrichRecurringPayoutMetadata(
+      {
+      taskId: lineDisplay.taskId,
+      ...(refundDisplayTitle
+        ? {
+            taskTitle: refundDisplayTitle,
+            taskTitleSnapshot: refundDisplayTitle,
+            ...(lineDisplay.isLineItem ? { cancelledServiceTitle: refundTitle } : {}),
+          }
+        : {}),
+      ...(policyMeta.cancellationPolicyLabel
+        ? {
+            cancellationPolicyLabel: policyMeta.cancellationPolicyLabel,
+            cancellationFeePercentage: policyMeta.cancellationFeePercentage,
+          }
+        : {}),
+      ...(taskCategorySnapshot && !lineDisplay.isLineItem
+        ? { taskCategory: taskCategorySnapshot, taskCategorySnapshot }
+        : {}),
+      ...(taskDescriptionSnapshot && !lineDisplay.isLineItem
+        ? { taskDescription: taskDescriptionSnapshot }
+        : {}),
+      cancellationFee: feeStr,
+      refundAmount: refundAmtStr,
+      toOtherParty: refund.toOtherParty?.toString() || '0',
+      toPlatform: refund.toPlatform?.toString() || '0',
+      cancelledBy: refund.cancelledBy,
+      reason: refund.reason,
+      ...(lineDisplay.isLineItem
+        ? {
+            bookingMode: 'book_now',
+            bookNowLineRefund: true,
+            lineItemAmount,
+            originalAmount: lineItemAmount,
+            taskAmount: lineItemAmount,
+            totalPaid: lineItemAmount,
+            amountBreakdown: {
+              lineItemAmount,
+              cancellationFee: feeStr,
+              refundAmount: refundAmtStr,
+            },
+          }
+        : {
+            originalAmount: escrow.amountInRupees.toString(),
+            taskAmount: taskAmount.toString(),
+            platformFee: finalPlatformFee.toString(),
+            gstAmount: finalGst.toString(),
+            totalPaid: totalPaid.toString(),
+            ...(parseFloat(feeStr) > 0
+              ? {
+                  amountBreakdown: {
+                    lineItemAmount: totalPaid.toString(),
+                    cancellationFee: feeStr,
+                    refundAmount: refundAmtStr,
+                  },
+                }
+              : {}),
+          }),
+      },
+      escrowEm,
+    ),
+  };
 }
 
 /**
@@ -652,6 +896,8 @@ export async function getUserTransactions(
             requestId: requestId ?? null,
           },
         ];
+        const recurringPaymentDisplay = resolveRecurringPayoutDisplay(em);
+        const paymentDisplayTitle = recurringPaymentDisplay?.displayTitle || taskTitleSnapshot;
 
         // Always add payment transactions when user is the poster (they paid)
         transactions.push(
@@ -662,28 +908,21 @@ export async function getUserTransactions(
               type: 'escrow',
               amount: escrow.amountInRupees.toString(),
               status: escrow.status,
-              description: taskTitleSnapshot
+              description: paymentDisplayTitle
                 ? paymentKind === 'additional'
-                  ? `Additional payment — ${
-                      taskTitleSnapshot.length > 100
-                        ? `${taskTitleSnapshot.slice(0, 97)}...`
-                        : taskTitleSnapshot
-                    }`
-                  : `Original payment — ${
-                      taskTitleSnapshot.length > 100
-                        ? `${taskTitleSnapshot.slice(0, 97)}...`
-                        : taskTitleSnapshot
-                    }`
+                  ? `Additional payment — ${truncateTitle(paymentDisplayTitle)}`
+                  : `Original payment — ${truncateTitle(paymentDisplayTitle)}`
                 : paymentLabel,
               date: paymentEventDate,
               relatedEntityId: escrow.escrowId,
               category: 'payments', // Money spent
-              metadata: {
+              metadata: enrichRecurringPayoutMetadata(
+                {
                 taskId: escrow.taskId,
-                ...(taskTitleSnapshot
+                ...(paymentDisplayTitle
                   ? {
-                      taskTitle: taskTitleSnapshot,
-                      taskTitleSnapshot,
+                      taskTitle: paymentDisplayTitle,
+                      taskTitleSnapshot: paymentDisplayTitle,
                     }
                   : {}),
                 ...(taskCategorySnapshot ? { taskCategory: taskCategorySnapshot, taskCategorySnapshot } : {}),
@@ -749,6 +988,8 @@ export async function getUserTransactions(
                   : {}),
                 ...partySnapshot,
               },
+                em,
+              ),
             },
             paymentEventDate,
             {
@@ -772,6 +1013,9 @@ export async function getUserTransactions(
               : {};
           const penaltyDeducted = payoutMetadata.penaltyDeducted || '0.00';
           const penaltyLines = Array.isArray(payoutMetadata.penaltyLines) ? payoutMetadata.penaltyLines : [];
+          const recurringPayout = resolveRecurringPayoutDisplay(em, payoutMetadata);
+          const payoutDisplayTitle =
+            recurringPayout?.displayTitle || taskTitleSnapshot || undefined;
           
           const payoutDate = (payout.completedAt ?? payout.createdAt).toISOString();
           const partySnapshotPayout = partySnapshotFromEscrowMeta(em);
@@ -783,18 +1027,19 @@ export async function getUserTransactions(
                 type: 'payout',
                 amount: payout.netAmount.toString(),
                 status: payout.status,
-                description: taskTitleSnapshot
-                  ? `Money received — ${taskTitleSnapshot.length > 100 ? `${taskTitleSnapshot.slice(0, 97)}...` : taskTitleSnapshot}`
+                description: payoutDisplayTitle
+                  ? formatRecurringPayoutDescription('Money received', payoutDisplayTitle)
                   : `Money received from task ${escrow.taskId}`,
                 date: payoutDate,
                 relatedEntityId: payout.escrowId || undefined,
                 category: 'earnings', // Money received
-                metadata: {
+                metadata: enrichRecurringPayoutMetadata(
+                  {
                   taskId: escrow.taskId,
-                  ...(taskTitleSnapshot
+                  ...(payoutDisplayTitle
                     ? {
-                        taskTitle: taskTitleSnapshot,
-                        taskTitleSnapshot,
+                        taskTitle: payoutDisplayTitle,
+                        taskTitleSnapshot: payoutDisplayTitle,
                       }
                     : {}),
                   ...(taskCategorySnapshot
@@ -829,6 +1074,9 @@ export async function getUserTransactions(
                   role: 'performer',
                   ...partySnapshotPayout,
                 },
+                  em,
+                  payoutMetadata,
+                ),
               },
               payoutDate
             )
@@ -848,100 +1096,12 @@ export async function getUserTransactions(
             refund.toOtherParty;
 
           if (isPosterRefund) {
-            const lineDisplay = resolveBookNowLineRefundDisplay(
-              refund,
-              escrow,
-              taskTitleSnapshot,
-            );
-            const refundTitle = lineDisplay.title;
-            const feeStr = refund.cancellationFee?.toString() || '0';
-            const refundAmtStr = refund.refundAmount.toString();
-            const lineItemAmount =
-              lineDisplay.lineItemAmount ||
-              (parseFloat(feeStr) > 0
-                ? (parseFloat(feeStr) + parseFloat(refundAmtStr)).toFixed(2)
-                : undefined);
-            const policyMeta = resolveRefundCancellationPolicyMeta(
-              refund,
-              lineDisplay,
-              lineDisplay.isLineItem ? lineItemAmount : totalPaid.toString(),
-            );
-
-            // Poster gets refund (money back) - this is a payment-related transaction
-            transactions.push({
-              id: refund.id,
-              transactionId: refund.refundId,
-              type: 'refund',
-              amount: refundAmtStr,
-              status: refund.status,
-              description: refundTitle
-                ? `Refund — ${truncateTitle(refundTitle)}`
-                : `Money returned for cancelled task ${lineDisplay.taskId}`,
-              date: refund.createdAt.toISOString(),
-              relatedEntityId: refund.escrowId || undefined,
-              category: 'payments', // Money returned (related to payment)
-              metadata: {
-                taskId: lineDisplay.taskId,
-                ...(refundTitle
-                  ? {
-                      taskTitle: refundTitle,
-                      taskTitleSnapshot: refundTitle,
-                      ...(lineDisplay.isLineItem
-                        ? { cancelledServiceTitle: refundTitle }
-                        : {}),
-                    }
-                  : {}),
-                ...(policyMeta.cancellationPolicyLabel
-                  ? {
-                      cancellationPolicyLabel: policyMeta.cancellationPolicyLabel,
-                      cancellationFeePercentage: policyMeta.cancellationFeePercentage,
-                    }
-                  : {}),
-                ...(taskCategorySnapshot && !lineDisplay.isLineItem
-                  ? { taskCategory: taskCategorySnapshot, taskCategorySnapshot }
-                  : {}),
-                ...(taskDescriptionSnapshot && !lineDisplay.isLineItem
-                  ? { taskDescription: taskDescriptionSnapshot }
-                  : {}),
-                cancellationFee: feeStr,
-                refundAmount: refundAmtStr,
-                toOtherParty: refund.toOtherParty?.toString() || '0',
-                toPlatform: refund.toPlatform?.toString() || '0',
-                cancelledBy: refund.cancelledBy,
-                reason: refund.reason,
-                ...(lineDisplay.isLineItem
-                  ? {
-                      bookingMode: 'book_now',
-                      bookNowLineRefund: true,
-                      lineItemAmount,
-                      originalAmount: lineItemAmount,
-                      taskAmount: lineItemAmount,
-                      totalPaid: lineItemAmount,
-                      amountBreakdown: {
-                        lineItemAmount,
-                        cancellationFee: feeStr,
-                        refundAmount: refundAmtStr,
-                      },
-                    }
-                  : {
-                      originalAmount: escrow.amountInRupees.toString(),
-                      taskAmount: taskAmount.toString(),
-                      platformFee: finalPlatformFee.toString(),
-                      gstAmount: finalGst.toString(),
-                      totalPaid: totalPaid.toString(),
-                      ...(parseFloat(feeStr) > 0
-                        ? {
-                            amountBreakdown: {
-                              lineItemAmount: totalPaid.toString(),
-                              cancellationFee: feeStr,
-                              refundAmount: refundAmtStr,
-                            },
-                          }
-                        : {}),
-                    }),
-              },
-            });
+            const ctx = resolveEscrowFinanceContext(escrow);
+            transactions.push(buildPosterRefundTransaction(refund, escrow, ctx));
           } else if (isPerformerCompensation) {
+            const recurringCompDisplay = resolveRecurringPayoutDisplay(em);
+            const compensationDisplayTitle =
+              recurringCompDisplay?.displayTitle || taskTitleSnapshot;
             // Performer gets compensation (money earned) - this is an earnings transaction
             transactions.push({
               id: refund.id,
@@ -949,36 +1109,78 @@ export async function getUserTransactions(
               type: 'compensation',
               amount: (refund.toOtherParty?.toString() || '0'),
               status: refund.status,
-              description: taskTitleSnapshot
-                ? `Compensation — ${taskTitleSnapshot.length > 100 ? `${taskTitleSnapshot.slice(0, 97)}...` : taskTitleSnapshot}`
+              description: compensationDisplayTitle
+                ? `Compensation — ${truncateTitle(compensationDisplayTitle)}`
                 : `Money from cancelled task ${escrow.taskId}`,
               date: refund.createdAt.toISOString(),
               relatedEntityId: refund.escrowId || undefined,
               category: 'earnings', // Money received
-              metadata: {
-                taskId: escrow.taskId,
-                ...(taskTitleSnapshot
-                  ? {
-                      taskTitle: taskTitleSnapshot,
-                      taskTitleSnapshot,
-                    }
-                  : {}),
-                ...(taskCategorySnapshot
-                  ? { taskCategory: taskCategorySnapshot, taskCategorySnapshot }
-                  : {}),
-                ...(taskDescriptionSnapshot ? { taskDescription: taskDescriptionSnapshot } : {}),
-                cancellationFee: refund.cancellationFee?.toString() || '0',
-                refundAmount: refund.refundAmount.toString(),
-                toOtherParty: refund.toOtherParty?.toString() || '0',
-                toPlatform: refund.toPlatform?.toString() || '0',
-                cancelledBy: refund.cancelledBy,
-                reason: refund.reason
-              }
+              metadata: enrichRecurringPayoutMetadata(
+                {
+                  taskId: escrow.taskId,
+                  ...(compensationDisplayTitle
+                    ? {
+                        taskTitle: compensationDisplayTitle,
+                        taskTitleSnapshot: compensationDisplayTitle,
+                      }
+                    : {}),
+                  ...(taskCategorySnapshot
+                    ? { taskCategory: taskCategorySnapshot, taskCategorySnapshot }
+                    : {}),
+                  ...(taskDescriptionSnapshot ? { taskDescription: taskDescriptionSnapshot } : {}),
+                  cancellationFee: refund.cancellationFee?.toString() || '0',
+                  refundAmount: refund.refundAmount.toString(),
+                  toOtherParty: refund.toOtherParty?.toString() || '0',
+                  toPlatform: refund.toPlatform?.toString() || '0',
+                  cancelledBy: refund.cancelledBy,
+                  reason: refund.reason,
+                },
+                em,
+              ),
             });
           }
         }
       });
     });
+
+    // Poster refunds queried directly — parent escrow may fall outside escrow pagination window
+    if (!typeFilter || typeFilter === 'refund') {
+      try {
+        const seenRefundIds = new Set(
+          transactions
+            .filter((entry) => entry.type === 'refund')
+            .map((entry) => entry.transactionId),
+        );
+        const posterRefunds = await prisma.refund.findMany({
+          where: {
+            escrow: { posterUid: { in: uidList } },
+            ...(statusFilter ? { status: statusFilter } : {}),
+            ...(startDate || endDate
+              ? {
+                  createdAt: {
+                    ...(startDate ? { gte: startDate } : {}),
+                    ...(endDate ? { lte: endDate } : {}),
+                  },
+                }
+              : {}),
+          },
+          include: { escrow: true },
+          orderBy: { createdAt: 'desc' },
+          take: fetchLimit,
+        });
+
+        for (const refund of posterRefunds) {
+          if (!refund.escrow || seenRefundIds.has(refund.refundId)) continue;
+          const ctx = resolveEscrowFinanceContext(refund.escrow);
+          transactions.push(buildPosterRefundTransaction(refund, refund.escrow, ctx));
+          seenRefundIds.add(refund.refundId);
+        }
+      } catch (refundFetchErr: unknown) {
+        logger.warn('[TransactionHistory] Standalone refund fetch failed', {
+          message: refundFetchErr instanceof Error ? refundFetchErr.message : String(refundFetchErr),
+        });
+      }
+    }
 
     // Tasker cancellation penalties — optional DB features must not break core history
     if (!typeFilter || typeFilter === 'cancellation_penalty') {
@@ -1045,17 +1247,10 @@ export async function getUserTransactions(
           const grossFromPenalty = Number.isFinite(penaltyDeducted) && penaltyDeducted > 0
             ? new Prisma.Decimal(payout.netAmount.toString()).add(new Prisma.Decimal(penaltyDeducted.toString())).toString()
             : payout.amount.toString();
-          transactions.push({
-            id: payout.id,
-            transactionId: payout.payoutId,
-            type: 'payout',
-            amount: payout.netAmount.toString(),
-            status: payout.status,
-            description: payout.description || 'Task payout credited',
-            date: payout.createdAt.toISOString(),
-            relatedEntityId: payout.payoutId,
-            category: 'earnings',
-            metadata: {
+          const recurringPayout = resolveRecurringPayoutDisplay(pm);
+          const payoutDisplayTitle = recurringPayout?.displayTitle;
+          const payoutMetadata = enrichRecurringPayoutMetadata(
+            {
               taskAmount: grossFromPenalty,
               totalPaid: grossFromPenalty,
               grossAmount: grossFromPenalty,
@@ -1078,6 +1273,21 @@ export async function getUserTransactions(
               },
               ...pm,
             },
+            pm,
+          );
+          transactions.push({
+            id: payout.id,
+            transactionId: payout.payoutId,
+            type: 'payout',
+            amount: payout.netAmount.toString(),
+            status: payout.status,
+            description: payoutDisplayTitle
+              ? formatRecurringPayoutDescription('Money received', payoutDisplayTitle)
+              : payout.description || 'Task payout credited',
+            date: payout.createdAt.toISOString(),
+            relatedEntityId: payout.payoutId,
+            category: 'earnings',
+            metadata: payoutMetadata,
           });
         });
       } catch (payoutErr: any) {

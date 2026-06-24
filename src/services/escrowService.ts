@@ -566,7 +566,11 @@ export async function attachPerformerToEscrow(params: {
     const pendingPerformer =
       !existing.performerUid || existing.performerUid === 'pending_assignment';
     if (!pendingPerformer && existing.performerUid !== performerUid) {
-      return { success: false, error: 'Performer already attached to this escrow' };
+      logger.warn('Overwriting performer on book-now escrow', {
+        escrowId,
+        oldPerformerUid: existing.performerUid,
+        newPerformerUid: performerUid,
+      });
     }
 
     const metadata =

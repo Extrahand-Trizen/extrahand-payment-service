@@ -13,6 +13,7 @@ const envSchema = z.object({
   
   // Postgres (Neon DB)
   POSTGRESDB_URI: z.string().url('POSTGRESDB_URI must be a valid URL'),
+  DEV_POSTGRESDB_URI: z.string().url('DEV_POSTGRESDB_URI must be a valid URL').optional(),
   
   // Razorpay
   RAZORPAY_KEY_ID: z.string().min(1, 'RAZORPAY_KEY_ID is required'),

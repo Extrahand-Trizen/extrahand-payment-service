@@ -5,6 +5,7 @@ import { BadRequestError, NotFoundError } from '../errors/AppError';
 import { createRefundAmountPaise } from '../services/paymentService';
 import { createLedgerEntry, getEscrowBalance } from '../services/ledgerService';
 import { toAdminBankAccount } from '../services/bankAccountSecrets';
+import logger from '../config/logger';
 
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
@@ -429,6 +430,7 @@ export class AdminFinanceController {
 
   static async getPayouts(req: Request, res: Response): Promise<void> {
     const { status, q, startDate, endDate } = req.query;
+    const transactionType = typeof req.query.transactionType === 'string' ? req.query.transactionType : undefined;
     const limit = parseLimit(req.query.limit);
     const offset = parseOffset(req.query.offset);
     const search = typeof q === 'string' && q.trim() ? q.trim() : undefined;
@@ -436,6 +438,20 @@ export class AdminFinanceController {
     const where: Prisma.PayoutWhereInput = {};
     if (status && typeof status === 'string') {
       where.status = status;
+    }
+
+    if (transactionType === 'real') {
+      where.NOT = {
+        OR: [
+          { metadata: { path: ['teamTest'], equals: true } },
+          { escrow: { metadata: { path: ['teamTest'], equals: true } } }
+        ]
+      };
+    } else if (transactionType === 'team') {
+      where.OR = [
+        { metadata: { path: ['teamTest'], equals: true } },
+        { escrow: { metadata: { path: ['teamTest'], equals: true } } }
+      ];
     }
     if (startDate || endDate) {
       where.createdAt = {};
@@ -450,7 +466,7 @@ export class AdminFinanceController {
       ];
     }
 
-    const [total, rows] = await Promise.all([
+    const [payoutTotal, payoutRows] = await Promise.all([
       prisma.payout.count({ where }),
       prisma.payout.findMany({
         where,
@@ -461,7 +477,7 @@ export class AdminFinanceController {
       }),
     ]);
 
-    const data = rows.map((row) => ({
+    const data = payoutRows.map((row) => ({
       payoutId: row.payoutId,
       performerUid: row.performerUid,
       taskId: row.taskId || row.escrow?.taskId || null,
@@ -471,17 +487,16 @@ export class AdminFinanceController {
       status: row.status,
       source: row.source,
       createdAt: row.createdAt,
-      // Include metadata so admin server can read teamTest flag (mirrors pay-ins approach)
       metadata: row.metadata ?? null,
     }));
 
     const page = Math.floor(offset / limit) + 1;
-    const pages = Math.ceil(total / limit);
+    const pages = Math.ceil(payoutTotal / limit);
 
     res.json({
       success: true,
       data,
-      pagination: { page, limit, total, pages },
+      pagination: { page, limit, total: payoutTotal, pages },
     });
   }
 
@@ -568,6 +583,7 @@ export class AdminFinanceController {
 
   static async getRefunds(req: Request, res: Response): Promise<void> {
     const { status, q, startDate, endDate } = req.query;
+    const transactionType = typeof req.query.transactionType === 'string' ? req.query.transactionType : undefined;
     const limit = parseLimit(req.query.limit);
     const offset = parseOffset(req.query.offset);
     const search = typeof q === 'string' && q.trim() ? q.trim() : undefined;
@@ -575,6 +591,12 @@ export class AdminFinanceController {
     const where: Prisma.RefundWhereInput = {};
     if (status && typeof status === 'string') {
       where.status = status;
+    }
+
+    if (transactionType === 'real') {
+      where.NOT = { escrow: { metadata: { path: ['teamTest'], equals: true } } };
+    } else if (transactionType === 'team') {
+      where.escrow = { metadata: { path: ['teamTest'], equals: true } };
     }
     if (startDate || endDate) {
       where.createdAt = {};
@@ -589,7 +611,7 @@ export class AdminFinanceController {
       ];
     }
 
-    const [total, rows] = await Promise.all([
+    const [refundTotal, refundRows] = await Promise.all([
       prisma.refund.count({ where }),
       prisma.refund.findMany({
         where,
@@ -600,7 +622,7 @@ export class AdminFinanceController {
       }),
     ]);
 
-    const data = rows.map((row) => {
+    const data = refundRows.map((row) => {
       // Read teamTest from the linked Escrow metadata (mirrors pay-ins/transactions approach)
       const escrowMeta =
         row.escrow?.metadata && typeof row.escrow.metadata === 'object'
@@ -614,18 +636,17 @@ export class AdminFinanceController {
         refundAmount: toStringValue(row.refundAmount),
         status: row.status,
         createdAt: row.createdAt,
-        // Expose teamTest from escrow metadata so the admin server can display it correctly
         teamTest: escrowMeta.teamTest === true,
       };
     });
 
     const page = Math.floor(offset / limit) + 1;
-    const pages = Math.ceil(total / limit);
+    const pages = Math.ceil(refundTotal / limit);
 
     res.json({
       success: true,
       data,
-      pagination: { page, limit, total, pages },
+      pagination: { page, limit, total: refundTotal, pages },
     });
   }
 

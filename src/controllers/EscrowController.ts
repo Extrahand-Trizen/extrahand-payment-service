@@ -3,12 +3,12 @@ import {
   createEscrow,
   createBookingEscrow,
   attachPerformerToEscrow,
+  resetPerformerOnEscrow,
   reassignRecurringVisitEscrow,
   getEscrowStatus,
   getEscrowByTaskId,
   getEscrowByTaskIdAndVisitId,
   releaseEscrow,
-  updateEscrowAutoRelease,
 } from '../services/escrowService';
 import { BadRequestError, NotFoundError } from '../errors/AppError';
 
@@ -163,6 +163,18 @@ export class EscrowController {
       success: true,
       escrow: result.escrow,
     });
+  }
+
+  /**
+   * PATCH /api/v1/escrow/:escrowId/reset-performer
+   */
+  static async resetPerformer(req: Request, res: Response): Promise<void> {
+    const { escrowId } = req.params;
+    const result = await resetPerformerOnEscrow(escrowId);
+    if (!result.success) {
+      throw new BadRequestError(result.error || 'Failed to reset performer');
+    }
+    res.json({ success: true });
   }
 
   /**

@@ -1,10 +1,11 @@
 import { Request, Response } from 'express';
-import { prisma } from '../config/prisma';
+import { prisma, prismaDev } from '../config/prisma';
 import { Prisma } from '@prisma/client';
 import { BadRequestError, NotFoundError } from '../errors/AppError';
 import { createRefundAmountPaise } from '../services/paymentService';
 import { createLedgerEntry, getEscrowBalance } from '../services/ledgerService';
 import { toAdminBankAccount } from '../services/bankAccountSecrets';
+import { calculateFees } from '../services/feeCalculationService';
 import logger from '../config/logger';
 
 const DEFAULT_LIMIT = 50;
@@ -22,10 +23,76 @@ function parseOffset(value: unknown): number {
   return Math.max(Math.floor(parsed), 0);
 }
 
+/**
+ * Build a raw SQL query for Escrow listing with COUNT(*) OVER() window function.
+ * Avoids separate COUNT(*) + findMany + include subquery — all in one round-trip.
+ */
+function buildEscrowQuery(
+  where: Prisma.EscrowWhereInput,
+  limit: number,
+  offset: number,
+): { sql: string; params: any[] } {
+  const conditions: string[] = [];
+  const params: any[] = [];
+  let idx = 1;
+
+  if (where.status && typeof where.status === 'string') {
+    conditions.push(`"status" = $${idx++}`);
+    params.push(where.status);
+  }
+
+  const createdAt = where.createdAt as { gte?: Date; lte?: Date } | undefined;
+  if (createdAt) {
+    if (createdAt.gte) {
+      conditions.push(`"createdAt" >= $${idx++}`);
+      params.push(createdAt.gte);
+    }
+    if (createdAt.lte) {
+      conditions.push(`"createdAt" <= $${idx++}`);
+      params.push(createdAt.lte);
+    }
+  }
+
+  const orClauses = where.OR as Array<Record<string, any>> | undefined;
+  if (orClauses && orClauses.length > 0) {
+    const orParts: string[] = [];
+    for (const clause of orClauses) {
+      for (const [col, val] of Object.entries(clause)) {
+        if (val && typeof val === 'object' && 'contains' in val) {
+          orParts.push(`"${col}"::text ILIKE $${idx++}`);
+          params.push(`%${val.contains}%`);
+        }
+      }
+    }
+    if (orParts.length > 0) {
+      conditions.push(`(${orParts.join(' OR ')})`);
+    }
+  }
+
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+  const sql = `
+    SELECT *, COUNT(*) OVER() AS _total_count
+    FROM "Escrow"
+    ${whereClause}
+    ORDER BY "createdAt" DESC
+    LIMIT $${idx++} OFFSET $${idx++}
+  `;
+  params.push(limit, offset);
+
+  return { sql, params };
+}
+
 function toStringValue(value: Prisma.Decimal | string | number | null | undefined): string | null {
   if (value == null) return null;
   if (value instanceof Prisma.Decimal) return value.toString();
   return String(value);
+}
+
+/** Returns true only when metadata.teamTest === true. null/undefined/false = real transaction. */
+function isTeamTest(metadata: unknown): boolean {
+  if (!metadata || typeof metadata !== 'object') return false;
+  return (metadata as Record<string, unknown>).teamTest === true;
 }
 
 export class AdminFinanceController {
@@ -34,6 +101,8 @@ export class AdminFinanceController {
     const start = startDate ? new Date(startDate as string) : undefined;
     const end = endDate ? new Date(endDate as string) : undefined;
 
+    // Fetch without teamTest DB filter — Prisma JSONB NOT filter misses null/missing-key rows.
+    // We filter in JS after fetching so null/missing teamTest correctly counts as real.
     const escrowWhere: Prisma.EscrowWhereInput = {};
     if (start || end) {
       escrowWhere.createdAt = {};
@@ -43,52 +112,71 @@ export class AdminFinanceController {
 
     const refundWhere: Prisma.RefundWhereInput = { status: 'completed' };
     const payoutWhere: Prisma.PayoutWhereInput = { status: 'completed' };
-
     if (start || end) {
       refundWhere.createdAt = {};
       payoutWhere.createdAt = {};
-      if (start) {
-        refundWhere.createdAt.gte = start;
-        payoutWhere.createdAt.gte = start;
-      }
-      if (end) {
-        refundWhere.createdAt.lte = end;
-        payoutWhere.createdAt.lte = end;
+      if (start) { refundWhere.createdAt.gte = start; payoutWhere.createdAt.gte = start; }
+      if (end) { refundWhere.createdAt.lte = end; payoutWhere.createdAt.lte = end; }
+    }
+
+    // Fetch all escrows, refunds, payouts from primary DB
+    const [mainEscrows, mainRefunds, mainPayouts] = await Promise.all([
+      prisma.escrow.findMany({ where: escrowWhere, select: { escrowId: true, paymentStatus: true, amountInRupees: true, metadata: true } }),
+      prisma.refund.findMany({ where: refundWhere, select: { refundId: true, refundAmount: true, escrow: { select: { metadata: true } } }, }),
+      prisma.payout.findMany({ where: payoutWhere, select: { payoutId: true, netAmount: true, metadata: true, escrow: { select: { metadata: true } } }, }),
+    ]);
+
+    let allEscrows = mainEscrows as any[];
+    let allRefunds = mainRefunds as any[];
+    let allPayouts = mainPayouts as any[];
+
+    // Merge from secondary DB
+    if (prismaDev) {
+      try {
+        const [devEscrows, devRefunds, devPayouts] = await Promise.all([
+          prismaDev.escrow.findMany({ where: escrowWhere, select: { escrowId: true, paymentStatus: true, amountInRupees: true, metadata: true } }),
+          prismaDev.refund.findMany({ where: refundWhere, select: { refundId: true, refundAmount: true, escrow: { select: { metadata: true } } }, }),
+          prismaDev.payout.findMany({ where: payoutWhere, select: { payoutId: true, netAmount: true, metadata: true, escrow: { select: { metadata: true } } }, }),
+        ]);
+        const seenEscrows = new Set(allEscrows.map((r: any) => r.escrowId));
+        allEscrows = [...allEscrows, ...(devEscrows as any[]).filter((r: any) => !seenEscrows.has(r.escrowId))];
+        const seenRefunds = new Set(allRefunds.map((r: any) => r.refundId));
+        allRefunds = [...allRefunds, ...(devRefunds as any[]).filter((r: any) => !seenRefunds.has(r.refundId))];
+        const seenPayouts = new Set(allPayouts.map((r: any) => r.payoutId));
+        allPayouts = [...allPayouts, ...(devPayouts as any[]).filter((r: any) => !seenPayouts.has(r.payoutId))];
+      } catch (err: any) {
+        logger.warn('Failed to query secondary DB for metrics:', { message: err?.message });
       }
     }
 
-    const [capturedCount, failedCount, totalPayins, totalRefunds, totalPayouts] = await Promise.all([
-      prisma.escrow.count({ where: { ...escrowWhere, paymentStatus: 'captured' } }),
-      prisma.escrow.count({ where: { ...escrowWhere, paymentStatus: 'failed' } }),
-      prisma.escrow.aggregate({
-        where: { ...escrowWhere, paymentStatus: 'captured' },
-        _sum: { amountInRupees: true },
-      }),
-      prisma.refund.aggregate({
-        where: refundWhere,
-        _sum: { refundAmount: true },
-      }),
-      prisma.payout.aggregate({
-        where: payoutWhere,
-        _sum: { netAmount: true },
-      }),
-    ]);
+    // JS filter: real = teamTest is NOT true (null / missing key / false all count as real)
+    const realEscrows = allEscrows.filter((e: any) => !isTeamTest(e.metadata));
+    const realRefunds = allRefunds.filter((r: any) => !isTeamTest(r.escrow?.metadata));
+    const realPayouts = allPayouts.filter((p: any) => !isTeamTest(p.metadata) && !isTeamTest(p.escrow?.metadata));
 
-    const totalAttempts = capturedCount + failedCount;
-    const successRate = totalAttempts > 0 ? capturedCount / totalAttempts : 0;
+    const captured = realEscrows.filter((e: any) => e.paymentStatus === 'captured');
+    const failed = realEscrows.filter((e: any) => e.paymentStatus === 'failed');
+    const mergedCaptured = captured.length;
+    const mergedFailed = failed.length;
+    const mergedPayins = captured.reduce((sum: number, e: any) => sum + Number(e.amountInRupees ?? 0), 0);
+    const mergedRefunds = realRefunds.reduce((sum: number, r: any) => sum + Number(r.refundAmount ?? 0), 0);
+    const mergedPayouts = realPayouts.reduce((sum: number, p: any) => sum + Number(p.netAmount ?? 0), 0);
+    const totalAttempts = mergedCaptured + mergedFailed;
+    const successRate = totalAttempts > 0 ? mergedCaptured / totalAttempts : 0;
 
     res.json({
       success: true,
       metrics: {
-        totalPayins: toStringValue(totalPayins._sum?.amountInRupees),
-        totalRefunds: toStringValue(totalRefunds._sum?.refundAmount),
-        totalPayouts: toStringValue(totalPayouts._sum?.netAmount),
-        capturedCount,
-        failedCount,
+        totalPayins: mergedPayins > 0 ? mergedPayins.toFixed(2) : null,
+        totalRefunds: mergedRefunds > 0 ? mergedRefunds.toFixed(2) : null,
+        totalPayouts: mergedPayouts > 0 ? mergedPayouts.toFixed(2) : null,
+        capturedCount: mergedCaptured,
+        failedCount: mergedFailed,
         successRate,
       },
     });
   }
+
 
   static async getTransactions(req: Request, res: Response): Promise<void> {
     const { status, q, startDate, endDate } = req.query;
@@ -108,11 +196,8 @@ export class AdminFinanceController {
       where.status = holdStatus;
     }
 
-    if (transactionType === 'real') {
-      where.NOT = { metadata: { path: ['teamTest'], equals: true } };
-    } else if (transactionType === 'team') {
-      where.metadata = { path: ['teamTest'], equals: true };
-    }
+    // NOTE: transactionType filter (real/team) is applied in JS after merging both DBs
+    // to avoid Prisma JSONB NOT null-propagation bug that drops rows with null/missing teamTest.
 
     if (startDate || endDate) {
       where.createdAt = {};
@@ -131,20 +216,100 @@ export class AdminFinanceController {
       ];
     }
 
-    // No nested includes — all required fields are directly on Escrow.
-    // Nested include across 3 relations on large datasets caused 500 timeouts.
-    const [total, rows] = await Promise.all([
-      prisma.escrow.count({ where }),
-      prisma.escrow.findMany({
-        where,
-        orderBy: { createdAt: 'desc' },
-        take: limit,
-        skip: offset,
-      }),
-    ]);
+    // Avoid COUNT(*) + include subquery — both are slow on large tables.
+    // Use a single query with window function for total, and batch payouts separately.
+    let allRows: any[] = [];
+    let total = 0;
 
-    const data = rows.map((escrow) => {
+    // Fields needed from Escrow (avoid SELECT *)
+    const escrowSelect = {
+      id: true, escrowId: true, razorpayOrderId: true, razorpayPaymentId: true,
+      taskId: true, applicationId: true,
+      posterUid: true, performerUid: true,
+      status: true, paymentStatus: true,
+      amountInRupees: true, taskAmount: true,
+      createdAt: true, metadata: true,
+    } as const;
+
+    if (prismaDev) {
+      // Dual-DB: fetch limited rows from each, merge in JS
+      const BATCH = 200;
+      const [mainRows, devRows] = await Promise.all([
+        prisma.escrow.findMany({
+          where, select: escrowSelect,
+          orderBy: { createdAt: 'desc' },
+          take: BATCH, skip: 0,
+        }),
+        prismaDev.escrow.findMany({
+          where, select: escrowSelect,
+          orderBy: { createdAt: 'desc' },
+          take: BATCH, skip: 0,
+        }),
+      ]);
+      const seen = new Set(mainRows.map((r: any) => r.escrowId));
+      allRows = [...mainRows, ...devRows.filter((r: any) => !seen.has(r.escrowId))];
+      allRows.sort((a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    } else {
+      // Single DB: use COUNT(*) OVER() window function — one round-trip, no separate count query
+      const query = buildEscrowQuery(where, limit, offset);
+      const raw: any[] = await prisma.$queryRawUnsafe(query.sql, ...query.params);
+      total = raw.length > 0 ? Number(raw[0]._total_count) : 0;
+      // Prisma raw does not map JSONB — parse manually
+      allRows = raw.map((r: any) => ({
+        ...r,
+        metadata: typeof r.metadata === 'string' ? JSON.parse(r.metadata) : (r.metadata ?? null),
+      }));
+    }
+
+    // Apply transactionType filter in JS (avoids Prisma JSONB NOT null-propagation bug)
+    if (transactionType === 'real') {
+      allRows = allRows.filter((r: any) => !isTeamTest(r.metadata));
+    } else if (transactionType === 'team') {
+      allRows = allRows.filter((r: any) => isTeamTest(r.metadata));
+    }
+    if (!prismaDev) {
+      total = allRows.length;
+      allRows = allRows.slice(0, limit);
+    } else {
+      total = allRows.length;
+      allRows = allRows.slice(offset, offset + limit);
+    }
+
+    // Batch fetch payouts for these escrows (instead of per-row include subquery)
+    let payoutByEscrowId = new Map<string, any>();
+    if (allRows.length > 0) {
+      const escrowDbIds = allRows.map((r: any) => r.id);
+      const payouts = await prisma.payout.findMany({
+        where: { escrowId: { in: escrowDbIds } },
+        select: { escrowId: true, performerUid: true, netAmount: true, amount: true, status: true },
+        orderBy: { createdAt: 'desc' },
+        // take: 1 per escrow — handled by groupBy in JS
+      });
+      for (const p of payouts) {
+        if (p.escrowId && !payoutByEscrowId.has(p.escrowId)) {
+          payoutByEscrowId.set(p.escrowId, p);
+        }
+      }
+    }
+
+    const data = allRows.map((escrow: any) => {
       const metadata = escrow.metadata && typeof escrow.metadata === 'object' ? (escrow.metadata as Record<string, unknown>) : {};
+      const linkedPayout = payoutByEscrowId.get(escrow.id) ?? null;
+      let payoutNetAmount: string | null = null;
+      if (linkedPayout) {
+        payoutNetAmount = toStringValue(linkedPayout.netAmount);
+      } else if (escrow.taskAmount != null) {
+        try {
+          const taskAmount = new Prisma.Decimal(Number(escrow.taskAmount));
+          const commission = taskAmount.mul(0.05).toDecimalPlaces(2);
+          const gstOnCommission = commission.mul(0.18).toDecimalPlaces(2);
+          const netAmount = taskAmount.sub(commission).sub(gstOnCommission).toDecimalPlaces(2);
+          payoutNetAmount = netAmount.toString();
+        } catch { /* ignore */ }
+      }
+      const resolvedPerformerUid =
+        linkedPayout?.performerUid ||
+        (escrow.performerUid !== 'pending_assignment' ? escrow.performerUid : null);
       return {
         escrowId: escrow.escrowId,
         razorpayOrderId: escrow.razorpayOrderId,
@@ -152,10 +317,11 @@ export class AdminFinanceController {
         taskId: escrow.taskId,
         applicationId: escrow.applicationId,
         CustomerUid: escrow.posterUid,
-        performerUid: escrow.performerUid,
+        performerUid: resolvedPerformerUid || 'pending_assignment',
         status: escrow.status,
         paymentStatus: escrow.paymentStatus,
-        amountInRupees: toStringValue(escrow.amountInRupees),
+        amountInRupees: toStringValue(new Prisma.Decimal(Number(escrow.amountInRupees))),
+        payoutAmount: payoutNetAmount,
         createdAt: escrow.createdAt,
         teamTest: metadata.teamTest === true,
         teamTestTransferred: metadata.teamTestTransferred === true,
@@ -256,7 +422,8 @@ export class AdminFinanceController {
       throw new BadRequestError('teamTest or teamTestTransferred must be provided as boolean');
     }
 
-    const escrow = await prisma.escrow.findFirst({
+    let targetPrisma = prisma;
+    let escrow = await prisma.escrow.findFirst({
       where: {
         OR: [
           { id },
@@ -266,6 +433,21 @@ export class AdminFinanceController {
         ],
       },
     });
+    if (!escrow && prismaDev) {
+      escrow = await prismaDev.escrow.findFirst({
+        where: {
+          OR: [
+            { id },
+            { escrowId: id },
+            { razorpayOrderId: id },
+            { razorpayPaymentId: id },
+          ],
+        },
+      });
+      if (escrow) {
+        targetPrisma = prismaDev;
+      }
+    }
     if (!escrow) throw new NotFoundError('Transaction not found');
 
     const existingMetadata = escrow.metadata && typeof escrow.metadata === 'object' ? (escrow.metadata as Record<string, unknown>) : {};
@@ -277,14 +459,14 @@ export class AdminFinanceController {
       updatedMetadata.teamTestTransferred = teamTestTransferred;
     }
 
-    const updated = await prisma.escrow.update({
+    const updated = await targetPrisma.escrow.update({
       where: { id: escrow.id },
       data: {
         metadata: updatedMetadata as Prisma.InputJsonValue,
       },
     });
 
-    await prisma.auditLog.create({
+    await targetPrisma.auditLog.create({
       data: {
         entityType: 'escrow',
         entityId: updated.id,
@@ -312,20 +494,29 @@ export class AdminFinanceController {
       throw new BadRequestError('teamTest must be a boolean');
     }
 
-    const payout = await prisma.payout.findFirst({
+    let targetPrisma = prisma;
+    let payout = await prisma.payout.findFirst({
       where: { OR: [{ id }, { payoutId: id }] },
     });
+    if (!payout && prismaDev) {
+      payout = await prismaDev.payout.findFirst({
+        where: { OR: [{ id }, { payoutId: id }] },
+      });
+      if (payout) {
+        targetPrisma = prismaDev;
+      }
+    }
     if (!payout) throw new NotFoundError('Payout not found');
 
     const existingMetadata = payout.metadata && typeof payout.metadata === 'object' ? (payout.metadata as Record<string, unknown>) : {};
     const updatedMetadata: Record<string, unknown> = { ...existingMetadata, teamTest };
 
-    const updated = await prisma.payout.update({
+    const updated = await targetPrisma.payout.update({
       where: { id: payout.id },
       data: { metadata: updatedMetadata as Prisma.InputJsonValue },
     });
 
-    await prisma.auditLog.create({
+    await targetPrisma.auditLog.create({
       data: {
         entityType: 'payout',
         entityId: updated.id,
@@ -352,12 +543,20 @@ export class AdminFinanceController {
       throw new BadRequestError('teamTest must be a boolean');
     }
 
-    // Refund model has no metadata field — mirror the transactions (pay-ins) approach:
-    // store teamTest on the linked Escrow's metadata JSON field.
-    const refund = await prisma.refund.findFirst({
+    let targetPrisma = prisma;
+    let refund = await prisma.refund.findFirst({
       where: { OR: [{ id }, { refundId: id }] },
       include: { escrow: true },
     });
+    if (!refund && prismaDev) {
+      refund = await prismaDev.refund.findFirst({
+        where: { OR: [{ id }, { refundId: id }] },
+        include: { escrow: true },
+      });
+      if (refund) {
+        targetPrisma = prismaDev;
+      }
+    }
     if (!refund) throw new NotFoundError('Refund not found');
 
     // Update the linked escrow's metadata (same as how pay-in transactions work)
@@ -367,13 +566,13 @@ export class AdminFinanceController {
           ? (refund.escrow.metadata as Record<string, unknown>)
           : {};
       const updatedMeta: Record<string, unknown> = { ...existingMeta, teamTest };
-      await prisma.escrow.update({
+      await targetPrisma.escrow.update({
         where: { id: refund.escrow.id },
         data: { metadata: updatedMeta as Prisma.InputJsonValue },
       });
     }
 
-    await prisma.auditLog.create({
+    await targetPrisma.auditLog.create({
       data: {
         entityType: 'refund',
         entityId: refund.id,
@@ -405,17 +604,26 @@ export class AdminFinanceController {
       throw new BadRequestError(`Invalid payout status. Allowed values: ${allowedStatuses.join(', ')}`);
     }
 
-    const payout = await prisma.payout.findFirst({
+    let targetPrisma = prisma;
+    let payout = await prisma.payout.findFirst({
       where: { OR: [{ id }, { payoutId: id }] },
     });
+    if (!payout && prismaDev) {
+      payout = await prismaDev.payout.findFirst({
+        where: { OR: [{ id }, { payoutId: id }] },
+      });
+      if (payout) {
+        targetPrisma = prismaDev;
+      }
+    }
     if (!payout) throw new NotFoundError('Payout not found');
 
-    const updated = await prisma.payout.update({
+    const updated = await targetPrisma.payout.update({
       where: { id: payout.id },
       data: { status },
     });
 
-    await prisma.auditLog.create({
+    await targetPrisma.auditLog.create({
       data: {
         entityType: 'payout',
         entityId: updated.id,
@@ -440,19 +648,7 @@ export class AdminFinanceController {
       where.status = status;
     }
 
-    if (transactionType === 'real') {
-      where.NOT = {
-        OR: [
-          { metadata: { path: ['teamTest'], equals: true } },
-          { escrow: { metadata: { path: ['teamTest'], equals: true } } }
-        ]
-      };
-    } else if (transactionType === 'team') {
-      where.OR = [
-        { metadata: { path: ['teamTest'], equals: true } },
-        { escrow: { metadata: { path: ['teamTest'], equals: true } } }
-      ];
-    }
+    // NOTE: transactionType filter applied in JS after merging to avoid Prisma JSONB NOT bug.
     if (startDate || endDate) {
       where.createdAt = {};
       if (startDate) where.createdAt.gte = new Date(startDate as string);
@@ -466,18 +662,53 @@ export class AdminFinanceController {
       ];
     }
 
-    const [payoutTotal, payoutRows] = await Promise.all([
+    let mainPayoutTotal = 0;
+    let payoutRows: any[] = [];
+
+    [mainPayoutTotal, payoutRows] = await Promise.all([
       prisma.payout.count({ where }),
       prisma.payout.findMany({
         where,
         orderBy: { createdAt: 'desc' },
-        take: limit,
-        skip: offset,
+        take: prismaDev ? 2000 : limit,
+        skip: prismaDev ? 0 : offset,
         include: { escrow: true },
       }),
     ]);
 
-    const data = payoutRows.map((row) => ({
+    let payoutTotal = mainPayoutTotal;
+
+    if (prismaDev) {
+      try {
+        const [devPayoutTotal, devPayoutRows] = await Promise.all([
+          prismaDev.payout.count({ where }),
+          prismaDev.payout.findMany({
+            where,
+            orderBy: { createdAt: 'desc' },
+            take: 2000,
+            skip: 0,
+            include: { escrow: true },
+          }),
+        ]);
+        const seen = new Set(payoutRows.map((r: any) => r.payoutId));
+        const uniqueDev = devPayoutRows.filter((r: any) => !seen.has(r.payoutId));
+        payoutRows = [...payoutRows, ...uniqueDev];
+        payoutRows.sort((a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+      } catch (err: any) {
+        logger.warn('Failed to query secondary DB for payouts:', { message: err?.message });
+      }
+    }
+
+    // Apply transactionType filter in JS (avoids Prisma JSONB NOT null-propagation bug)
+    if (transactionType === 'real') {
+      payoutRows = payoutRows.filter((r: any) => !isTeamTest(r.metadata) && !isTeamTest(r.escrow?.metadata));
+    } else if (transactionType === 'team') {
+      payoutRows = payoutRows.filter((r: any) => isTeamTest(r.metadata) || isTeamTest(r.escrow?.metadata));
+    }
+    payoutTotal = payoutRows.length;
+    payoutRows = payoutRows.slice(offset, offset + limit);
+
+    const data = payoutRows.map((row: any) => ({
       payoutId: row.payoutId,
       performerUid: row.performerUid,
       taskId: row.taskId || row.escrow?.taskId || null,
@@ -502,14 +733,24 @@ export class AdminFinanceController {
 
   static async getPayoutById(req: Request, res: Response): Promise<void> {
     const { id } = req.params;
-    const payout = await prisma.payout.findFirst({
+    let targetPrisma = prisma;
+    let payout = await prisma.payout.findFirst({
       where: { OR: [{ id }, { payoutId: id }] },
       include: { escrow: true },
     });
+    if (!payout && prismaDev) {
+      payout = await prismaDev.payout.findFirst({
+        where: { OR: [{ id }, { payoutId: id }] },
+        include: { escrow: true },
+      });
+      if (payout) {
+        targetPrisma = prismaDev;
+      }
+    }
 
     if (!payout) throw new NotFoundError('Payout not found');
 
-    const ledger = await prisma.ledger.findMany({
+    const ledger = await targetPrisma.ledger.findMany({
       where: { payoutId: payout.id },
       orderBy: { createdAt: 'asc' },
     });
@@ -521,12 +762,22 @@ export class AdminFinanceController {
     const { id } = req.params;
     if (!id) throw new BadRequestError('Payout id is required');
 
-    const payout = await prisma.payout.findFirst({
+    let targetPrisma = prisma;
+    let payout = await prisma.payout.findFirst({
       where: { OR: [{ id }, { payoutId: id }] },
     });
+    if (!payout && prismaDev) {
+      payout = await prismaDev.payout.findFirst({
+        where: { OR: [{ id }, { payoutId: id }] },
+      });
+      if (payout) {
+        targetPrisma = prismaDev;
+      }
+    }
     if (!payout) throw new NotFoundError('Payout not found');
 
     const jobId = `payout_retry_${payout.payoutId}`;
+    // Always upsert to primary jobQueue as that is where active workers poll jobs
     await prisma.jobQueue.upsert({
       where: { jobId },
       create: {
@@ -534,7 +785,7 @@ export class AdminFinanceController {
         jobType: 'payout_retry',
         entityType: 'payout',
         entityId: payout.id,
-        payload: { payoutId: payout.payoutId },
+        payload: { payoutId: payout.payoutId, useDevDb: targetPrisma === prismaDev },
         status: 'pending',
         nextRetryAt: new Date(),
         priority: 5,
@@ -555,12 +806,21 @@ export class AdminFinanceController {
     const { reason } = req.body || {};
     if (!id) throw new BadRequestError('Payout id is required');
 
-    const payout = await prisma.payout.findFirst({
+    let targetPrisma = prisma;
+    let payout = await prisma.payout.findFirst({
       where: { OR: [{ id }, { payoutId: id }] },
     });
+    if (!payout && prismaDev) {
+      payout = await prismaDev.payout.findFirst({
+        where: { OR: [{ id }, { payoutId: id }] },
+      });
+      if (payout) {
+        targetPrisma = prismaDev;
+      }
+    }
     if (!payout) throw new NotFoundError('Payout not found');
 
-    const updated = await prisma.payout.update({
+    const updated = await targetPrisma.payout.update({
       where: { id: payout.id },
       data: {
         status: 'held',
@@ -568,7 +828,7 @@ export class AdminFinanceController {
       },
     });
 
-    await prisma.auditLog.create({
+    await targetPrisma.auditLog.create({
       data: {
         entityType: 'payout',
         entityId: updated.id,
@@ -593,11 +853,7 @@ export class AdminFinanceController {
       where.status = status;
     }
 
-    if (transactionType === 'real') {
-      where.NOT = { escrow: { metadata: { path: ['teamTest'], equals: true } } };
-    } else if (transactionType === 'team') {
-      where.escrow = { metadata: { path: ['teamTest'], equals: true } };
-    }
+    // NOTE: transactionType filter applied in JS after merging to avoid Prisma JSONB NOT bug.
     if (startDate || endDate) {
       where.createdAt = {};
       if (startDate) where.createdAt.gte = new Date(startDate as string);
@@ -611,18 +867,53 @@ export class AdminFinanceController {
       ];
     }
 
-    const [refundTotal, refundRows] = await Promise.all([
+    let mainRefundTotal = 0;
+    let refundRows: any[] = [];
+
+    [mainRefundTotal, refundRows] = await Promise.all([
       prisma.refund.count({ where }),
       prisma.refund.findMany({
         where,
         orderBy: { createdAt: 'desc' },
-        take: limit,
-        skip: offset,
+        take: prismaDev ? 2000 : limit,
+        skip: prismaDev ? 0 : offset,
         include: { escrow: true },
       }),
     ]);
 
-    const data = refundRows.map((row) => {
+    let refundTotal = mainRefundTotal;
+
+    if (prismaDev) {
+      try {
+        const [devRefundTotal, devRefundRows] = await Promise.all([
+          prismaDev.refund.count({ where }),
+          prismaDev.refund.findMany({
+            where,
+            orderBy: { createdAt: 'desc' },
+            take: 2000,
+            skip: 0,
+            include: { escrow: true },
+          }),
+        ]);
+        const seen = new Set(refundRows.map((r: any) => r.refundId));
+        const uniqueDev = devRefundRows.filter((r: any) => !seen.has(r.refundId));
+        refundRows = [...refundRows, ...uniqueDev];
+        refundRows.sort((a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+      } catch (err: any) {
+        logger.warn('Failed to query secondary DB for refunds:', { message: err?.message });
+      }
+    }
+
+    // Apply transactionType filter in JS (avoids Prisma JSONB NOT null-propagation bug)
+    if (transactionType === 'real') {
+      refundRows = refundRows.filter((r: any) => !isTeamTest(r.escrow?.metadata));
+    } else if (transactionType === 'team') {
+      refundRows = refundRows.filter((r: any) => isTeamTest(r.escrow?.metadata));
+    }
+    refundTotal = refundRows.length;
+    refundRows = refundRows.slice(offset, offset + limit);
+
+    const data = refundRows.map((row: any) => {
       // Read teamTest from the linked Escrow metadata (mirrors pay-ins/transactions approach)
       const escrowMeta =
         row.escrow?.metadata && typeof row.escrow.metadata === 'object'
@@ -979,18 +1270,27 @@ export class AdminFinanceController {
     const { payoutId, reason } = req.body || {};
     if (!payoutId) throw new BadRequestError('payoutId is required');
 
-    const payout = await prisma.payout.findFirst({
+    let targetPrisma = prisma;
+    let payout = await prisma.payout.findFirst({
       where: { OR: [{ id: payoutId }, { payoutId }] },
     });
+    if (!payout && prismaDev) {
+      payout = await prismaDev.payout.findFirst({
+        where: { OR: [{ id: payoutId }, { payoutId }] },
+      });
+      if (payout) {
+        targetPrisma = prismaDev;
+      }
+    }
 
     if (!payout) throw new NotFoundError('Payout not found');
 
-    const updated = await prisma.payout.update({
+    const updated = await targetPrisma.payout.update({
       where: { id: payout.id },
       data: { status: 'held', errorMessage: reason || payout.errorMessage },
     });
 
-    await prisma.auditLog.create({
+    await targetPrisma.auditLog.create({
       data: {
         entityType: 'payout',
         entityId: updated.id,
@@ -1090,16 +1390,25 @@ export class AdminFinanceController {
     const { id } = req.params;
     if (!id) throw new BadRequestError('Transaction ID is required');
 
-    const escrow = await prisma.escrow.findFirst({
+    let targetPrisma = prisma;
+    let escrow = await prisma.escrow.findFirst({
       where: { OR: [{ id }, { escrowId: id }] },
     });
+    if (!escrow && prismaDev) {
+      escrow = await prismaDev.escrow.findFirst({
+        where: { OR: [{ id }, { escrowId: id }] },
+      });
+      if (escrow) {
+        targetPrisma = prismaDev;
+      }
+    }
     if (!escrow) throw new NotFoundError('Transaction not found');
 
-    await prisma.escrow.delete({
+    await targetPrisma.escrow.delete({
       where: { id: escrow.id },
     });
 
-    await prisma.auditLog.create({
+    await targetPrisma.auditLog.create({
       data: {
         entityType: 'escrow',
         entityId: escrow.id,
@@ -1116,16 +1425,25 @@ export class AdminFinanceController {
     const { id } = req.params;
     if (!id) throw new BadRequestError('Payout ID is required');
 
-    const payout = await prisma.payout.findFirst({
+    let targetPrisma = prisma;
+    let payout = await prisma.payout.findFirst({
       where: { OR: [{ id }, { payoutId: id }] },
     });
+    if (!payout && prismaDev) {
+      payout = await prismaDev.payout.findFirst({
+        where: { OR: [{ id }, { payoutId: id }] },
+      });
+      if (payout) {
+        targetPrisma = prismaDev;
+      }
+    }
     if (!payout) throw new NotFoundError('Payout not found');
 
-    await prisma.payout.delete({
+    await targetPrisma.payout.delete({
       where: { id: payout.id },
     });
 
-    await prisma.auditLog.create({
+    await targetPrisma.auditLog.create({
       data: {
         entityType: 'payout',
         entityId: payout.id,
@@ -1142,16 +1460,25 @@ export class AdminFinanceController {
     const { id } = req.params;
     if (!id) throw new BadRequestError('Refund ID is required');
 
-    const refund = await prisma.refund.findFirst({
+    let targetPrisma = prisma;
+    let refund = await prisma.refund.findFirst({
       where: { OR: [{ id }, { refundId: id }] },
     });
+    if (!refund && prismaDev) {
+      refund = await prismaDev.refund.findFirst({
+        where: { OR: [{ id }, { refundId: id }] },
+      });
+      if (refund) {
+        targetPrisma = prismaDev;
+      }
+    }
     if (!refund) throw new NotFoundError('Refund not found');
 
-    await prisma.refund.delete({
+    await targetPrisma.refund.delete({
       where: { id: refund.id },
     });
 
-    await prisma.auditLog.create({
+    await targetPrisma.auditLog.create({
       data: {
         entityType: 'refund',
         entityId: refund.id,

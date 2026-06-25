@@ -9,6 +9,7 @@ import {
   getEscrowByTaskId,
   getEscrowByTaskIdAndVisitId,
   releaseEscrow,
+  updateEscrowAutoRelease,
 } from '../services/escrowService';
 import { BadRequestError, NotFoundError } from '../errors/AppError';
 

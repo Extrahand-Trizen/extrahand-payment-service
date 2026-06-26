@@ -10,6 +10,7 @@ import logger from '../config/logger';
 import { RAZORPAY_CONFIG } from '../config/razorpay';
 import { updateEscrowOnPaymentCapture } from '../services/escrowService';
 import { handlePaymentFailure } from '../services/paymentFailureService';
+import { completeRefundFromRazorpayWebhook } from '../services/refundService';
 import {
   getWebhookByEventId,
   logWebhookReceived,
@@ -128,8 +129,11 @@ router.post('/razorpay', express.raw({ type: 'application/json' }), async (req, 
         break;
 
       case 'payment.refunded':
-        // Payment was refunded (will be handled in Phase 3)
-        logger.info('💰 Refund webhook received (will be handled in refund service)');
+        await handlePaymentRefunded(event.payload);
+        break;
+
+      case 'refund.processed':
+        await handlePaymentRefunded(event.payload);
         break;
 
       default:
@@ -273,6 +277,29 @@ async function handleOrderPaid(payload: any): Promise<void> {
     // This is just for logging/confirmation
   } catch (error: any) {
     logger.error('❌ Error handling order.paid:', error);
+  }
+}
+
+/**
+ * Handle payment.refunded / refund.processed — sync ExtraHand refund row with Razorpay.
+ */
+async function handlePaymentRefunded(payload: {
+  refund?: { entity?: { id?: string; status?: string } };
+  payment?: { entity?: { id?: string } };
+}): Promise<void> {
+  try {
+    const refund = payload?.refund?.entity;
+    const payment = payload?.payment?.entity;
+
+    logger.info('💰 Refund webhook processing', {
+      razorpayRefundId: refund?.id,
+      razorpayPaymentId: payment?.id,
+      razorpayRefundStatus: refund?.status,
+    });
+
+    await completeRefundFromRazorpayWebhook(payload);
+  } catch (error: any) {
+    logger.error('❌ Error handling refund webhook:', error);
   }
 }
 

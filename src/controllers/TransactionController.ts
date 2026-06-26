@@ -6,6 +6,7 @@ import type { GrantSpec } from '../rewards/types/GrantSpec';
 import { BadRequestError } from '../errors/AppError';
 import { logPaymentReferralCoins } from '../rewards/referralCoinsLogger';
 import { parseWalletRole } from '../rewards/utils/walletRole';
+import { parseQueryEndDateInclusive, parseQueryStartDate } from '../utils/queryDateRange';
 
 export class TransactionController {
   /**
@@ -31,8 +32,8 @@ export class TransactionController {
     const options = {
       limit: limit ? parseInt(limit as string, 10) : undefined,
       offset: offset ? parseInt(offset as string, 10) : undefined,
-      startDate: startDate ? new Date(startDate as string) : undefined,
-      endDate: endDate ? new Date(endDate as string) : undefined,
+      startDate: startDate ? parseQueryStartDate(startDate as string) : undefined,
+      endDate: endDate ? parseQueryEndDateInclusive(endDate as string) : undefined,
       type: type as 'payment' | 'payout' | 'refund' | 'compensation' | 'fee' | 'escrow' | undefined,
       status: status as string | undefined,
       category: category as 'earnings' | 'payments' | 'all' | undefined,
@@ -66,8 +67,8 @@ export class TransactionController {
       throw new BadRequestError('User ID is required');
     }
 
-    const start = startDate ? new Date(startDate as string) : undefined;
-    const end = endDate ? new Date(endDate as string) : undefined;
+    const start = startDate ? parseQueryStartDate(startDate as string) : undefined;
+    const end = endDate ? parseQueryEndDateInclusive(endDate as string) : undefined;
     const linkedParsed =
       typeof linkedUserIds === 'string' && linkedUserIds.trim()
         ? linkedUserIds

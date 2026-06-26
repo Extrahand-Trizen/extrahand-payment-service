@@ -6,7 +6,7 @@ import { REVIEW_ORDER_ID_PREFIX } from '../utils/reviewBypass';
 // PaymentTransaction model removed - using Postgres Ledger instead
 import { createOrder, getOrderDetails } from './paymentService';
 import { sanitizeRazorpayOrderData, sanitizeRazorpayData, sanitizeRazorpayPaymentData } from '../utils/paymentSanitizer';
-import { prisma } from '../config/prisma';
+import { prisma, prismaDev } from '../config/prisma';
 import { getFeeStructureForCategory } from './feeConfigService';
 import { createLedgerEntry, getEscrowBalance } from './ledgerService';
 import { Prisma } from '@prisma/client';
@@ -574,11 +574,23 @@ export async function attachPerformerToEscrow(params: {
   }
 
   try {
-    const existing = await prisma.escrow.findFirst({
+    let targetPrisma = prisma;
+    let existing = await prisma.escrow.findFirst({
       where: {
         OR: [{ escrowId }, { id: escrowId }],
       },
     });
+
+    if (!existing && prismaDev) {
+      existing = await prismaDev.escrow.findFirst({
+        where: {
+          OR: [{ escrowId }, { id: escrowId }],
+        },
+      });
+      if (existing) {
+        targetPrisma = prismaDev;
+      }
+    }
 
     if (!existing) {
       return { success: false, error: 'Escrow not found' };
@@ -603,7 +615,7 @@ export async function attachPerformerToEscrow(params: {
         ? { ...(existing.metadata as Record<string, unknown>) }
         : {};
 
-    const updated = await prisma.escrow.update({
+    const updated = await targetPrisma.escrow.update({
       where: { id: existing.id },
       data: {
         performerUid,
@@ -630,6 +642,41 @@ export async function attachPerformerToEscrow(params: {
       error: error?.message,
     });
     return { success: false, error: error.message || 'Failed to attach performer' };
+  }
+}
+
+export async function resetPerformerOnEscrow(escrowId: string): Promise<{ success: boolean; error?: string }> {
+  if (!escrowId?.trim()) {
+    return { success: false, error: 'escrowId is required' };
+  }
+
+  try {
+    let targetPrisma = prisma;
+    let existing = await prisma.escrow.findFirst({
+      where: { OR: [{ escrowId }, { id: escrowId }] },
+    });
+
+    if (!existing && prismaDev) {
+      existing = await prismaDev.escrow.findFirst({
+        where: { OR: [{ escrowId }, { id: escrowId }] },
+      });
+      if (existing) targetPrisma = prismaDev;
+    }
+
+    if (!existing) {
+      return { success: false, error: 'Escrow not found' };
+    }
+
+    await targetPrisma.escrow.update({
+      where: { id: existing.id },
+      data: { performerUid: 'pending_assignment' },
+    });
+
+    logger.info('Performer reset on escrow', { escrowId });
+    return { success: true };
+  } catch (error: any) {
+    logger.error('Failed to reset performer on escrow', { escrowId, error: error?.message });
+    return { success: false, error: error.message || 'Failed to reset performer' };
   }
 }
 

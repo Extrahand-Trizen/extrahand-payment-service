@@ -18,6 +18,8 @@ router.post('/create-booking', asyncHandler(EscrowController.createBookingEscrow
 
 router.patch('/:escrowId/attach-performer', asyncHandler(EscrowController.attachPerformer));
 
+router.patch('/:escrowId/reset-performer', asyncHandler(EscrowController.resetPerformer));
+
 router.patch(
   '/:escrowId/reassign-recurring-visit',
   asyncHandler(EscrowController.reassignRecurringVisit),

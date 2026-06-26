@@ -17,7 +17,7 @@ import { updateUserPaymentProfile } from './userPaymentProfileService';
 import { createRazorpayXPayout, getRazorpayXPayoutStatus } from './razorpayxService';
 import { applyPenaltyLinesInTx, planPenaltyDeductionsFromGross } from './performerPenaltyService';
 import { notifyPayoutInitiated } from './paymentNotificationService';
-import { getFeeStructure } from './feeConfigService';
+import { getFeeStructureForCategory, resolveBiddingPayoutFeePercents, resolveEscrowCategoryFeeConfigKey } from './feeConfigService';
 import { applyExtraCoinsForPayout, awardExtraCoinsForCompletedTask } from './extraCoinsService';
 import { paymentRewardsFlags } from '../config/rewardsFlags';
 import { CoinUsageConfigProvider } from '../rewards/config/CoinUsageConfigProvider';
@@ -1064,7 +1064,42 @@ export async function processTaskCompletionPayout(params: {
       });
     }
 
-    const feeStructure = await getFeeStructure();
+    const escrowMeta =
+      taskEscrow?.metadata &&
+      typeof taskEscrow.metadata === 'object' &&
+      !Array.isArray(taskEscrow.metadata)
+        ? (taskEscrow.metadata as Record<string, unknown>)
+        : {};
+
+    const escrowTaskCategory = resolveEscrowCategoryFeeConfigKey({
+      taskCategory: taskEscrow?.taskCategory,
+      categorySlug:
+        typeof escrowMeta.categorySlug === 'string' ? escrowMeta.categorySlug : undefined,
+      catalogId: typeof escrowMeta.catalogId === 'string' ? escrowMeta.catalogId : undefined,
+      metadata: escrowMeta,
+    });
+
+    const resolvedFees = await resolveBiddingPayoutFeePercents({
+      taskCategory: taskEscrow?.taskCategory,
+      categorySlug:
+        typeof escrowMeta.categorySlug === 'string' ? escrowMeta.categorySlug : undefined,
+      catalogId: typeof escrowMeta.catalogId === 'string' ? escrowMeta.catalogId : undefined,
+      metadata: escrowMeta,
+    });
+    const feeStructure = {
+      platformFee: {
+        percentage: resolvedFees.platformFeePercentage,
+        gstPercentage: resolvedFees.gstPercentage,
+      },
+    };
+
+    logger.debug('[payoutService] Resolved bidding payout fee structure', {
+      taskId,
+      escrowId: taskEscrow?.escrowId,
+      categoryFeeKey: escrowTaskCategory ?? 'default',
+      platformFeePercentage: feeStructure.platformFee.percentage,
+      gstPercentage: feeStructure.platformFee.gstPercentage,
+    });
     const platformCommission = grossAmount
       .mul(feeStructure.platformFee.percentage)
       .toDecimalPlaces(2);
@@ -1201,13 +1236,6 @@ export async function processTaskCompletionPayout(params: {
 
     // RazorpayX narration max length is 30 chars.
     const payoutNarration = `Task ${taskId.slice(-8)} payout`;
-
-    const escrowMeta =
-      taskEscrow?.metadata &&
-      typeof taskEscrow.metadata === 'object' &&
-      !Array.isArray(taskEscrow.metadata)
-        ? (taskEscrow.metadata as Record<string, unknown>)
-        : {};
 
     const metadataPayload = enrichRecurringPayoutMetadata(
       {

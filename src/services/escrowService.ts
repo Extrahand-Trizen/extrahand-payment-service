@@ -7,9 +7,14 @@ import { REVIEW_ORDER_ID_PREFIX } from '../utils/reviewBypass';
 import { createOrder, getOrderDetails } from './paymentService';
 import { sanitizeRazorpayOrderData, sanitizeRazorpayData, sanitizeRazorpayPaymentData } from '../utils/paymentSanitizer';
 import { prisma, prismaDev } from '../config/prisma';
-import { getFeeStructureForCategory } from './feeConfigService';
+import { CategoryFeeMode, Prisma } from '@prisma/client';
+import {
+  getFeeStructureForCategory,
+  pickCategoryFeeConfigKey,
+  resolveBiddingPayoutFeePercents,
+  resolveEscrowCategoryFeeConfigKey,
+} from './feeConfigService';
 import { createLedgerEntry, getEscrowBalance } from './ledgerService';
-import { Prisma } from '@prisma/client';
 import { EmailServiceClient } from '../clients/EmailServiceClient';
 import { InAppNotificationClient } from '../clients/InAppNotificationClient';
 import { fireWhatsAppNotify } from '../clients/WhatsAppClient';
@@ -223,6 +228,28 @@ async function convertPostgresEscrowToFrontendFormat(postgresEscrow: any): Promi
       ? escrowMeta.taskTitle.trim()
       : undefined;
 
+  let appliedPlatformFeePercent = postgresEscrow.appliedPlatformFeePercent?.toString() ?? null;
+  let appliedGstPercent = postgresEscrow.appliedGstPercent?.toString() ?? null;
+
+  if (!isBookNowEscrowRecord(postgresEscrow)) {
+    try {
+      const resolved = await resolveBiddingPayoutFeePercents({
+        taskCategory: postgresEscrow.taskCategory,
+        categorySlug:
+          typeof escrowMeta.categorySlug === 'string' ? escrowMeta.categorySlug : undefined,
+        catalogId: typeof escrowMeta.catalogId === 'string' ? escrowMeta.catalogId : undefined,
+        metadata: escrowMeta,
+      });
+      appliedPlatformFeePercent = String(resolved.platformFeePercentage);
+      appliedGstPercent = String(resolved.gstPercentage);
+    } catch (error: any) {
+      logger.warn('Could not resolve live bidding payout fee percents for escrow', {
+        escrowId: postgresEscrow.escrowId,
+        error: error?.message,
+      });
+    }
+  }
+
   return {
     _id: postgresEscrow.id, // For backward compatibility
     id: postgresEscrow.id,
@@ -236,8 +263,8 @@ async function convertPostgresEscrowToFrontendFormat(postgresEscrow: any): Promi
     amount: postgresEscrow.amount.toString(),
     amountInRupees: postgresEscrow.amountInRupees.toString(),
     taskAmount: payoutTaskAmount.toString(),
-    appliedPlatformFeePercent: postgresEscrow.appliedPlatformFeePercent?.toString() ?? null,
-    appliedGstPercent: postgresEscrow.appliedGstPercent?.toString() ?? null,
+    appliedPlatformFeePercent,
+    appliedGstPercent,
     taskTitle,
     currency: postgresEscrow.currency,
     status: postgresEscrow.status,
@@ -415,8 +442,19 @@ export async function createEscrow(params: {
       : null;
 
     try {
+      const isBookNowEscrow = metadata?.bookingMode === 'book_now';
+      const categoryFeeKey = resolveEscrowCategoryFeeConfigKey({
+        taskCategory,
+        categorySlug:
+          typeof metadata.categorySlug === 'string' ? metadata.categorySlug : undefined,
+        catalogId: typeof metadata.catalogId === 'string' ? metadata.catalogId : undefined,
+        metadata,
+      });
+
       // Resolve fee structure for this category and snapshot applied percentages
-      const feeForCategory = await getFeeStructureForCategory(taskCategory);
+      const feeForCategory = await getFeeStructureForCategory(categoryFeeKey, {
+        mode: isBookNowEscrow ? CategoryFeeMode.BOOK_NOW : CategoryFeeMode.BIDDING,
+      });
 
       const appliedGstPercent = feeForCategory.platformFee.gstPercentage !== undefined
         ? new Prisma.Decimal(feeForCategory.platformFee.gstPercentage.toString())
@@ -453,7 +491,7 @@ export async function createEscrow(params: {
           autoReleaseDate: autoReleaseDate,
           razorpayOrderData: sanitizedOrderData as any, // Store sanitized data in JSONB
           metadata: escrowMetadata as any, // JSONB: snapshot + client fields
-          taskCategory: taskCategory ?? null,
+          taskCategory: pickCategoryFeeConfigKey(categoryFeeKey, taskCategory) ?? null,
           appliedGstPercent: appliedGstPercent ?? null,
           appliedPlatformFeePercent: appliedPlatformFeePercent ?? null,
           appliedRazorpayGstPercent: appliedRazorpayGstPercent ?? null,

@@ -1,7 +1,9 @@
-import { CategoryFeeMode, Prisma } from '@prisma/client';
+import { CategoryFeeMode ,Prisma} from '@prisma/client';
 import logger from '../config/logger';
 import { prisma } from '../config/prisma';
 import { getCategoryLookupKeys } from './feeConfigService';
+
+const BOOK_NOW_MODE = CategoryFeeMode.BOOK_NOW;
 
 export type BookNowGstLineInput = {
   categorySlug: string;
@@ -78,7 +80,7 @@ async function queryGstPercentageForCategory(categoryKey: string): Promise<numbe
       prisma.categoryFeeConfig.findFirst({
         where: {
           categoryKey: key,
-          mode: CategoryFeeMode.BOOK_NOW,
+          mode: BOOK_NOW_MODE,
           ...effectiveDateFilter(now),
         },
         orderBy: { effectiveFrom: 'desc' },

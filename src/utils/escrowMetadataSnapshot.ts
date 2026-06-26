@@ -53,10 +53,11 @@ export function buildEscrowMetadataSnapshot(
     normalizeTaskTitleSnapshot(metadata.taskTitle);
 
   const categoryFromOpts = normalizeCategorySnapshot(opts.taskCategory);
+  const categorySlugFromMeta = normalizeCategorySnapshot(metadata.categorySlug);
   const categoryFromMeta =
     normalizeCategorySnapshot(metadata.taskCategorySnapshot) ??
     normalizeCategorySnapshot(metadata.taskCategory);
-  const category = categoryFromOpts ?? categoryFromMeta;
+  const category = categorySlugFromMeta ?? categoryFromOpts ?? categoryFromMeta;
 
   const description = normalizeDescriptionSnapshot(metadata.taskDescription);
 
@@ -84,6 +85,7 @@ export function buildEscrowMetadataSnapshot(
       ? {
           taskCategory: category,
           taskCategorySnapshot: category,
+          categorySlug: categorySlugFromMeta ?? category,
         }
       : {}),
     ...(description ? { taskDescription: description } : {}),

@@ -1,6 +1,13 @@
 import logger from '../config/logger';
-import { isPostgresConnected } from '../config/database';
-import { calculateRefundWithCancellationFee, CancellationFeeResult } from './feeCalculationService';
+import { ensurePostgresReady, isPostgresConnected } from '../config/database';
+import {
+  calculateRefundWithCancellationFee,
+  CancellationFeeResult,
+} from './feeCalculationService';
+import {
+  calculateBookNowCancellationFee,
+  describeBookNowCancellationPolicy,
+} from './bookNowCancellationPolicy';
 import { prisma } from '../config/prisma';
 import { Prisma } from '@prisma/client';
 import mongoose from 'mongoose';
@@ -44,6 +51,9 @@ export async function processRefund(params: {
   amount?: number;
   assignedAt?: Date;
   feeBaseAmount?: number;
+  /** Book Now catalog id (e.g. ac-services) — enables flat cancellation fees */
+  catalogId?: string | null;
+  partnerReachedLocation?: boolean;
 }): Promise<{
   success: boolean;
   refund?: any;
@@ -61,6 +71,8 @@ export async function processRefund(params: {
       amount,
       assignedAt,
       feeBaseAmount,
+      catalogId,
+      partnerReachedLocation,
     } = params;
 
     logger.info('💰 Processing refund', {
@@ -171,8 +183,7 @@ export async function processRefund(params: {
       toOtherParty = new Prisma.Decimal('0.00');
       toPlatform = new Prisma.Decimal('0.00');
     } else if (cancelledBy === 'performer') {
-      // Tasker cancel: poster gets full captured amount back (includes platform fee + GST)
-      // Policy penalty is recovered from performer's future payouts.
+      // Tasker cancel: full captured refund to poster; policy penalty from performer payouts.
       const performerRefundAmount = new Prisma.Decimal((maxRefundablePaise / 100).toFixed(2));
       
       refundAmount = performerRefundAmount;
@@ -186,18 +197,38 @@ export async function processRefund(params: {
         includesPlatformFeeAndGst: true,
       });
     } else {
-      // Poster cancel: time-based cancellation fee may reduce refund
-      // Use taskAmount as feeBaseAmount if available (for refund calculation on task amount only, not fees/GST)
-      const refundFeeBase = refundTaskBase;
-      
-      cancellationFeeResult = await calculateRefundWithCancellationFee({
-        amount: refundFeeBase,  // Calculate fees on task amount, not full capture
-        taskStartDate,
-        cancelledAt,
-        cancelledBy,
-        assignedAt,
-        feeBaseAmount: refundFeeBase,
-      });
+      const { isBookNowEscrowRecord } = await import('./escrowService');
+      const escrowMeta = (postgresEscrow.metadata as Record<string, unknown> | null) || {};
+      const isBookNow = isBookNowEscrowRecord(postgresEscrow);
+      const refundableCapturedRupees = new Prisma.Decimal(
+        (maxRefundablePaise / 100).toFixed(2),
+      );
+
+      if (isBookNow) {
+        const resolvedCatalogId = resolveBookNowCatalogId(
+          escrowMeta,
+          postgresEscrow.taskId,
+          catalogId,
+        );
+        const bookNowFee = await calculateBookNowCancellationFee({
+          catalogId: resolvedCatalogId,
+          amount: refundableCapturedRupees,
+          taskStartDate,
+          cancelledAt,
+          partnerReachedLocation,
+        });
+        cancellationFeeResult = bookNowFee;
+      } else {
+        const refundFeeBase = refundTaskBase;
+        cancellationFeeResult = await calculateRefundWithCancellationFee({
+          amount: refundFeeBase,
+          taskStartDate,
+          cancelledAt,
+          cancelledBy,
+          assignedAt,
+          feeBaseAmount: refundFeeBase,
+        });
+      }
 
       refundAmount = cancellationFeeResult.refundAmount;
       cancellationFee = cancellationFeeResult.cancellationFee;
@@ -285,6 +316,7 @@ export async function processRefund(params: {
             data: {
               refundId,
               escrowId: postgresEscrow.id,
+              taskId: postgresEscrow.taskId,
               paymentId: razorpayPaymentId,
               razorpayRefundId: razorpayRefund.id,
               cancellationFee: cancellationFee.greaterThan(0) ? cancellationFee : null,
@@ -296,6 +328,8 @@ export async function processRefund(params: {
               status: 'processing',
             },
           });
+
+          const ledgerRefundId = postgresRefund.id;
 
           // Update escrow status to 'refunded'
           await tx.escrow.update({
@@ -310,6 +344,7 @@ export async function processRefund(params: {
           const ledgerEntries: Array<{
             transactionId: string;
             escrowId: string;
+            refundId: string;
             type: string;
             amount: Prisma.Decimal;
             balanceBefore: Prisma.Decimal;
@@ -327,6 +362,7 @@ export async function processRefund(params: {
           ledgerEntries.push({
             transactionId: generateTxId(),
             escrowId: postgresEscrow.id,
+            refundId: ledgerRefundId,
             type: 'refund',
             amount: refundAmount.neg(),
             balanceBefore: currentBalance,
@@ -354,6 +390,7 @@ export async function processRefund(params: {
             ledgerEntries.push({
               transactionId: generateTxId(),
               escrowId: postgresEscrow.id,
+              refundId: ledgerRefundId,
               type: 'cancellation_fee',
               amount: cancellationFee.neg(),
               balanceBefore: balanceBeforeFee,
@@ -374,6 +411,7 @@ export async function processRefund(params: {
               ledgerEntries.push({
                 transactionId: generateTxId(),
                 escrowId: postgresEscrow.id,
+                refundId: ledgerRefundId,
                 type: 'compensation',
                 amount: toOtherParty.neg(),
                 balanceBefore: balanceBeforeComp,
@@ -394,6 +432,7 @@ export async function processRefund(params: {
               ledgerEntries.push({
                 transactionId: generateTxId(),
                 escrowId: postgresEscrow.id,
+                refundId: ledgerRefundId,
                 type: 'platform_fee',
                 amount: toPlatform.neg(),
                 balanceBefore: balanceBeforePlatform,
@@ -443,7 +482,7 @@ export async function processRefund(params: {
         });
 
         // Performer gets compensation (if applicable)
-        if (toOtherParty.greaterThan(0)) {
+        if (toOtherParty.greaterThan(0) && postgresEscrow.performerUid) {
           updateUserPaymentProfile(postgresEscrow.performerUid, {
             type: 'compensation',
             amount: toOtherParty,
@@ -646,6 +685,407 @@ export async function getRefundsByEscrowId(escrowId: string): Promise<{
   } catch (error: any) {
     logger.error('❌ Error getting refunds by escrow ID:', error);
     return { success: false, error: error.message || 'Failed to get refunds' };
+  }
+}
+
+/**
+ * Map a line's catalog price to the INR actually charged on Razorpay for that line.
+ * Needed when checkout used Extra Coins, prior partial refunds, or line totals != capture.
+ */
+function resolveBookNowCatalogId(
+  meta: Record<string, unknown>,
+  taskId?: string | null,
+  catalogId?: string | null,
+): string | undefined {
+  const explicit = String(catalogId || meta.bookNowCatalogId || '').trim();
+  if (explicit) return explicit;
+
+  const lineItems = Array.isArray(meta.bookNowLineItems)
+    ? (meta.bookNowLineItems as Array<{
+        taskId?: string;
+        catalogId?: string;
+        categorySlug?: string;
+      }>)
+    : [];
+
+  if (taskId) {
+    const row = lineItems.find((item) => item.taskId === taskId);
+    const fromRow = String(row?.catalogId || row?.categorySlug || '').trim();
+    if (fromRow) return fromRow;
+  }
+
+  if (lineItems.length === 1) {
+    const only = lineItems[0];
+    const fromOnly = String(only.catalogId || only.categorySlug || '').trim();
+    if (fromOnly) return fromOnly;
+  }
+
+  return undefined;
+}
+
+function resolveBookNowLineFeeBase(params: {
+  lineAmountRupees: number;
+  capturedPaise: number;
+  maxRefundablePaise: number;
+  taskId: string;
+  isLastActiveItem: boolean;
+  meta: Record<string, unknown>;
+  escrowTaskAmountRupees?: Prisma.Decimal | null;
+}): number {
+  const {
+    lineAmountRupees,
+    capturedPaise,
+    maxRefundablePaise,
+    taskId,
+    isLastActiveItem,
+    meta,
+    escrowTaskAmountRupees,
+  } = params;
+
+  const capturedRupees = capturedPaise / 100;
+  const maxRefundableRupees = maxRefundablePaise / 100;
+
+  const lineItems = Array.isArray(meta.bookNowLineItems)
+    ? (meta.bookNowLineItems as Array<{ taskId?: string; lineAmountRupees?: number }>)
+    : [];
+
+  const totalCatalogLineRupees =
+    lineItems.length > 0
+      ? lineItems.reduce((sum, row) => sum + Number(row.lineAmountRupees || 0), 0)
+      : Number(escrowTaskAmountRupees?.toString() || lineAmountRupees);
+
+  let feeBase = lineAmountRupees;
+  if (totalCatalogLineRupees > 0 && Math.abs(totalCatalogLineRupees - capturedRupees) > 0.01) {
+    feeBase = (lineAmountRupees / totalCatalogLineRupees) * capturedRupees;
+  }
+
+  if (isLastActiveItem) {
+    feeBase = Math.min(feeBase, maxRefundableRupees);
+  }
+
+  const rounded = Math.round(feeBase * 100) / 100;
+  logger.info('Book Now line refund fee base resolved', {
+    taskId,
+    lineAmountRupees,
+    capturedRupees,
+    totalCatalogLineRupees,
+    feeBase: rounded,
+    isLastActiveItem,
+    maxRefundableRupees,
+  });
+  return rounded;
+}
+
+/** Refund one Book Now line item from a multi-service checkout (partial refund, escrow stays held). */
+export async function processBookNowLineItemRefund(params: {
+  bookingOrderId: string;
+  taskId: string;
+  lineAmountRupees: number;
+  taskStartDate: Date;
+  assignedAt?: Date | null;
+  reason?: string;
+  userId?: string;
+  taskTitle?: string;
+  isLastActiveItem: boolean;
+  catalogId?: string | null;
+  partnerReachedLocation?: boolean;
+}): Promise<{ success: boolean; refund?: any; error?: string }> {
+  const {
+    bookingOrderId,
+    taskId,
+    lineAmountRupees,
+    taskStartDate,
+    assignedAt,
+    reason,
+    userId,
+    taskTitle,
+    isLastActiveItem,
+    catalogId,
+    partnerReachedLocation,
+  } = params;
+
+  try {
+    if (!(await ensurePostgresReady())) {
+      return { success: false, error: 'Postgres not connected' };
+    }
+
+    const { findEscrowByBookingOrderId, isBookNowEscrowRecord } = await import('./escrowService');
+    const postgresEscrow = await findEscrowByBookingOrderId(bookingOrderId);
+    if (!postgresEscrow) {
+      return { success: false, error: 'Escrow not found for booking' };
+    }
+    if (!isBookNowEscrowRecord(postgresEscrow)) {
+      return { success: false, error: 'Not a Book Now escrow' };
+    }
+    const razorpayPaymentId = postgresEscrow.razorpayPaymentId;
+    if (!razorpayPaymentId) {
+      return { success: false, error: 'Payment not captured — nothing to refund' };
+    }
+
+    const meta = (postgresEscrow.metadata as Record<string, unknown> | null) || {};
+    const cancelledIds = Array.isArray(meta.cancelledLineTaskIds)
+      ? (meta.cancelledLineTaskIds as string[])
+      : [];
+    if (cancelledIds.includes(taskId)) {
+      return { success: false, error: 'This service was already refunded' };
+    }
+
+    const paymentFetch = await getPaymentDetails(razorpayPaymentId);
+    if (!paymentFetch.success || !paymentFetch.payment) {
+      return { success: false, error: 'Could not load payment for refund' };
+    }
+
+    const capturedPaise = Number(paymentFetch.payment.amount);
+    const alreadyRefundedPaise = Number(paymentFetch.payment.amount_refunded ?? 0);
+    const maxRefundablePaise = capturedPaise - alreadyRefundedPaise;
+    if (!Number.isFinite(maxRefundablePaise) || maxRefundablePaise <= 0) {
+      return { success: false, error: 'No capturable balance left to refund' };
+    }
+
+    const cancelledAt = new Date();
+    const feeBaseRupees = resolveBookNowLineFeeBase({
+      lineAmountRupees,
+      capturedPaise,
+      maxRefundablePaise,
+      taskId,
+      isLastActiveItem,
+      meta,
+      escrowTaskAmountRupees: postgresEscrow.taskAmount,
+    });
+
+    const resolvedCatalogId = resolveBookNowCatalogId(meta, taskId, catalogId);
+    const feeResult = await calculateBookNowCancellationFee({
+      catalogId: resolvedCatalogId,
+      amount: feeBaseRupees,
+      taskStartDate,
+      cancelledAt,
+      partnerReachedLocation,
+    });
+
+    let refundPaise = Math.round(parseFloat(feeResult.refundAmount.toString()) * 100);
+    if (refundPaise <= 0) {
+      return {
+        success: false,
+        error: 'Calculated refund after cancellation fees is zero; nothing to return via Razorpay',
+      };
+    }
+    if (refundPaise > maxRefundablePaise) {
+      logger.warn('Book Now line refund capped to remaining Razorpay balance', {
+        bookingOrderId,
+        taskId,
+        requestedRefundPaise: refundPaise,
+        maxRefundablePaise,
+        lineAmountRupees,
+        feeBaseRupees,
+        isLastActiveItem,
+      });
+      refundPaise = maxRefundablePaise;
+    }
+
+    const refundAmount = new Prisma.Decimal((refundPaise / 100).toFixed(2));
+    const cancellationFee = feeResult.cancellationFee;
+    const toOtherParty = feeResult.toOtherParty;
+    const toPlatform = feeResult.toPlatform;
+    const razorpayRefundResult = await createRefundAmountPaise(
+      razorpayPaymentId,
+      refundPaise,
+    );
+    if (!razorpayRefundResult.success || !razorpayRefundResult.refund) {
+      return {
+        success: false,
+        error: razorpayRefundResult.error || 'Failed to create Razorpay refund',
+      };
+    }
+
+    const razorpayRefund = razorpayRefundResult.refund;
+    const refundId = generateRefundId();
+    const nextCancelledIds = [...cancelledIds, taskId];
+    const prevLineDetails = Array.isArray(meta.cancelledLineDetails)
+      ? (meta.cancelledLineDetails as Array<Record<string, unknown>>)
+      : [];
+    const cancellationPolicy = describeBookNowCancellationPolicy({
+      catalogId: resolvedCatalogId,
+      tier: feeResult.tier,
+      cancellationFee: feeResult.cancellationFee,
+    });
+    const resolvedLineTitle = taskTitle?.trim() || undefined;
+    const lineDetail = {
+      taskId,
+      taskTitle: resolvedLineTitle,
+      lineAmountRupees,
+      refundAmount: refundAmount.toString(),
+      cancellationFee: cancellationFee.toString(),
+      cancellationFeePercentage: feeResult.cancellationFeePercentage,
+      cancellationPolicyLabel: cancellationPolicy.label,
+      cancellationPolicyKey: cancellationPolicy.policyKey,
+      cancelledAt: cancelledAt.toISOString(),
+    };
+
+    await prisma.$transaction(async (tx) => {
+      const latestEntry = await tx.ledger.findFirst({
+        where: { escrowId: postgresEscrow.id },
+        orderBy: { createdAt: 'desc' },
+      });
+      const currentBalance = latestEntry?.balanceAfter || new Prisma.Decimal('0.00');
+      const balanceAfter = Prisma.Decimal.max(
+        currentBalance.sub(refundAmount),
+        new Prisma.Decimal('0.00'),
+      );
+
+      const postgresRefund = await tx.refund.create({
+        data: {
+          refundId,
+          escrowId: postgresEscrow.id,
+          taskId,
+          paymentId: razorpayPaymentId,
+          razorpayRefundId: razorpayRefund.id,
+          refundAmount,
+          cancellationFee: cancellationFee.greaterThan(0) ? cancellationFee : null,
+          toOtherParty: toOtherParty.greaterThan(0) ? toOtherParty : null,
+          toPlatform: toPlatform.greaterThan(0) ? toPlatform : null,
+          reason: resolvedLineTitle
+            ? `Book Now line cancelled: ${resolvedLineTitle}`
+            : reason || 'Book Now line cancelled',
+          cancelledBy: 'poster',
+          status: 'completed',
+          completedAt: new Date(),
+        },
+      });
+
+      await tx.ledger.create({
+        data: {
+          transactionId: `ledger_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
+          escrowId: postgresEscrow.id,
+          refundId: postgresRefund.id,
+          type: 'refund',
+          amount: refundAmount.neg(),
+          balanceBefore: currentBalance,
+          balanceAfter,
+          description: `Partial Book Now refund for task ${taskId}`,
+          metadata: {
+            refundId,
+            taskId,
+            bookingOrderId,
+            razorpayRefundId: razorpayRefund.id,
+          },
+        },
+      });
+
+      const remainingPaise = maxRefundablePaise - refundPaise;
+      const closeEscrow = isLastActiveItem || remainingPaise <= 0;
+
+      await tx.escrow.update({
+        where: { id: postgresEscrow.id },
+        data: {
+          status: closeEscrow ? 'refunded' : 'held',
+          ...(closeEscrow ? { refundedAt: new Date() } : {}),
+          metadata: {
+            ...meta,
+            cancelledLineTaskIds: nextCancelledIds,
+            cancelledLineDetails: [
+              ...prevLineDetails.filter((row) => String(row.taskId) !== taskId),
+              lineDetail,
+            ],
+            lastPartialRefundTaskId: taskId,
+            lastPartialRefundAt: new Date().toISOString(),
+          } as any,
+        },
+      });
+    });
+
+    logger.info('Book Now line item refund processed', {
+      bookingOrderId,
+      taskId,
+      refundPaise,
+      isLastActiveItem,
+      userId,
+    });
+
+    return {
+      success: true,
+      refund: {
+        refundId,
+        razorpayRefundId: razorpayRefund.id,
+        amount: refundAmount.toString(),
+        status: 'completed',
+      },
+    };
+  } catch (error: any) {
+    logger.error('Book Now line item refund failed', {
+      bookingOrderId,
+      taskId,
+      error: error?.message,
+    });
+    return { success: false, error: error?.message || 'Failed to process partial refund' };
+  }
+}
+
+type RazorpayRefundWebhookPayload = {
+  refund?: { entity?: { id?: string; status?: string } };
+  payment?: { entity?: { id?: string } };
+};
+
+/**
+ * Mark refund completed (or failed) when Razorpay sends refund webhooks.
+ * Idempotent — safe when processRefund already set status to completed.
+ */
+export async function completeRefundFromRazorpayWebhook(
+  payload: RazorpayRefundWebhookPayload,
+): Promise<void> {
+  if (!isPostgresConnected()) {
+    logger.warn('Refund webhook skipped — Postgres not connected');
+    return;
+  }
+
+  const refundEntity = payload?.refund?.entity;
+  const razorpayRefundId = refundEntity?.id;
+  if (!razorpayRefundId) {
+    logger.warn('Refund webhook missing refund entity id');
+    return;
+  }
+
+  const razorpayStatus = String(refundEntity?.status || '').trim().toLowerCase();
+
+  if (razorpayStatus === 'failed') {
+    await prisma.refund.updateMany({
+      where: { razorpayRefundId },
+      data: {
+        status: 'failed',
+        errorMessage: 'Razorpay reported refund failure',
+      },
+    });
+    logger.info('Refund marked failed from Razorpay webhook', { razorpayRefundId });
+    return;
+  }
+
+  const terminalStatuses = new Set(['processed', 'completed', 'success']);
+  if (!terminalStatuses.has(razorpayStatus) && razorpayStatus) {
+    logger.info('Refund webhook received — non-terminal Razorpay status', {
+      razorpayRefundId,
+      razorpayStatus,
+    });
+    return;
+  }
+
+  const result = await prisma.refund.updateMany({
+    where: {
+      razorpayRefundId,
+      status: { in: ['pending', 'processing'] },
+    },
+    data: {
+      status: 'completed',
+      completedAt: new Date(),
+    },
+  });
+
+  if (result.count > 0) {
+    logger.info('Refund marked completed from Razorpay webhook', { razorpayRefundId });
+    return;
+  }
+
+  const existing = await prisma.refund.findUnique({ where: { razorpayRefundId } });
+  if (!existing) {
+    logger.warn('Refund webhook for unknown razorpayRefundId', { razorpayRefundId });
   }
 }
 

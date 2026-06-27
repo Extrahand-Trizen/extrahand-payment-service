@@ -24,6 +24,9 @@ function generateLedgerTransactionId(): string {
  */
 export async function createLedgerEntry(params: {
   escrowId?: string;
+  payoutId?: string;
+  refundId?: string;
+  paymentTransactionId?: string;
   type: 'escrow' | 'payment' | 'refund' | 'payout' | 'fee' | 'cancellation_fee' | 'platform_fee' | 'platform_commission' | 'gst' | 'razorpay_fee' | 'tds';
   amount: number | Prisma.Decimal; // Amount in rupees (will be converted to Decimal)
   balanceBefore: number | Prisma.Decimal; // Balance before this transaction
@@ -34,6 +37,9 @@ export async function createLedgerEntry(params: {
   try {
     const {
       escrowId,
+      payoutId,
+      refundId,
+      paymentTransactionId,
       type,
       amount,
       balanceBefore,
@@ -59,6 +65,9 @@ export async function createLedgerEntry(params: {
       data: {
         transactionId,
         escrowId: escrowId || null,
+        payoutId: payoutId || null,
+        refundId: refundId || null,
+        paymentTransactionId: paymentTransactionId || null,
         razorpayPaymentId: (metadata as any)?.razorpayPaymentId ?? null,
         type,
         amount: amountDecimal,

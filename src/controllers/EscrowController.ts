@@ -1,8 +1,13 @@
 import { Response, Request } from 'express';
 import {
   createEscrow,
+  createBookingEscrow,
+  attachPerformerToEscrow,
+  resetPerformerOnEscrow,
+  reassignRecurringVisitEscrow,
   getEscrowStatus,
   getEscrowByTaskId,
+  getEscrowByTaskIdAndVisitId,
   releaseEscrow,
   updateEscrowAutoRelease,
 } from '../services/escrowService';
@@ -74,6 +79,134 @@ export class EscrowController {
   }
 
   /**
+   * POST /api/v1/escrow/create-booking
+   * Book Now: create escrow before helper is assigned
+   */
+  static async createBookingEscrow(req: Request, res: Response): Promise<void> {
+    const {
+      taskId,
+      bookingOrderId,
+      posterUid,
+      amount,
+      taskAmount,
+      currency,
+      metadata,
+      taskCategory,
+      taskTitle: taskTitleBody,
+    } = req.body;
+
+    if (!taskId || !bookingOrderId || !posterUid || !amount) {
+      throw new BadRequestError(
+        'Missing required fields: taskId, bookingOrderId, posterUid, amount'
+      );
+    }
+
+    if (amount <= 0) {
+      throw new BadRequestError('Amount must be greater than 0');
+    }
+
+    const baseMeta =
+      metadata && typeof metadata === 'object' && !Array.isArray(metadata)
+        ? { ...(metadata as Record<string, unknown>) }
+        : {};
+    const titleFromBody =
+      typeof taskTitleBody === 'string' && taskTitleBody.trim().length > 0
+        ? taskTitleBody.trim()
+        : undefined;
+    if (titleFromBody && !baseMeta.taskTitle && !baseMeta.taskTitleSnapshot) {
+      baseMeta.taskTitle = titleFromBody;
+    }
+
+    const result = await createBookingEscrow({
+      taskId,
+      bookingOrderId,
+      posterUid,
+      amount,
+      taskAmount,
+      currency,
+      taskCategory,
+      metadata: baseMeta,
+    });
+
+    if (!result.success) {
+      throw new Error(result.error || 'Failed to create booking escrow');
+    }
+
+    res.status(201).json({
+      success: true,
+      escrow: result.escrow,
+      order: result.order,
+    });
+  }
+
+  /**
+   * PATCH /api/v1/escrow/:escrowId/attach-performer
+   */
+  static async attachPerformer(req: Request, res: Response): Promise<void> {
+    const { escrowId } = req.params;
+    const { performerUid, applicationId } = req.body;
+
+    if (!performerUid) {
+      throw new BadRequestError('performerUid is required');
+    }
+
+    const result = await attachPerformerToEscrow({
+      escrowId,
+      performerUid,
+      applicationId,
+    });
+
+    if (!result.success) {
+      throw new BadRequestError(result.error || 'Failed to attach performer');
+    }
+
+    res.json({
+      success: true,
+      escrow: result.escrow,
+    });
+  }
+
+  /**
+   * PATCH /api/v1/escrow/:escrowId/reset-performer
+   */
+  static async resetPerformer(req: Request, res: Response): Promise<void> {
+    const { escrowId } = req.params;
+    const result = await resetPerformerOnEscrow(escrowId);
+    if (!result.success) {
+      throw new BadRequestError(result.error || 'Failed to reset performer');
+    }
+    res.json({ success: true });
+  }
+
+  /**
+   * PATCH /api/v1/escrow/:escrowId/reassign-recurring-visit
+   */
+  static async reassignRecurringVisit(req: Request, res: Response): Promise<void> {
+    const { escrowId } = req.params;
+    const { taskId, fromVisitId, toVisitId } = req.body;
+
+    if (!taskId || !fromVisitId || !toVisitId) {
+      throw new BadRequestError('taskId, fromVisitId, and toVisitId are required');
+    }
+
+    const result = await reassignRecurringVisitEscrow({
+      escrowId,
+      taskId,
+      fromVisitId,
+      toVisitId,
+    });
+
+    if (!result.success) {
+      throw new BadRequestError(result.error || 'Failed to reassign recurring visit escrow');
+    }
+
+    res.json({
+      success: true,
+      escrow: result.escrow,
+    });
+  }
+
+  /**
    * GET /api/v1/escrow/status/:escrowId
    * Get escrow status by escrow ID
    */
@@ -98,10 +231,20 @@ export class EscrowController {
    */
   static async getEscrowByTaskId(req: Request, res: Response): Promise<void> {
     const { taskId } = req.params;
+    const visitId =
+      typeof req.query.visitId === 'string' && req.query.visitId.trim()
+        ? req.query.visitId.trim()
+        : undefined;
 
-    const escrow = await getEscrowByTaskId(taskId);
+    const escrow = visitId
+      ? await getEscrowByTaskIdAndVisitId(taskId, visitId)
+      : await getEscrowByTaskId(taskId);
 
     if (!escrow) {
+      if (visitId) {
+        res.json({ success: true, escrow: null });
+        return;
+      }
       throw new NotFoundError('Escrow not found for this task');
     }
 

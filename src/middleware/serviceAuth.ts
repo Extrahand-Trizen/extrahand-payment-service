@@ -35,12 +35,12 @@ export function serviceAuthMiddleware(
       return;
     }
 
-    if (providedToken !== serviceAuthToken) {
+    if (providedToken.trim() !== serviceAuthToken.trim()) {
       logger.warn('⚠️ Service auth failed: Token mismatch', {
-        providedTokenLength: providedToken.length,
-        expectedTokenLength: serviceAuthToken.length,
-        providedPrefix: providedToken.substring(0, 10),
-        expectedPrefix: serviceAuthToken.substring(0, 10),
+        providedTokenLength: providedToken.trim().length,
+        expectedTokenLength: serviceAuthToken.trim().length,
+        providedPrefix: providedToken.trim().substring(0, 10),
+        expectedPrefix: serviceAuthToken.trim().substring(0, 10),
         url: req.url,
         method: req.method,
       });

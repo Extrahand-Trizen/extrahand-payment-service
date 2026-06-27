@@ -26,8 +26,8 @@ model Transaction {
   status            String // created, authorized, captured, failed
   paymentMethod     String?
   metadata          Json?
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
 
   @@index([userId])
   @@index([taskId])
@@ -45,7 +45,8 @@ model Escrow {
   taskCategory      String? // e.g. "cleaning", "legal"; nullable for old escrows
   applicationId     String?
   posterUid         String
-  performerUid      String
+  performerUid      String?
+  bookingOrderId    String?
   amount            Decimal   @db.Decimal(12, 2) // Amount in paise
   currency          String    @default("INR")
   amountInRupees    Decimal   @db.Decimal(12, 2) // Amount in rupees (task + platform fee + GST)
@@ -80,8 +81,11 @@ model Escrow {
   disputes Dispute[]
 
   @@index([taskId, status])
+  @@index([bookingOrderId])
   @@index([posterUid, status])
+  @@index([posterUid, status, createdAt(sort: Desc)])
   @@index([performerUid, status])
+  @@index([performerUid, status, createdAt(sort: Desc)])
   @@index([status, autoReleaseDate])
   @@index([createdAt])
 }
@@ -97,6 +101,7 @@ model Ledger {
   escrowId          String?
   payoutId          String?
   refundId          String?
+  paymentTransactionId String?
   razorpayPaymentId String?
   type              String // escrow, payment, refund, payout, razorpay_fee, platform_commission, gst, tds, cancellation_fee, platform_fee
   direction         String? // credit, debit
@@ -109,12 +114,16 @@ model Ledger {
 
   // Relations
   escrow Escrow? @relation(fields: [escrowId], references: [id], onDelete: SetNull)
+  payout Payout? @relation(fields: [payoutId], references: [id], onDelete: SetNull)
+  refund Refund? @relation(fields: [refundId], references: [id], onDelete: SetNull)
 
   @@unique([razorpayPaymentId, type])
   @@index([escrowId])
   @@index([userId])
   @@index([taskId])
   @@index([type])
+  @@index([payoutId])
+  @@index([refundId])
   @@index([createdAt])
 }
 
@@ -142,12 +151,14 @@ model Refund {
 
   // Relations
   escrow Escrow? @relation(fields: [escrowId], references: [id], onDelete: SetNull)
+  ledger Ledger[]
 
   @@index([escrowId])
   @@index([transactionId])
   @@index([taskId])
   @@index([paymentId])
   @@index([status])
+  @@index([status, createdAt(sort: Desc)])
   @@index([createdAt])
 }
 
@@ -177,11 +188,14 @@ model Payout {
 
   // Relations
   escrow Escrow? @relation(fields: [escrowId], references: [id], onDelete: SetNull)
+  ledger Ledger[]
 
   @@index([escrowId])
   @@index([transactionId])
   @@index([taskId])
   @@index([performerUid])
+  @@index([performerUid, createdAt(sort: Desc)])
+  @@index([performerUid, status, createdAt(sort: Desc)])
   @@index([status])
   @@index([createdAt])
 }
@@ -265,20 +279,26 @@ model Reconciliation {
 model BankAccount {
   id                String    @id @default(uuid())
   userId            String // User UID (reference only, no FK - user data in User Service)
-  accountNumber     String // Encrypted or masked (last 4 digits visible)
+  accountNumber     String // Masked display only (XXXX1234) for tasker-facing APIs
   ifscCode          String
   bankName          String
-  accountHolderName String
+  accountHolderName String // Masked display for tasker-facing APIs
+  /** AES-256-GCM ciphertext (base64 envelope). Full number for admin/ops decrypt only. */
+  accountNumberEncrypted    String? @db.Text
+  accountHolderNameEncrypted String? @db.Text
+  accountNumberLast4        String?
+  encryptionKeyVersion      String? @default("v1")
   isVerified        Boolean   @default(false)
   isDefault         Boolean   @default(false)
   verifiedAt        DateTime?
-  verificationRef   String? // Reference from bank verification service
+  verificationRef   String? // RazorpayX contactId + fundAccountId JSON
   createdAt         DateTime  @default(now())
   updatedAt         DateTime  @updatedAt
 
   // Duplicates are allowed intentionally to support repeated account onboarding entries.
   // The app layer can still apply business checks if needed.
   @@index([userId, accountNumber, ifscCode])
+  @@index([userId, accountNumberLast4])
   @@index([userId])
   @@index([userId, isDefault])
 }
@@ -323,7 +343,8 @@ model UserPaymentProfile {
 // ExtraCoin wallet balance per performer
 model ExtraCoinWallet {
   id                  String   @id @default(uuid())
-  userId              String   @unique
+  userId              String
+  walletRole          String   @default("tasker") // poster | tasker (legacy: customer)
   balanceCoins        Decimal  @default(0) @db.Decimal(12, 2)
   balanceRupees       Decimal  @default(0) @db.Decimal(12, 2)
   lifetimeEarnedCoins Decimal  @default(0) @db.Decimal(12, 2)
@@ -332,7 +353,9 @@ model ExtraCoinWallet {
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
 
+  @@unique([userId, walletRole])
   @@index([userId])
+  @@index([userId, walletRole])
 }
 
 // ExtraCoin ledger for earning, redeeming, and expiry events
@@ -340,6 +363,7 @@ model ExtraCoinTransaction {
   id              String    @id @default(uuid())
   transactionId   String    @unique
   userId          String
+  walletRole      String    @default("tasker") // poster | tasker (legacy: customer)
   type            String // earned, redeemed, expired
   status          String    @default("completed") // completed, reversed
   coins           Decimal   @db.Decimal(12, 2)
@@ -349,12 +373,15 @@ model ExtraCoinTransaction {
   sourcePayoutId  String?
   taskId          String?
   expiresAt       DateTime?
+  idempotencyKey  String?   @unique
   metadata        Json?
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 
-  @@index([userId, type])
+  @@index([userId, walletRole, type])
   @@index([userId, expiresAt])
+  @@index([userId, walletRole, expiresAt])
+  @@index([walletRole, createdAt])
   @@index([sourcePayoutId])
   @@index([taskId])
   @@index([createdAt])
@@ -449,11 +476,21 @@ model PaymentOrderIdempotency {
   createdAt       DateTime @default(now())
 }
 
+enum CategoryFeeMode {
+  BOOK_NOW
+  BIDDING
+}
+
 // CategoryFeeConfig - Per-category fee overrides and optional guards
 model CategoryFeeConfig {
-  id          String  @id @default(uuid())
-  categoryKey String  @unique
+  id          String          @id @default(uuid())
+  categoryKey String
+  mode        CategoryFeeMode @default(BIDDING)
   displayName String?
+
+  // GST classification (SAC = Services Accounting Code)
+  sacCode     String?
+  sacHeading  String?
 
   // Core knobs
   gstPercentage            Decimal  @db.Decimal(5, 4)
@@ -471,7 +508,9 @@ model CategoryFeeConfig {
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
 
+  @@unique([categoryKey, mode])
   @@index([categoryKey])
+  @@index([mode])
   @@index([effectiveFrom, effectiveTo])
 }
 

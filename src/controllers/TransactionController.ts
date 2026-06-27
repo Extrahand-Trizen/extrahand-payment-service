@@ -1,7 +1,12 @@
 import { Response, Request } from 'express';
 import { getUserTransactions, getTransactionSummary } from '../services/transactionHistoryService';
 import { getExtraCoinsWallet } from '../services/extraCoinsService';
+import { issueGrants } from '../rewards/grants/GrantExecutor';
+import type { GrantSpec } from '../rewards/types/GrantSpec';
 import { BadRequestError } from '../errors/AppError';
+import { logPaymentReferralCoins } from '../rewards/referralCoinsLogger';
+import { parseWalletRole } from '../rewards/utils/walletRole';
+import { parseQueryEndDateInclusive, parseQueryStartDate } from '../utils/queryDateRange';
 
 export class TransactionController {
   /**
@@ -27,8 +32,8 @@ export class TransactionController {
     const options = {
       limit: limit ? parseInt(limit as string, 10) : undefined,
       offset: offset ? parseInt(offset as string, 10) : undefined,
-      startDate: startDate ? new Date(startDate as string) : undefined,
-      endDate: endDate ? new Date(endDate as string) : undefined,
+      startDate: startDate ? parseQueryStartDate(startDate as string) : undefined,
+      endDate: endDate ? parseQueryEndDateInclusive(endDate as string) : undefined,
       type: type as 'payment' | 'payout' | 'refund' | 'compensation' | 'fee' | 'escrow' | undefined,
       status: status as string | undefined,
       category: category as 'earnings' | 'payments' | 'all' | undefined,
@@ -62,8 +67,8 @@ export class TransactionController {
       throw new BadRequestError('User ID is required');
     }
 
-    const start = startDate ? new Date(startDate as string) : undefined;
-    const end = endDate ? new Date(endDate as string) : undefined;
+    const start = startDate ? parseQueryStartDate(startDate as string) : undefined;
+    const end = endDate ? parseQueryEndDateInclusive(endDate as string) : undefined;
     const linkedParsed =
       typeof linkedUserIds === 'string' && linkedUserIds.trim()
         ? linkedUserIds
@@ -90,7 +95,7 @@ export class TransactionController {
    */
   static async getExtraCoinsWallet(req: Request, res: Response): Promise<void> {
     const { userId } = req.params;
-    const { linkedUserIds } = req.query;
+    const { linkedUserIds, walletRole } = req.query;
 
     if (!userId) {
       throw new BadRequestError('User ID is required');
@@ -104,7 +109,11 @@ export class TransactionController {
             .filter(Boolean)
         : undefined;
 
-    const result = await getExtraCoinsWallet(userId, linkedParsed);
+    const result = await getExtraCoinsWallet(
+      userId,
+      linkedParsed,
+      parseWalletRole(walletRole)
+    );
 
     if (!result.success) {
       throw new Error(result.error || 'Failed to get ExtraCoins wallet');
@@ -114,6 +123,33 @@ export class TransactionController {
       success: true,
       wallet: result.wallet,
     });
+  }
+
+  /**
+   * POST /api/v1/transactions/issue-grants
+   */
+  static async issueGrants(req: Request, res: Response): Promise<void> {
+    const { grants } = req.body as { grants?: GrantSpec[] };
+    if (!Array.isArray(grants) || grants.length === 0) {
+      throw new BadRequestError('grants array is required');
+    }
+    logPaymentReferralCoins('issue_grants_request', {
+      grantCount: grants.length,
+      recipients: grants.map((g) => ({
+        recipientUid: g.recipientUid,
+        walletRole: g.walletRole || 'tasker',
+        coins: g.coins,
+        source: g.metadata?.source,
+        idempotencyKey: g.idempotencyKey,
+      })),
+    });
+    const result = await issueGrants(grants);
+    logPaymentReferralCoins('issue_grants_response', {
+      success: result.success,
+      partial: result.partial,
+      results: result.results,
+    }, result.success && !result.partial ? 'info' : 'warn');
+    res.json(result);
   }
 }
 

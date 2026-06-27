@@ -2,10 +2,19 @@ import { Prisma } from '@prisma/client';
 import mongoose from 'mongoose';
 import logger from '../config/logger';
 import { prisma } from '../config/prisma';
+import { issueGrant } from '../rewards/grants/GrantExecutor';
+import type { GrantSpec } from '../rewards/types/GrantSpec';
+import { UserServiceClient } from '../clients/UserServiceClient';
+import { paymentRewardsFlags } from '../config/rewardsFlags';
+import { parseWalletRole, type WalletRole } from '../rewards/utils/walletRole';
 
-const COIN_VALUE_INR = new Prisma.Decimal('0.20');
+export type { WalletRole };
+
+/** 1 ExtraCoin = ₹1 redeemable (must match user-service RewardProgram.coinEconomics.coinValueInr) */
+const COIN_VALUE_INR = new Prisma.Decimal('1.00');
 const COIN_EXPIRY_DAYS = 180;
 const EXPIRING_SOON_DAYS = 7;
+const DEFAULT_WALLET_ROLE: WalletRole = 'tasker';
 
 const ZERO = new Prisma.Decimal('0.00');
 const ONE = new Prisma.Decimal('1.00');
@@ -27,6 +36,10 @@ function generateCoinTransactionId(prefix: 'earned' | 'redeemed' | 'expired'): s
   return `xcoin_${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function normalizeWalletRole(role?: WalletRole | string): WalletRole {
+  return parseWalletRole(role, DEFAULT_WALLET_ROLE);
+}
+
 function getBaseRewardPercent(taskAmount: Prisma.Decimal): Prisma.Decimal {
   if (taskAmount.lessThan(new Prisma.Decimal('200'))) return ZERO;
   if (taskAmount.lessThan(new Prisma.Decimal('400'))) return new Prisma.Decimal('0.05');
@@ -40,10 +53,35 @@ async function getPerformerCoinContext(uid: string): Promise<{
   ratingMultiplier: Prisma.Decimal;
   skillCertificateBonusPct: Prisma.Decimal;
 }> {
-  if (!uid || mongoose.connection.readyState !== 1) {
+  if (!uid) {
     return {
       rating: ZERO,
-      // When profile context is unavailable, keep baseline rewards enabled.
+      ratingMultiplier: new Prisma.Decimal('0.80'),
+      skillCertificateBonusPct: ZERO,
+    };
+  }
+
+  if (paymentRewardsFlags.USE_USER_SERVICE_REWARD_CONTEXT) {
+    const ctx = await UserServiceClient.getRewardContext(uid);
+    if (ctx) {
+      const rating = new Prisma.Decimal(Math.max(ctx.rating, 0).toFixed(2));
+      return {
+        rating,
+        ratingMultiplier: new Prisma.Decimal(ctx.ratingMultiplier.toFixed(4)),
+        skillCertificateBonusPct: new Prisma.Decimal(ctx.skillCertificateBonusPct.toFixed(4)),
+      };
+    }
+    // Fail-open: user-service unreachable — use safe defaults so payout/earn is not blocked
+    return {
+      rating: ZERO,
+      ratingMultiplier: new Prisma.Decimal('0.80'),
+      skillCertificateBonusPct: ZERO,
+    };
+  }
+
+  if (mongoose.connection.readyState !== 1) {
+    return {
+      rating: ZERO,
       ratingMultiplier: new Prisma.Decimal('0.80'),
       skillCertificateBonusPct: ZERO,
     };
@@ -121,7 +159,7 @@ async function getPerformerCoinContext(uid: string): Promise<{
   }
 }
 
-export async function expireExtraCoins(userId: string): Promise<{
+export async function expireExtraCoins(userId: string, walletRole: WalletRole = DEFAULT_WALLET_ROLE): Promise<{
   success: boolean;
   expiredCoins: string;
   expiredRupees: string;
@@ -133,9 +171,11 @@ export async function expireExtraCoins(userId: string): Promise<{
     }
 
     const now = new Date();
+    const role = normalizeWalletRole(walletRole);
     const expiredEarnRows = await prisma.extraCoinTransaction.findMany({
       where: {
         userId,
+        walletRole: role,
         type: 'earned',
         status: 'completed',
         expiresAt: { lt: now },
@@ -173,6 +213,7 @@ export async function expireExtraCoins(userId: string): Promise<{
           data: {
             transactionId: generateCoinTransactionId('expired'),
             userId,
+            walletRole: role,
             type: 'expired',
             status: 'completed',
             coins: rowExpiredCoins,
@@ -189,7 +230,7 @@ export async function expireExtraCoins(userId: string): Promise<{
       }
 
       await tx.extraCoinWallet.upsert({
-        where: { userId },
+        where: { userId_walletRole: { userId, walletRole: role } },
         update: {
           balanceCoins: { decrement: totalExpiredCoins },
           balanceRupees: { decrement: totalExpiredRupees },
@@ -197,6 +238,7 @@ export async function expireExtraCoins(userId: string): Promise<{
         },
         create: {
           userId,
+          walletRole: role,
           balanceCoins: ZERO,
           balanceRupees: ZERO,
           lifetimeEarnedCoins: ZERO,
@@ -212,7 +254,7 @@ export async function expireExtraCoins(userId: string): Promise<{
       expiredRupees: totalExpiredRupees.toString(),
     };
   } catch (error: any) {
-    logger.error('[extraCoins] Failed to expire ExtraCoins', { userId, error });
+    logger.error('[extraCoins] Failed to expire ExtraCoins', { userId, walletRole, error });
     return {
       success: false,
       expiredCoins: '0.00',
@@ -222,11 +264,76 @@ export async function expireExtraCoins(userId: string): Promise<{
   }
 }
 
+/**
+ * Read-only estimate of redeemable coins (no wallet mutation).
+ * Uses wallet balance and open earned lots so checkout matches capture redemption.
+ */
+export async function previewExtraCoinsRedemption(params: {
+  userId: string;
+  maxRedeemRupees: Prisma.Decimal;
+  walletRole?: WalletRole;
+}): Promise<{
+  redeemableRupees: string;
+  redeemableCoins: string;
+}> {
+  const walletRole = normalizeWalletRole(params.walletRole || 'tasker');
+  const { userId } = params;
+
+  await expireExtraCoins(userId, walletRole);
+
+  const capRupees = maxDecimal(params.maxRedeemRupees.toDecimalPlaces(2), ZERO);
+  if (capRupees.lessThanOrEqualTo(ZERO)) {
+    return { redeemableRupees: '0.00', redeemableCoins: '0.00' };
+  }
+
+  const wallet = await prisma.extraCoinWallet.findUnique({
+    where: { userId_walletRole: { userId, walletRole } },
+  });
+  const walletRupees = toDecimal(wallet?.balanceRupees || ZERO).toDecimalPlaces(2);
+  if (walletRupees.lessThanOrEqualTo(ZERO)) {
+    return { redeemableRupees: '0.00', redeemableCoins: '0.00' };
+  }
+
+  const earnRows = await prisma.extraCoinTransaction.findMany({
+    where: {
+      userId,
+      walletRole,
+      type: 'earned',
+      status: 'completed',
+      remainingRupees: { gt: ZERO },
+      OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }],
+    },
+    select: { remainingRupees: true },
+  });
+
+  let earnAvailableRupees = ZERO;
+  for (const row of earnRows) {
+    earnAvailableRupees = earnAvailableRupees
+      .plus(toDecimal(row.remainingRupees || ZERO).toDecimalPlaces(2))
+      .toDecimalPlaces(2);
+  }
+
+  if (earnAvailableRupees.lessThanOrEqualTo(ZERO)) {
+    return { redeemableRupees: '0.00', redeemableCoins: '0.00' };
+  }
+
+  const redeemRupees = minDecimal(walletRupees, minDecimal(capRupees, earnAvailableRupees)).toDecimalPlaces(2);
+  if (redeemRupees.lessThanOrEqualTo(ZERO)) {
+    return { redeemableRupees: '0.00', redeemableCoins: '0.00' };
+  }
+
+  return {
+    redeemableRupees: redeemRupees.toString(),
+    redeemableCoins: redeemRupees.div(COIN_VALUE_INR).toDecimalPlaces(2).toString(),
+  };
+}
+
 export async function applyExtraCoinsForPayout(params: {
   userId: string;
   payoutId: string;
   taskId: string;
   maxRedeemRupees: Prisma.Decimal;
+  walletRole?: WalletRole;
 }): Promise<{
   success: boolean;
   redeemedCoins: string;
@@ -236,12 +343,51 @@ export async function applyExtraCoinsForPayout(params: {
     redeemedCoins: string;
     redeemedRupees: string;
   }>;
+  duplicate?: boolean;
   error?: string;
 }> {
   const { userId, payoutId, taskId, maxRedeemRupees } = params;
+  const walletRole = normalizeWalletRole(params.walletRole || 'tasker');
 
   try {
-    await expireExtraCoins(userId);
+    const existingRedeem = await prisma.extraCoinTransaction.findFirst({
+      where: {
+        userId,
+        walletRole,
+        type: 'redeemed',
+        status: 'completed',
+        sourcePayoutId: payoutId,
+      },
+      select: {
+        coins: true,
+        rupeeValue: true,
+        metadata: true,
+      },
+    });
+
+    if (existingRedeem) {
+      const metadata =
+        existingRedeem.metadata && typeof existingRedeem.metadata === 'object' && !Array.isArray(existingRedeem.metadata)
+          ? (existingRedeem.metadata as Record<string, unknown>)
+          : {};
+      const sourceEarnTransactions = Array.isArray(metadata.sourceEarnTransactions)
+        ? metadata.sourceEarnTransactions
+        : [];
+
+      return {
+        success: true,
+        redeemedCoins: existingRedeem.coins.toString(),
+        redeemedRupees: existingRedeem.rupeeValue.toString(),
+        sources: sourceEarnTransactions.map((source: any) => ({
+          transactionId: String(source?.transactionId || ''),
+          redeemedCoins: String(source?.redeemedCoins || '0.00'),
+          redeemedRupees: String(source?.redeemedRupees || '0.00'),
+        })),
+        duplicate: true,
+      };
+    }
+
+    await expireExtraCoins(userId, walletRole);
 
     const capRupees = maxDecimal(maxRedeemRupees.toDecimalPlaces(2), ZERO);
     if (capRupees.lessThanOrEqualTo(ZERO)) {
@@ -253,7 +399,9 @@ export async function applyExtraCoinsForPayout(params: {
       };
     }
 
-    const wallet = await prisma.extraCoinWallet.findUnique({ where: { userId } });
+    const wallet = await prisma.extraCoinWallet.findUnique({
+      where: { userId_walletRole: { userId, walletRole } },
+    });
     const walletRupees = toDecimal(wallet?.balanceRupees || ZERO).toDecimalPlaces(2);
 
     if (walletRupees.lessThanOrEqualTo(ZERO)) {
@@ -278,6 +426,7 @@ export async function applyExtraCoinsForPayout(params: {
     const earnRows = await prisma.extraCoinTransaction.findMany({
       where: {
         userId,
+        walletRole,
         type: 'earned',
         status: 'completed',
         remainingRupees: { gt: ZERO },
@@ -358,6 +507,7 @@ export async function applyExtraCoinsForPayout(params: {
         data: {
           transactionId: generateCoinTransactionId('redeemed'),
           userId,
+          walletRole,
           type: 'redeemed',
           status: 'completed',
           coins: totalRedeemedCoins,
@@ -376,7 +526,7 @@ export async function applyExtraCoinsForPayout(params: {
       });
 
       await tx.extraCoinWallet.upsert({
-        where: { userId },
+        where: { userId_walletRole: { userId, walletRole } },
         update: {
           balanceCoins: { decrement: totalRedeemedCoins },
           balanceRupees: { decrement: totalRedeemedRupees },
@@ -385,6 +535,7 @@ export async function applyExtraCoinsForPayout(params: {
         },
         create: {
           userId,
+          walletRole,
           balanceCoins: ZERO,
           balanceRupees: ZERO,
           lifetimeEarnedCoins: ZERO,
@@ -405,7 +556,12 @@ export async function applyExtraCoinsForPayout(params: {
       })),
     };
   } catch (error: any) {
-    logger.error('[extraCoins] Failed to redeem ExtraCoins', { userId, payoutId, error });
+    logger.error('[extraCoins] Failed to redeem ExtraCoins', {
+      userId,
+      payoutId,
+      walletRole,
+      error,
+    });
     return {
       success: false,
       redeemedCoins: '0.00',
@@ -416,12 +572,39 @@ export async function applyExtraCoinsForPayout(params: {
   }
 }
 
+export async function applyExtraCoinsForBooking(params: {
+  userId: string;
+  bookingId: string;
+  taskId: string;
+  maxRedeemRupees: Prisma.Decimal;
+}): Promise<{
+  success: boolean;
+  redeemedCoins: string;
+  redeemedRupees: string;
+  sources: Array<{
+    transactionId: string;
+    redeemedCoins: string;
+    redeemedRupees: string;
+  }>;
+  duplicate?: boolean;
+  error?: string;
+}> {
+  return applyExtraCoinsForPayout({
+    userId: params.userId,
+    payoutId: `booking:${params.bookingId}`,
+    taskId: params.taskId,
+    maxRedeemRupees: params.maxRedeemRupees,
+    walletRole: 'poster',
+  });
+}
+
 export async function awardExtraCoinsForCompletedTask(params: {
   userId: string;
   payoutId: string;
   taskId: string;
   taskAmountRupees: Prisma.Decimal;
   platformFeeRupees: Prisma.Decimal;
+  walletRole?: WalletRole;
 }): Promise<{
   success: boolean;
   awardedCoins: string;
@@ -438,39 +621,10 @@ export async function awardExtraCoinsForCompletedTask(params: {
   error?: string;
 }> {
   const { userId, payoutId, taskId, taskAmountRupees, platformFeeRupees } = params;
+  const walletRole = normalizeWalletRole(params.walletRole || 'tasker');
 
   try {
-    await expireExtraCoins(userId);
-
-    const duplicate = await prisma.extraCoinTransaction.findFirst({
-      where: {
-        userId,
-        type: 'earned',
-        OR: [{ sourcePayoutId: payoutId }, { taskId }],
-        status: 'completed',
-      },
-    });
-
-    if (duplicate) {
-      const meta = duplicate.metadata && typeof duplicate.metadata === 'object' && !Array.isArray(duplicate.metadata)
-        ? (duplicate.metadata as Record<string, unknown>)
-        : {};
-
-      return {
-        success: true,
-        awardedCoins: duplicate.coins.toString(),
-        awardedRupees: duplicate.rupeeValue.toString(),
-        details: {
-          baseRewardPercent: String(meta.baseRewardPercent || '0'),
-          rating: String(meta.rating || '0'),
-          ratingMultiplier: String(meta.ratingMultiplier || '0'),
-          onboardingBonusPct: String(meta.onboardingBonusPct || '0'),
-          skillCertificateBonusPct: String(meta.skillCertificateBonusPct || '0'),
-          totalBonusMultiplier: String(meta.totalBonusMultiplier || '1'),
-        },
-        reason: 'already_awarded',
-      };
-    }
+    await expireExtraCoins(userId, walletRole);
 
     const baseRewardPercent = getBaseRewardPercent(taskAmountRupees).toDecimalPlaces(4);
     if (baseRewardPercent.lessThanOrEqualTo(ZERO)) {
@@ -551,69 +705,60 @@ export async function awardExtraCoinsForCompletedTask(params: {
     const rewardCoins = rewardRupees.div(COIN_VALUE_INR).toDecimalPlaces(2);
     const expiresAt = new Date(Date.now() + COIN_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
 
-    await prisma.$transaction(async (tx) => {
-      await tx.extraCoinTransaction.create({
-        data: {
-          transactionId: generateCoinTransactionId('earned'),
-          userId,
-          type: 'earned',
-          status: 'completed',
-          coins: rewardCoins,
-          rupeeValue: rewardRupees,
-          remainingCoins: rewardCoins,
-          remainingRupees: rewardRupees,
-          sourcePayoutId: payoutId,
-          taskId,
-          expiresAt,
-          metadata: {
-            taskAmount: taskAmountRupees.toString(),
-            platformFee: platformFeeRupees.toString(),
-            baseRewardPercent: baseRewardPercent.toString(),
-            rating: profileContext.rating.toString(),
-            ratingMultiplier: profileContext.ratingMultiplier.toString(),
-            onboardingBonusPct: onboardingBonusPct.toString(),
-            skillCertificateBonusPct: profileContext.skillCertificateBonusPct.toString(),
-            totalBonusMultiplier: totalBonusMultiplier.toString(),
-            coinValueInr: COIN_VALUE_INR.toString(),
-            formula: 'coins = (platformFee * basePercent) * ratingMultiplier * (1 + bonuses) / 0.20',
-          } as Prisma.JsonObject,
-        },
-      });
+    const detailsPayload = {
+      baseRewardPercent: baseRewardPercent.toString(),
+      rating: profileContext.rating.toString(),
+      ratingMultiplier: profileContext.ratingMultiplier.toString(),
+      onboardingBonusPct: onboardingBonusPct.toString(),
+      skillCertificateBonusPct: profileContext.skillCertificateBonusPct.toString(),
+      totalBonusMultiplier: totalBonusMultiplier.toString(),
+    };
 
-      await tx.extraCoinWallet.upsert({
-        where: { userId },
-        update: {
-          balanceCoins: { increment: rewardCoins },
-          balanceRupees: { increment: rewardRupees },
-          lifetimeEarnedCoins: { increment: rewardCoins },
-          lastUpdatedAt: new Date(),
-        },
-        create: {
-          userId,
-          balanceCoins: rewardCoins,
-          balanceRupees: rewardRupees,
-          lifetimeEarnedCoins: rewardCoins,
-          lifetimeUsedCoins: ZERO,
-          lastUpdatedAt: new Date(),
-        },
-      });
+    const grantResult = await issueGrant({
+      idempotencyKey: `task:earn:${taskId}:${userId}`,
+      recipientUid: userId,
+      walletRole,
+      coins: rewardCoins.toString(),
+      rupeeValue: rewardRupees.toString(),
+      expiresAt: expiresAt.toISOString(),
+      taskId,
+      sourcePayoutId: payoutId,
+      metadata: {
+        source: 'task_completion',
+        taskId,
+        taskAmount: taskAmountRupees.toString(),
+        platformFee: platformFeeRupees.toString(),
+        ...detailsPayload,
+        coinValueInr: COIN_VALUE_INR.toString(),
+        formula: 'coins = (platformFee * basePercent) * ratingMultiplier * (1 + bonuses) / coinValueInr (1 coin = ₹1)',
+      },
     });
+
+    if (!grantResult.success) {
+      return {
+        success: false,
+        awardedCoins: '0.00',
+        awardedRupees: '0.00',
+        details: { ...detailsPayload, totalBonusMultiplier: totalBonusMultiplier.toString() },
+        error: grantResult.error || 'Failed to award ExtraCoins',
+      };
+    }
 
     return {
       success: true,
-      awardedCoins: rewardCoins.toString(),
-      awardedRupees: rewardRupees.toString(),
-      details: {
-        baseRewardPercent: baseRewardPercent.toString(),
-        rating: profileContext.rating.toString(),
-        ratingMultiplier: profileContext.ratingMultiplier.toString(),
-        onboardingBonusPct: onboardingBonusPct.toString(),
-        skillCertificateBonusPct: profileContext.skillCertificateBonusPct.toString(),
-        totalBonusMultiplier: totalBonusMultiplier.toString(),
-      },
+      awardedCoins: grantResult.coins,
+      awardedRupees: grantResult.rupeeValue,
+      details: detailsPayload,
+      ...(grantResult.duplicate ? { reason: 'already_awarded' as const } : {}),
     };
   } catch (error: any) {
-    logger.error('[extraCoins] Failed to award ExtraCoins', { userId, payoutId, taskId, error });
+    logger.error('[extraCoins] Failed to award ExtraCoins', {
+      userId,
+      payoutId,
+      taskId,
+      walletRole,
+      error,
+    });
     return {
       success: false,
       awardedCoins: '0.00',
@@ -631,7 +776,10 @@ export async function awardExtraCoinsForCompletedTask(params: {
   }
 }
 
-async function backfillMissingExtraCoinsForWallet(userId: string): Promise<void> {
+async function backfillMissingExtraCoinsForWallet(
+  userId: string,
+  walletRole: WalletRole = 'tasker'
+): Promise<void> {
   if (!userId) return;
 
   const payouts = await prisma.payout.findMany({
@@ -665,11 +813,16 @@ async function backfillMissingExtraCoinsForWallet(userId: string): Promise<void>
       taskId,
       taskAmountRupees: new Prisma.Decimal(String(metadata.taskAmount || payout.amount || '0')),
       platformFeeRupees: new Prisma.Decimal(String(metadata.platformFee || payout.platformCommission || '0')),
+      walletRole,
     });
   }
 }
 
-export async function getExtraCoinsWallet(userId: string, linkedUserIds?: string[]): Promise<{
+export async function getExtraCoinsWallet(
+  userId: string,
+  linkedUserIds?: string[],
+  walletRole: WalletRole = DEFAULT_WALLET_ROLE
+): Promise<{
   success: boolean;
   wallet?: {
     coinToRupee: string;
@@ -712,6 +865,7 @@ export async function getExtraCoinsWallet(userId: string, linkedUserIds?: string
   error?: string;
 }> {
   try {
+    const role = normalizeWalletRole(walletRole);
     const allUserIds = Array.from(
       new Set(
         [userId, ...(linkedUserIds || [])]
@@ -727,16 +881,16 @@ export async function getExtraCoinsWallet(userId: string, linkedUserIds?: string
       };
     }
 
-    await Promise.all(allUserIds.map((id) => backfillMissingExtraCoinsForWallet(id)));
-    await Promise.all(allUserIds.map((id) => expireExtraCoins(id)));
+    await Promise.all(allUserIds.map((id) => backfillMissingExtraCoinsForWallet(id, role)));
+    await Promise.all(allUserIds.map((id) => expireExtraCoins(id, role)));
 
     const now = new Date();
     const expiringSoonDate = new Date(now.getTime() + EXPIRING_SOON_DAYS * 24 * 60 * 60 * 1000);
 
     const walletWhere =
       allUserIds.length === 1
-        ? { userId: allUserIds[0] }
-        : { userId: { in: allUserIds } };
+        ? { userId: allUserIds[0], walletRole: role }
+        : { userId: { in: allUserIds }, walletRole: role };
 
     const [walletRows, lifetimeExpiredAgg, earnedRows, usedRows, expiringRows] = await Promise.all([
       prisma.extraCoinWallet.findMany({ where: walletWhere }),
@@ -840,3 +994,4 @@ export async function getExtraCoinsWallet(userId: string, linkedUserIds?: string
     };
   }
 }
+

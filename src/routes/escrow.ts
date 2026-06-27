@@ -14,6 +14,17 @@ router.use(serviceAuthMiddleware);
  */
 router.post('/create', asyncHandler(EscrowController.createEscrow));
 
+router.post('/create-booking', asyncHandler(EscrowController.createBookingEscrow));
+
+router.patch('/:escrowId/attach-performer', asyncHandler(EscrowController.attachPerformer));
+
+router.patch('/:escrowId/reset-performer', asyncHandler(EscrowController.resetPerformer));
+
+router.patch(
+  '/:escrowId/reassign-recurring-visit',
+  asyncHandler(EscrowController.reassignRecurringVisit),
+);
+
 /**
  * GET /api/v1/escrow/status/:escrowId
  * Get escrow status by escrow ID

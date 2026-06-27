@@ -30,9 +30,7 @@ function getPrismaClient(): PrismaClient {
     // For Prisma 7+, pass the adapter to PrismaClient constructor
     prismaInstance = new PrismaClient({
       adapter,
-      log: env.NODE_ENV === 'development' 
-        ? ['query', 'error', 'warn'] 
-        : ['error'],
+      log: env.NODE_ENV === 'development' ? ['error', 'warn'] : ['error'],
     });
 
     logger.info('✅ Prisma Client initialized with Postgres adapter (Neon compatible)');
@@ -42,6 +40,26 @@ function getPrismaClient(): PrismaClient {
 
 // Export the Prisma client instance
 export const prisma = getPrismaClient();
+
+// Export the Prisma dev client instance (for dev database query)
+let prismaDevInstance: PrismaClient | null = null;
+
+function getPrismaDevClient(): PrismaClient | null {
+  const devUrl = env.DEV_POSTGRESDB_URI;
+  if (!devUrl) return null;
+
+  if (!prismaDevInstance) {
+    const adapter = new PrismaPg({ connectionString: devUrl });
+    prismaDevInstance = new PrismaClient({
+      adapter,
+      log: env.NODE_ENV === 'development' ? ['error', 'warn'] : ['error'],
+    });
+    logger.info('✅ Prisma Dev Client initialized with DEV_POSTGRESDB_URI adapter (Neon compatible)');
+  }
+  return prismaDevInstance;
+}
+
+export const prismaDev = getPrismaDevClient();
 
 /**
  * Connect to Postgres database via Prisma

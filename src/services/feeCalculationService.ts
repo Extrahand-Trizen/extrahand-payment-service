@@ -7,8 +7,13 @@
  */
 
 import logger from '../config/logger';
-import { Prisma } from '@prisma/client';
-import { getFeeStructure, getFeeStructureForCategory } from './feeConfigService';
+import { CategoryFeeMode, Prisma } from '@prisma/client';
+import {
+  getFeeStructure,
+  getFeeStructureForCategory,
+  pickCategoryFeeConfigKey,
+  resolveBiddingPayoutFeePercents,
+} from './feeConfigService';
 
 /**
  * Fee calculation result interface (for performer - legacy support)
@@ -193,12 +198,18 @@ export async function calculatePosterFees(
 
 /**
  * Calculate performer fees (what performer gets after deductions)
- * 
+ *
  * @param taskAmount - Task amount in rupees
+ * @param taskCategory - Category slug/key for CategoryFeeConfig (BIDDING mode)
  * @returns Performer fee breakdown
  */
-export async function calculatePerformerFees(taskAmount: number | Prisma.Decimal): Promise<PerformerFeeBreakdown> {
-  const feeStructure = await getFeeStructure();
+export async function calculatePerformerFees(
+  taskAmount: number | Prisma.Decimal,
+  taskCategory?: string,
+): Promise<PerformerFeeBreakdown> {
+  const feeStructure = taskCategory
+    ? await getFeeStructureForCategory(taskCategory, { mode: CategoryFeeMode.BIDDING })
+    : await getFeeStructure();
   const taskAmountDecimal = new Prisma.Decimal(taskAmount.toString());
 
   // Calculate platform fee (10-15% of task amount)
@@ -241,6 +252,55 @@ export async function calculatePerformerFees(taskAmount: number | Prisma.Decimal
       processingFeeSplitRatio: feeStructure.processingFees.splitRatio.performer,
       gstPercentage: feeStructure.platformFee.gstPercentage,
       tdsPercentage: feeStructure.processingFees.tdsPercentage,
+    },
+  };
+}
+
+/**
+ * Tasker payout estimate for bidding tasks — platform fee + GST from CategoryFeeConfig (BIDDING).
+ * Matches task-completion payout math (no TDS / Razorpay split on this path).
+ */
+export async function estimateBiddingTaskCompletionPayout(params: {
+  taskAmount: number | Prisma.Decimal;
+  taskCategory?: string;
+  categorySlug?: string;
+}): Promise<{
+  taskAmount: Prisma.Decimal;
+  platformCommission: Prisma.Decimal;
+  gstOnCommission: Prisma.Decimal;
+  netAmount: Prisma.Decimal;
+  metadata: {
+    categoryFeeKey?: string;
+    platformFeePercentage: number;
+    gstPercentage: number;
+  };
+}> {
+  const taskAmountDecimal = new Prisma.Decimal(params.taskAmount.toString());
+  const categoryFeeKey = pickCategoryFeeConfigKey(params.categorySlug, params.taskCategory);
+  const resolved = await resolveBiddingPayoutFeePercents({
+    taskCategory: params.taskCategory,
+    categorySlug: params.categorySlug ?? categoryFeeKey,
+  });
+
+  const platformCommission = taskAmountDecimal
+    .mul(resolved.platformFeePercentage)
+    .toDecimalPlaces(2);
+  const gstOnCommission = platformCommission
+    .mul(resolved.gstPercentage)
+    .toDecimalPlaces(2);
+  const netAmount = taskAmountDecimal
+    .sub(platformCommission.add(gstOnCommission))
+    .toDecimalPlaces(2);
+
+  return {
+    taskAmount: taskAmountDecimal,
+    platformCommission,
+    gstOnCommission,
+    netAmount: Prisma.Decimal.max(netAmount, new Prisma.Decimal('0.00')),
+    metadata: {
+      categoryFeeKey: resolved.categoryFeeKey,
+      platformFeePercentage: resolved.platformFeePercentage,
+      gstPercentage: resolved.gstPercentage,
     },
   };
 }
@@ -429,6 +489,75 @@ export async function calculateRefundWithCancellationFee(params: {
   feeBaseAmount?: number | Prisma.Decimal;
 }): Promise<CancellationFeeResult> {
   return await calculateCancellationFee(params);
+}
+
+/** Human-readable cancellation policy label for receipts and refund history. */
+export function describeCancellationPolicy(params: {
+  cancellationFeePercentage: number;
+  cancelledBy: 'poster' | 'performer';
+  assignedAt?: Date;
+  cancelledAt?: Date;
+  taskStartDate?: Date;
+}): { label: string; policyKey: string; feePercentDisplay: number } {
+  const pct = params.cancellationFeePercentage;
+  const feePercentDisplay = Math.round(pct * 100);
+
+  if (pct <= 0) {
+    if (
+      params.cancelledBy === 'poster' &&
+      params.assignedAt &&
+      params.cancelledAt
+    ) {
+      const minutes =
+        (params.cancelledAt.getTime() - params.assignedAt.getTime()) / (1000 * 60);
+      if (minutes <= 15) {
+        return {
+          label: 'Free cancellation within 15 minutes of helper assignment',
+          policyKey: 'poster_grace_15m',
+          feePercentDisplay: 0,
+        };
+      }
+    }
+    if (params.taskStartDate && params.cancelledAt) {
+      const hours =
+        (params.taskStartDate.getTime() - params.cancelledAt.getTime()) / (1000 * 60 * 60);
+      if (hours > 24) {
+        return {
+          label: 'Free cancellation — more than 24 hours before service start',
+          policyKey: 'poster_early',
+          feePercentDisplay: 0,
+        };
+      }
+    }
+    return {
+      label: 'No cancellation fee applied',
+      policyKey: 'none',
+      feePercentDisplay: 0,
+    };
+  }
+
+  if (params.cancelledBy === 'poster') {
+    if (feePercentDisplay === 10) {
+      return {
+        label: '10% cancellation fee — within 24 hours of service start',
+        policyKey: 'poster_medium',
+        feePercentDisplay,
+      };
+    }
+    if (feePercentDisplay === 20) {
+      return {
+        label: '20% cancellation fee — within 1 hour of service start',
+        policyKey: 'poster_late',
+        feePercentDisplay,
+      };
+    }
+  }
+
+  return {
+    label: `${feePercentDisplay}% cancellation fee applied`,
+    policyKey: 'custom',
+    feePercentDisplay,
+  };
 }
 
 /**

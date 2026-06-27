@@ -4,6 +4,7 @@ import { razorpay, RAZORPAY_CONFIG } from '../config/razorpay';
 import logger from '../config/logger';
 import { prisma } from '../config/prisma';
 import { isPostgresConnected } from '../config/database';
+import { buildRazorpayOrderNotes } from '../utils/paymentSanitizer';
 import {
   isReviewBypassPhone,
   isReviewBypassUid,
@@ -47,7 +48,7 @@ export const createOrder = async (amount: number, currency: string = 'INR', meta
       amount: amount, // Convert to paise
       currency,
       receipt: `receipt_${Date.now()}`,
-      notes: metadata,
+      notes: buildRazorpayOrderNotes(metadata),
     };
 
     const order = await razorpay.orders.create(options);
@@ -154,6 +155,7 @@ export const getOrderDetails = async (orderId: string) => {
         success: false,
         error: 'Order not found',
         statusCode: 404,
+        errorCode: 'PAYMENT_ORDER_NOT_FOUND',
       };
     }
 
@@ -175,11 +177,16 @@ export const getOrderDetails = async (orderId: string) => {
       return { 
         success: false, 
         error: 'Order not found',
-        statusCode: 404 
+        statusCode: 404,
+        errorCode: 'PAYMENT_ORDER_NOT_FOUND',
       };
     }
     
-    return { success: false, error: error.message || 'Failed to fetch order details' };
+    return {
+      success: false,
+      error: error.message || 'Failed to fetch order details',
+      errorCode: 'PAYMENT_ORDER_STATUS_FETCH_FAILED',
+    };
   }
 };
 

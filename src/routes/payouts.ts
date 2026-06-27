@@ -38,6 +38,12 @@ router.get('/status/:payoutId', asyncHandler(PayoutController.getPayoutStatus));
  */
 router.get('/escrow/:escrowId', asyncHandler(PayoutController.getPayoutsByEscrowId));
 
+/**
+ * GET /api/v1/payouts/ops/manual-queue
+ * List payout requests for operations portal (manual bank transfers).
+ */
+router.get('/ops/manual-queue', asyncHandler(PayoutController.listManualOpsQueue));
+
 export default router;
 
 

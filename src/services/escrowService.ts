@@ -118,6 +118,10 @@ async function convertPostgresEscrowToFrontendFormat(postgresEscrow: any): Promi
     razorpayOrderData: postgresEscrow.razorpayOrderData || null,
     razorpayPaymentData: postgresEscrow.razorpayPaymentData || null,
     metadata: postgresEscrow.metadata || null,
+    taskCategory: postgresEscrow.taskCategory || null,
+    appliedGstPercent: postgresEscrow.appliedGstPercent?.toString() ?? null,
+    appliedPlatformFeePercent: postgresEscrow.appliedPlatformFeePercent?.toString() ?? null,
+    appliedRazorpayGstPercent: postgresEscrow.appliedRazorpayGstPercent?.toString() ?? null,
     createdAt: postgresEscrow.createdAt,
     updatedAt: postgresEscrow.updatedAt,
   };

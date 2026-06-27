@@ -11,6 +11,7 @@ import {
   cancelPayment as cancelPaymentOrder,
   cancelEscrow,
   cancelEscrowByTaskId,
+  cancelEscrowByBookingOrderId,
 } from '../services/cancellationService';
 import { BadRequestError, NotFoundError } from '../errors/AppError';
 import logger from '../config/logger';
@@ -235,6 +236,7 @@ export class PaymentController {
       razorpayOrderId,
       escrowId,
       taskId,
+      bookingOrderId,
       reason,
       userId,
       cancelledBy,
@@ -250,6 +252,7 @@ export class PaymentController {
       razorpayOrderId,
       escrowId,
       taskId,
+      bookingOrderId,
       cancelledBy,
       taskStartDate,
       assignedAt,
@@ -292,6 +295,19 @@ export class PaymentController {
         catalogId: typeof catalogId === 'string' ? catalogId : undefined,
         partnerReachedLocation: Boolean(partnerReachedLocation),
       });
+    } else if (bookingOrderId) {
+      result = await cancelEscrowByBookingOrderId({
+        bookingOrderId: String(bookingOrderId),
+        reason,
+        userId,
+        cancelledBy,
+        taskStartDate: taskStart,
+        assignedAt: assignedAtDate,
+        feeBaseAmount: feeBaseToPass,
+        taskTitle: typeof taskTitle === 'string' ? taskTitle : undefined,
+        catalogId: typeof catalogId === 'string' ? catalogId : undefined,
+        partnerReachedLocation: Boolean(partnerReachedLocation),
+      });
     } else if (taskId) {
       result = await cancelEscrowByTaskId({
         taskId,
@@ -306,7 +322,9 @@ export class PaymentController {
         partnerReachedLocation: Boolean(partnerReachedLocation),
       });
     } else {
-      throw new BadRequestError('Either razorpayOrderId, escrowId, or taskId is required');
+      throw new BadRequestError(
+        'Either razorpayOrderId, escrowId, bookingOrderId, or taskId is required',
+      );
     }
 
     if (!result.success) {

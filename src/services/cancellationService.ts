@@ -395,6 +395,63 @@ export async function cancelEscrow(params: {
 }
 
 /**
+ * Cancel Book Now escrow by booking order id (line task ids may differ from escrow.taskId).
+ */
+export async function cancelEscrowByBookingOrderId(params: {
+  bookingOrderId: string;
+  reason?: string;
+  userId?: string;
+  cancelledBy?: 'poster' | 'performer';
+  taskStartDate?: Date;
+  assignedAt?: Date;
+  feeBaseAmount?: number;
+  taskTitle?: string;
+  catalogId?: string | null;
+  partnerReachedLocation?: boolean;
+}): Promise<{ success: boolean; cancelled?: boolean; refundRequired?: boolean; refund?: any; error?: string }> {
+  try {
+    const {
+      bookingOrderId,
+      reason,
+      userId,
+      cancelledBy,
+      taskStartDate,
+      assignedAt,
+      feeBaseAmount,
+      taskTitle,
+      catalogId,
+      partnerReachedLocation,
+    } = params;
+
+    if (!isPostgresConnected()) {
+      return { success: false, error: 'Postgres not connected' };
+    }
+
+    const { findEscrowByBookingOrderId } = await import('./escrowService');
+    const postgresEscrow = await findEscrowByBookingOrderId(bookingOrderId);
+    if (!postgresEscrow) {
+      return { success: false, error: 'Escrow not found for booking' };
+    }
+
+    return await cancelPayment({
+      razorpayOrderId: postgresEscrow.razorpayOrderId,
+      reason,
+      userId,
+      cancelledBy,
+      taskStartDate,
+      assignedAt,
+      feeBaseAmount,
+      taskTitle,
+      catalogId,
+      partnerReachedLocation,
+    });
+  } catch (error: any) {
+    logger.error('❌ Error cancelling escrow by booking order ID:', error);
+    return { success: false, error: error.message || 'Failed to cancel escrow' };
+  }
+}
+
+/**
  * Cancel escrow by task ID
  * 
  * @param taskId - Task ID

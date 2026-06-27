@@ -71,25 +71,39 @@ const effectiveDateFilter = (now: Date) => ({
   ],
 });
 
+async function findGstPercentageForKey(
+  key: string,
+  mode: CategoryFeeMode,
+  now: Date,
+): Promise<number | null> {
+  const cfg = await withDbRetry(() =>
+    prisma.categoryFeeConfig.findFirst({
+      where: {
+        categoryKey: key,
+        mode,
+        ...effectiveDateFilter(now),
+      },
+      orderBy: { effectiveFrom: 'desc' },
+    }),
+  );
+
+  if (cfg?.gstPercentage != null && cfg.gstPercentage !== undefined) {
+    return Number(cfg.gstPercentage);
+  }
+  return null;
+}
+
 async function queryGstPercentageForCategory(categoryKey: string): Promise<number | null> {
   const lookupKeys = getCategoryLookupKeys(categoryKey);
   const now = new Date();
 
   for (const key of lookupKeys) {
-    const cfg = await withDbRetry(() =>
-      prisma.categoryFeeConfig.findFirst({
-        where: {
-          categoryKey: key,
-          mode: BOOK_NOW_MODE,
-          ...effectiveDateFilter(now),
-        },
-        orderBy: { effectiveFrom: 'desc' },
-      }),
-    );
+    const bookNowRate = await findGstPercentageForKey(key, BOOK_NOW_MODE, now);
+    if (bookNowRate != null) return bookNowRate;
 
-    if (cfg?.gstPercentage != null && cfg.gstPercentage !== undefined) {
-      return Number(cfg.gstPercentage);
-    }
+    // Deployed prod may only have BIDDING rows (e.g. home-cleaning @ 5%) until BOOK_NOW is seeded.
+    const biddingRate = await findGstPercentageForKey(key, CategoryFeeMode.BIDDING, now);
+    if (biddingRate != null) return biddingRate;
   }
 
   if (categoryKey !== 'default') {

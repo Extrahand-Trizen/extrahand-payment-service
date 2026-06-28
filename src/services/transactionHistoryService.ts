@@ -881,8 +881,13 @@ export async function getUserTransactions(
         const activeBookNowLineCount = bookNowLineItems.filter(
           (row) => row.taskId && !cancelledLineTaskIds.includes(String(row.taskId)),
         ).length;
+        const totalBookNowLineCount = Math.max(
+          bookNowLineItems.length,
+          Number(em.itemCount) || 0,
+        );
         const bookNowPartiallyCancelled =
           isBookNowPayment &&
+          totalBookNowLineCount > 1 &&
           cancelledLineTaskIds.length > 0 &&
           activeBookNowLineCount > 0;
         const paymentLineItems: PosterPaymentLineItem[] = [

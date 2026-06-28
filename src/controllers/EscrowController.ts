@@ -8,6 +8,7 @@ import {
   getEscrowStatus,
   getEscrowByTaskId,
   getEscrowByTaskIdAndVisitId,
+  getEscrowByBookingOrderId,
   releaseEscrow,
   updateEscrowAutoRelease,
 } from '../services/escrowService';
@@ -222,6 +223,25 @@ export class EscrowController {
     res.json({
       success: true,
       escrow: result.escrow,
+    });
+  }
+
+  /**
+   * GET /api/v1/escrow/booking-order/:bookingOrderId
+   * Get escrow by Book Now booking order id
+   */
+  static async getEscrowByBookingOrderId(req: Request, res: Response): Promise<void> {
+    const { bookingOrderId } = req.params;
+
+    const escrow = await getEscrowByBookingOrderId(bookingOrderId);
+
+    if (!escrow) {
+      throw new NotFoundError('Escrow not found for this booking order');
+    }
+
+    res.json({
+      success: true,
+      escrow,
     });
   }
 

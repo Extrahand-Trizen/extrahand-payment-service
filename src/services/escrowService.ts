@@ -1300,6 +1300,40 @@ export async function getEscrowByOrderId(razorpayOrderId: string): Promise<any |
   }
 }
 
+async function findEscrowByBookNowLineTaskId(taskId: string) {
+  const trimmed = taskId?.trim();
+  if (!trimmed) return null;
+
+  const recentBookNow = await prisma.escrow.findMany({
+    where: {
+      OR: [
+        { bookingOrderId: { not: null } },
+        { metadata: { path: ['bookingMode'], equals: 'book_now' } },
+      ],
+    },
+    orderBy: { createdAt: 'desc' },
+    take: 80,
+  });
+
+  for (const row of recentBookNow) {
+    const meta =
+      row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata)
+        ? (row.metadata as Record<string, unknown>)
+        : {};
+    const lineItems = Array.isArray(meta.bookNowLineItems) ? meta.bookNowLineItems : [];
+    if (
+      lineItems.some((item) => {
+        const rowItem = item as { taskId?: string };
+        return String(rowItem?.taskId || '').trim() === trimmed;
+      })
+    ) {
+      return row;
+    }
+  }
+
+  return null;
+}
+
 /**
  * Get escrow by task ID
  * Now uses Postgres only
@@ -1319,9 +1353,38 @@ export async function getEscrowByTaskId(taskId: string): Promise<any | null> {
       },
     });
 
-    return postgresEscrow ? await convertPostgresEscrowToFrontendFormat(postgresEscrow) : null;
+    if (postgresEscrow) {
+      return convertPostgresEscrowToFrontendFormat(postgresEscrow);
+    }
+
+    const byBookingOrderId = await findEscrowByBookingOrderId(taskId);
+    if (byBookingOrderId) {
+      return convertPostgresEscrowToFrontendFormat(byBookingOrderId);
+    }
+
+    const byLineTask = await findEscrowByBookNowLineTaskId(taskId);
+    if (byLineTask) {
+      return convertPostgresEscrowToFrontendFormat(byLineTask);
+    }
+
+    return null;
   } catch (error: any) {
     logger.error('❌ Error getting escrow by task ID:', error);
+    return null;
+  }
+}
+
+/** Book Now: escrow is keyed by booking order id, not always the line task id. */
+export async function getEscrowByBookingOrderId(bookingOrderId: string): Promise<any | null> {
+  try {
+    if (!isPostgresConnected()) {
+      return null;
+    }
+
+    const postgresEscrow = await findEscrowByBookingOrderId(bookingOrderId);
+    return postgresEscrow ? await convertPostgresEscrowToFrontendFormat(postgresEscrow) : null;
+  } catch (error: any) {
+    logger.error('❌ Error getting escrow by booking order ID:', error);
     return null;
   }
 }

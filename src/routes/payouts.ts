@@ -39,6 +39,18 @@ router.get('/status/:payoutId', asyncHandler(PayoutController.getPayoutStatus));
 router.get('/escrow/:escrowId', asyncHandler(PayoutController.getPayoutsByEscrowId));
 
 /**
+ * GET /api/v1/payouts/task/:taskId/bundle
+ * Combined escrow + payout + wallet + fee estimate for a task
+ */
+router.get('/task/:taskId/bundle', asyncHandler(PayoutController.getTaskPayoutBundle));
+
+/**
+ * POST /api/v1/payouts/status/batch
+ * Batch payout status lookup
+ */
+router.post('/status/batch', asyncHandler(PayoutController.getPayoutStatusBatch));
+
+/**
  * GET /api/v1/payouts/ops/manual-queue
  * List payout requests for operations portal (manual bank transfers).
  */

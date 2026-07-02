@@ -881,7 +881,7 @@ export async function getExtraCoinsWallet(
       };
     }
 
-    await Promise.all(allUserIds.map((id) => backfillMissingExtraCoinsForWallet(id, role)));
+    // Expire stale coins only — awards happen at payout completion (payoutService), not on read.
     await Promise.all(allUserIds.map((id) => expireExtraCoins(id, role)));
 
     const now = new Date();

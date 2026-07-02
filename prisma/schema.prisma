@@ -88,6 +88,10 @@ model Escrow {
   @@index([performerUid, status, createdAt(sort: Desc)])
   @@index([status, autoReleaseDate])
   @@index([createdAt])
+  @@index([razorpayPaymentId])
+  @@index([paymentStatus, createdAt])
+  @@index([status, heldAt])
+  @@index([paymentStatus, updatedAt])
 }
 
 // Ledger - Immutable transaction history
@@ -196,6 +200,8 @@ model Payout {
   @@index([performerUid])
   @@index([performerUid, createdAt(sort: Desc)])
   @@index([performerUid, status, createdAt(sort: Desc)])
+  @@index([performerUid, type, status])
+  @@index([escrowId, createdAt(sort: Desc)])
   @@index([status])
   @@index([createdAt])
 }

@@ -1396,19 +1396,6 @@ export async function getTransactionSummary(
       ),
     ];
 
-    const escrowWhere: Prisma.EscrowWhereInput = {
-      posterUid: { in: uidList },
-      status: { in: ['held', 'released', 'refunded'] },
-      ...(startDate || endDate
-        ? {
-            createdAt: {
-              ...(startDate ? { gte: startDate } : {}),
-              ...(endDate ? { lte: endDate } : {}),
-            },
-          }
-        : {}),
-    };
-
     const payoutWhere: Prisma.PayoutWhereInput = {
       performerUid: { in: uidList },
       status: { in: Array.from(SUCCESSFUL_PAYOUT_STATUSES) },
@@ -1437,7 +1424,16 @@ export async function getTransactionSummary(
         : {}),
     };
 
-    const [payoutsAgg, refundsAgg, compensationAgg] = await Promise.all([
+    const paymentStatuses = ['held', 'released', 'refunded'];
+    const dateConditions: Prisma.Sql[] = [];
+    if (startDate) dateConditions.push(Prisma.sql`"createdAt" >= ${startDate}`);
+    if (endDate) dateConditions.push(Prisma.sql`"createdAt" <= ${endDate}`);
+    const paymentDateSql =
+      dateConditions.length > 0
+        ? Prisma.sql`AND ${Prisma.join(dateConditions, ' AND ')}`
+        : Prisma.empty;
+
+    const [payoutsAgg, refundsAgg, compensationAgg, paymentAggRows] = await Promise.all([
       prisma.payout.aggregate({
         where: payoutWhere,
         _sum: { netAmount: true },
@@ -1461,23 +1457,26 @@ export async function getTransactionSummary(
         _sum: { toOtherParty: true },
         _count: { id: true },
       }),
+      prisma.$queryRaw<Array<{ total: Prisma.Decimal; count: bigint }>>`
+        SELECT
+          COALESCE(SUM(latest."amountInRupees"), 0) AS total,
+          COUNT(*)::bigint AS count
+        FROM (
+          SELECT DISTINCT ON ("taskId")
+            "taskId",
+            "amountInRupees"
+          FROM "Escrow"
+          WHERE "posterUid" IN (${Prisma.join(uidList)})
+            AND "status" IN (${Prisma.join(paymentStatuses)})
+            ${paymentDateSql}
+          ORDER BY "taskId", "createdAt" DESC
+        ) latest
+      `,
     ]);
 
-    // One logical "payment" per task for posters (matches dedupe in getUserTransactions).
-    const posterEscrowsLatest = await prisma.escrow.findMany({
-      where: escrowWhere,
-      select: { taskId: true, amountInRupees: true, createdAt: true },
-      orderBy: { createdAt: 'desc' },
-    });
-    const seenPaymentTask = new Set<string>();
-    let totalPayments = new Prisma.Decimal('0');
-    let paymentEscrowCount = 0;
-    for (const row of posterEscrowsLatest) {
-      if (seenPaymentTask.has(row.taskId)) continue;
-      seenPaymentTask.add(row.taskId);
-      totalPayments = totalPayments.add(row.amountInRupees);
-      paymentEscrowCount += 1;
-    }
+    const paymentAgg = paymentAggRows[0];
+    const totalPayments = paymentAgg?.total ?? new Prisma.Decimal('0');
+    const paymentEscrowCount = Number(paymentAgg?.count ?? 0);
 
     const totalPayouts = payoutsAgg._sum.netAmount || new Prisma.Decimal('0');
     const totalRefunds = refundsAgg._sum.refundAmount || new Prisma.Decimal('0');

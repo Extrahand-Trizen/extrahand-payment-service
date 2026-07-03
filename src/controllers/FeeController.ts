@@ -1,7 +1,8 @@
 import { Request, Response } from 'express';
 import { CategoryFeeMode } from '@prisma/client';
 import { getFeeStructure, listCategoryFeeConfigs, upsertCategoryFeeConfig, deleteCategoryFeeConfig, getFeeStructureForCategory } from '../services/feeConfigService';
-import { calculatePosterFees } from '../services/feeCalculationService';
+import { calculatePosterFees, estimateBiddingTaskCompletionPayout } from '../services/feeCalculationService';
+import { pickCategoryFeeConfigKey } from '../services/feeConfigService';
 import {
   calculateBookNowOrderTotals,
   type BookNowGstLineInput,
@@ -75,7 +76,10 @@ export class FeeController {
       }
 
       const taskAmount = Number(amount);
-      const categoryKey = typeof taskCategory === 'string' && taskCategory.trim() ? taskCategory.trim() : undefined;
+      const categoryKey = pickCategoryFeeConfigKey(
+        typeof req.query.categorySlug === 'string' ? req.query.categorySlug : undefined,
+        typeof taskCategory === 'string' ? taskCategory.trim() : undefined,
+      );
 
       // Calculate fees for the poster (category-aware when taskCategory provided)
       const fees = await calculatePosterFees(taskAmount, categoryKey);
@@ -104,6 +108,46 @@ export class FeeController {
       return res.status(500).json({
         success: false,
         error: error.message || 'Failed to calculate fees',
+      });
+    }
+  });
+
+  /**
+   * GET /api/v1/fees/performer-payout-estimate?amount=&taskCategory=&categorySlug=
+   * Tasker payout estimate — platform fee + GST from CategoryFeeConfig (BIDDING).
+   */
+  static estimatePerformerPayout = asyncHandler(async (req: Request, res: Response) => {
+    try {
+      const { amount, taskCategory, categorySlug } = req.query;
+
+      if (!amount || isNaN(Number(amount)) || Number(amount) <= 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'Amount is required and must be a positive number',
+        });
+      }
+
+      const estimate = await estimateBiddingTaskCompletionPayout({
+        taskAmount: Number(amount),
+        taskCategory: typeof taskCategory === 'string' ? taskCategory.trim() : undefined,
+        categorySlug: typeof categorySlug === 'string' ? categorySlug.trim() : undefined,
+      });
+
+      return res.status(200).json({
+        success: true,
+        estimate: {
+          taskAmount: Number(estimate.taskAmount),
+          platformCommission: Number(estimate.platformCommission),
+          gstOnCommission: Number(estimate.gstOnCommission),
+          netAmount: Number(estimate.netAmount),
+          metadata: estimate.metadata,
+        },
+      });
+    } catch (error: any) {
+      logger.error('Error estimating performer payout:', error);
+      return res.status(500).json({
+        success: false,
+        error: error.message || 'Failed to estimate performer payout',
       });
     }
   });

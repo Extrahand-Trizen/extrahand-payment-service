@@ -32,6 +32,15 @@ router.patch(
 router.get('/status/:escrowId', asyncHandler(EscrowController.getEscrowStatus));
 
 /**
+ * GET /api/v1/escrow/booking-order/:bookingOrderId
+ * Get escrow by Book Now booking order id
+ */
+router.get(
+  '/booking-order/:bookingOrderId',
+  asyncHandler(EscrowController.getEscrowByBookingOrderId),
+);
+
+/**
  * GET /api/v1/escrow/task/:taskId
  * Get escrow by task ID
  */

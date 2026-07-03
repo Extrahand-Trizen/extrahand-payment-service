@@ -19,7 +19,7 @@
     "test": "echo \"No tests specified\" && exit 0",
     "lint": "eslint src --ext .ts",
     "health": "curl -f http://localhost:4003/api/v1/health || exit 1",
-    "test:bank-crypto": "npm run build && node --test dist/utils/bankFieldCrypto.test.js",
+    "test:bank-crypto": "node --require ts-node/register/transpile-only --test src/utils/bankFieldCrypto.test.ts src/utils/queryDateRange.test.ts",
     "migrate:bank-encryption": "ts-node --require dotenv/config scripts/run-bank-encryption-migration.ts",
     "sync:postgres-dev-to-prod": "ts-node --require dotenv/config scripts/sync-dev-postgres-to-prod.ts",
     "sync:category-fees-dev-to-prod": "ts-node --require dotenv/config scripts/sync-category-fees-dev-to-prod.ts"

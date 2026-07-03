@@ -122,6 +122,40 @@ export function getCategoryLookupKeys(categoryKey?: string): string[] {
   return Array.from(new Set([raw, normalized, ...aliases].filter(Boolean)));
 }
 
+/**
+ * Prefer catalog slugs (`home-cleaning`) over task enums (`cleaning`) for CategoryFeeConfig.
+ */
+export function pickCategoryFeeConfigKey(
+  ...candidates: Array<string | null | undefined>
+): string | undefined {
+  const normalized = candidates
+    .map((value) => String(value || '').trim())
+    .filter(Boolean);
+  if (!normalized.length) return undefined;
+
+  const slugLike = normalized.find((value) => value.includes('-') || value.includes('_'));
+  return slugLike ?? normalized[0];
+}
+
+/** Resolve the CategoryFeeConfig key from escrow/task fields. */
+export function resolveEscrowCategoryFeeConfigKey(params: {
+  taskCategory?: string | null;
+  categorySlug?: string | null;
+  catalogId?: string | null;
+  metadata?: Record<string, unknown> | null;
+}): string | undefined {
+  const meta = params.metadata || {};
+  return pickCategoryFeeConfigKey(
+    params.categorySlug,
+    params.catalogId,
+    typeof meta.categorySlug === 'string' ? meta.categorySlug : undefined,
+    typeof meta.catalogId === 'string' ? meta.catalogId : undefined,
+    typeof meta.taskCategorySnapshot === 'string' ? meta.taskCategorySnapshot : undefined,
+    params.taskCategory,
+    typeof meta.taskCategory === 'string' ? meta.taskCategory : undefined,
+  );
+}
+
 export type CategoryFeeLookupOptions = {
   mode?: CategoryFeeMode;
   /** Task booking source — `book_now` maps to BOOK_NOW fee configs. */
@@ -132,6 +166,28 @@ function resolveCategoryFeeMode(options?: CategoryFeeLookupOptions): CategoryFee
   if (options?.mode) return options.mode;
   if (options?.bookingSource === 'book_now') return CategoryFeeMode.BOOK_NOW;
   return CategoryFeeMode.BIDDING;
+}
+
+/** Live BIDDING payout fee percents from CategoryFeeConfig (tasker payout / estimate). */
+export async function resolveBiddingPayoutFeePercents(params: {
+  taskCategory?: string | null;
+  categorySlug?: string | null;
+  catalogId?: string | null;
+  metadata?: Record<string, unknown> | null;
+}): Promise<{
+  categoryFeeKey?: string;
+  platformFeePercentage: number;
+  gstPercentage: number;
+}> {
+  const categoryFeeKey = resolveEscrowCategoryFeeConfigKey(params);
+  const feeStructure = await getFeeStructureForCategory(categoryFeeKey, {
+    mode: CategoryFeeMode.BIDDING,
+  });
+  return {
+    categoryFeeKey,
+    platformFeePercentage: feeStructure.platformFee.percentage,
+    gstPercentage: feeStructure.platformFee.gstPercentage,
+  };
 }
 
 /**

@@ -9,7 +9,7 @@ import {
 } from '../utils/recurringPayoutDisplay';
 import { isBookNowEscrowRecord } from './escrowService';
 
-const SUCCESSFUL_ESCROW_PAYMENT_STATUSES = new Set(['held', 'released']);
+const SUCCESSFUL_ESCROW_PAYMENT_STATUSES = new Set(['held', 'released', 'refunded']);
 const SUCCESSFUL_PAYOUT_STATUSES = new Set(['completed', 'released']);
 
 export interface Transaction {
@@ -881,9 +881,13 @@ export async function getUserTransactions(
         const activeBookNowLineCount = bookNowLineItems.filter(
           (row) => row.taskId && !cancelledLineTaskIds.includes(String(row.taskId)),
         ).length;
+        const totalBookNowLineCount = Math.max(
+          bookNowLineItems.length,
+          Number(em.itemCount) || 0,
+        );
         const bookNowPartiallyCancelled =
           isBookNowPayment &&
-          bookNowLineItems.length > 1 &&
+          totalBookNowLineCount > 1 &&
           cancelledLineTaskIds.length > 0 &&
           activeBookNowLineCount > 0;
         const paymentLineItems: PosterPaymentLineItem[] = [
@@ -1394,7 +1398,7 @@ export async function getTransactionSummary(
 
     const escrowWhere: Prisma.EscrowWhereInput = {
       posterUid: { in: uidList },
-      status: { in: Array.from(SUCCESSFUL_ESCROW_PAYMENT_STATUSES) },
+      status: { in: ['held', 'released', 'refunded'] },
       ...(startDate || endDate
         ? {
             createdAt: {

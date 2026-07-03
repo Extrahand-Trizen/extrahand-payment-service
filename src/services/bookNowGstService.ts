@@ -1,6 +1,9 @@
+import { CategoryFeeMode ,Prisma} from '@prisma/client';
 import logger from '../config/logger';
 import { prisma } from '../config/prisma';
 import { getCategoryLookupKeys } from './feeConfigService';
+
+const BOOK_NOW_MODE = CategoryFeeMode.BOOK_NOW;
 
 export type BookNowGstLineInput = {
   categorySlug: string;
@@ -23,8 +26,41 @@ export type BookNowOrderTotals = {
   categories: BookNowCategoryGstBreakdown[];
 };
 
+const GST_CACHE_TTL_MS = 5 * 60 * 1000;
+const FALLBACK_GST_PERCENTAGE = parseFloat(process.env.GST_PERCENTAGE || '0.18');
+
+const gstCache = new Map<string, { value: number | null; timestamp: number }>();
+
 function round2(value: number): number {
   return Math.round(value * 100) / 100;
+}
+
+function isPrismaUnreachable(error: unknown): boolean {
+  return (
+    error instanceof Prisma.PrismaClientKnownRequestError &&
+    (error.code === 'P1001' || error.code === 'P1017')
+  );
+}
+
+async function withDbRetry<T>(fn: () => Promise<T>, retries = 2): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (!isPrismaUnreachable(error) || attempt === retries) {
+        throw error;
+      }
+      const delayMs = 750 * (attempt + 1);
+      logger.warn('[bookNowGst] Postgres unreachable, retrying', {
+        attempt: attempt + 1,
+        delayMs,
+      });
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  throw lastError;
 }
 
 const effectiveDateFilter = (now: Date) => ({
@@ -35,39 +71,99 @@ const effectiveDateFilter = (now: Date) => ({
   ],
 });
 
-async function loadGstPercentageForCategory(categoryKey: string): Promise<number | null> {
+async function findGstPercentageForKey(
+  key: string,
+  mode: CategoryFeeMode,
+  now: Date,
+): Promise<number | null> {
+  const cfg = await withDbRetry(() =>
+    prisma.categoryFeeConfig.findFirst({
+      where: {
+        categoryKey: key,
+        mode,
+        ...effectiveDateFilter(now),
+      },
+      orderBy: { effectiveFrom: 'desc' },
+    }),
+  );
+
+  if (cfg?.gstPercentage != null && cfg.gstPercentage !== undefined) {
+    return Number(cfg.gstPercentage);
+  }
+  return null;
+}
+
+async function queryGstPercentageForCategory(categoryKey: string): Promise<number | null> {
   const lookupKeys = getCategoryLookupKeys(categoryKey);
   const now = new Date();
 
   for (const key of lookupKeys) {
-    const cfg = await prisma.categoryFeeConfig.findFirst({
-      where: {
-        categoryKey: key,
-        ...effectiveDateFilter(now),
-      },
-      orderBy: { effectiveFrom: 'desc' },
-    });
+    const bookNowRate = await findGstPercentageForKey(key, BOOK_NOW_MODE, now);
+    if (bookNowRate != null) return bookNowRate;
 
-    if (cfg?.gstPercentage != null && cfg.gstPercentage !== undefined) {
-      return Number(cfg.gstPercentage);
+    // Deployed prod may only have BIDDING rows (e.g. home-cleaning @ 5%) until BOOK_NOW is seeded.
+    const biddingRate = await findGstPercentageForKey(key, CategoryFeeMode.BIDDING, now);
+    if (biddingRate != null) return biddingRate;
+  }
+
+  if (categoryKey !== 'default') {
+    const defaultCfg = await withDbRetry(() =>
+      prisma.categoryFeeConfig.findUnique({
+        where: {
+          categoryKey_mode: { categoryKey: 'default', mode: CategoryFeeMode.BOOK_NOW },
+        },
+      }),
+    );
+    if (defaultCfg?.gstPercentage != null && defaultCfg.gstPercentage !== undefined) {
+      return Number(defaultCfg.gstPercentage);
     }
   }
 
   return null;
 }
 
+async function loadGstPercentageForCategory(categoryKey: string): Promise<number | null> {
+  const cacheKey = categoryKey.trim().toLowerCase() || 'default';
+  const cached = gstCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < GST_CACHE_TTL_MS) {
+    return cached.value;
+  }
+
+  try {
+    const value = await queryGstPercentageForCategory(cacheKey);
+    gstCache.set(cacheKey, { value, timestamp: Date.now() });
+    return value;
+  } catch (error) {
+    if (cached) {
+      logger.warn('[bookNowGst] using stale GST cache after DB error', { cacheKey });
+      return cached.value;
+    }
+    throw error;
+  }
+}
+
 async function resolveBookNowGstPercentage(categoryKey: string): Promise<number> {
-  const resolved = await loadGstPercentageForCategory(categoryKey);
-  if (resolved != null && Number.isFinite(resolved)) {
-    return resolved;
+  try {
+    const resolved = await loadGstPercentageForCategory(categoryKey);
+    if (resolved != null && Number.isFinite(resolved)) {
+      return resolved;
+    }
+
+    if (categoryKey !== 'default') {
+      const defaultRate = await loadGstPercentageForCategory('default');
+      if (defaultRate != null && Number.isFinite(defaultRate)) {
+        return defaultRate;
+      }
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logger.warn('[bookNowGst] falling back to default GST after DB error', {
+      categoryKey,
+      message,
+    });
   }
 
-  const defaultRate = await loadGstPercentageForCategory('default');
-  if (defaultRate != null && Number.isFinite(defaultRate)) {
-    return defaultRate;
-  }
-
-  return 0;
+  return Number.isFinite(FALLBACK_GST_PERCENTAGE) ? FALLBACK_GST_PERCENTAGE : 0;
 }
 
 /**

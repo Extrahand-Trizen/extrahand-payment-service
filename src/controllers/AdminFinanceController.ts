@@ -591,7 +591,12 @@ export class AdminFinanceController {
 
     const updated = await targetPrisma.payout.update({
       where: { id: payout.id },
-      data: { status },
+      data: {
+        status,
+        ...(status === 'completed'
+          ? { completedAt: payout.completedAt ?? new Date() }
+          : {}),
+      },
     });
 
     await targetPrisma.auditLog.create({

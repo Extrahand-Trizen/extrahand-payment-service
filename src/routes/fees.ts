@@ -18,6 +18,12 @@ router.get('/structure', FeeController.getFeeStructure);
 router.get('/calculate', FeeController.calculateFees);
 
 /**
+ * GET /api/v1/fees/performer-payout-estimate?amount=:amount&taskCategory=:taskCategory
+ * Tasker payout estimate — GST on platform fee from CategoryFeeConfig (BIDDING).
+ */
+router.get('/performer-payout-estimate', FeeController.estimatePerformerPayout);
+
+/**
  * POST /api/v1/fees/book-now/calculate
  * Book Now: per-category GST on service subtotals (customer payment only).
  */

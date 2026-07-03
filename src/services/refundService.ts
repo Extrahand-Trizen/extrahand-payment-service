@@ -1020,3 +1020,72 @@ export async function processBookNowLineItemRefund(params: {
   }
 }
 
+type RazorpayRefundWebhookPayload = {
+  refund?: { entity?: { id?: string; status?: string } };
+  payment?: { entity?: { id?: string } };
+};
+
+/**
+ * Mark refund completed (or failed) when Razorpay sends refund webhooks.
+ * Idempotent — safe when processRefund already set status to completed.
+ */
+export async function completeRefundFromRazorpayWebhook(
+  payload: RazorpayRefundWebhookPayload,
+): Promise<void> {
+  if (!isPostgresConnected()) {
+    logger.warn('Refund webhook skipped — Postgres not connected');
+    return;
+  }
+
+  const refundEntity = payload?.refund?.entity;
+  const razorpayRefundId = refundEntity?.id;
+  if (!razorpayRefundId) {
+    logger.warn('Refund webhook missing refund entity id');
+    return;
+  }
+
+  const razorpayStatus = String(refundEntity?.status || '').trim().toLowerCase();
+
+  if (razorpayStatus === 'failed') {
+    await prisma.refund.updateMany({
+      where: { razorpayRefundId },
+      data: {
+        status: 'failed',
+        errorMessage: 'Razorpay reported refund failure',
+      },
+    });
+    logger.info('Refund marked failed from Razorpay webhook', { razorpayRefundId });
+    return;
+  }
+
+  const terminalStatuses = new Set(['processed', 'completed', 'success']);
+  if (!terminalStatuses.has(razorpayStatus) && razorpayStatus) {
+    logger.info('Refund webhook received — non-terminal Razorpay status', {
+      razorpayRefundId,
+      razorpayStatus,
+    });
+    return;
+  }
+
+  const result = await prisma.refund.updateMany({
+    where: {
+      razorpayRefundId,
+      status: { in: ['pending', 'processing'] },
+    },
+    data: {
+      status: 'completed',
+      completedAt: new Date(),
+    },
+  });
+
+  if (result.count > 0) {
+    logger.info('Refund marked completed from Razorpay webhook', { razorpayRefundId });
+    return;
+  }
+
+  const existing = await prisma.refund.findUnique({ where: { razorpayRefundId } });
+  if (!existing) {
+    logger.warn('Refund webhook for unknown razorpayRefundId', { razorpayRefundId });
+  }
+}
+

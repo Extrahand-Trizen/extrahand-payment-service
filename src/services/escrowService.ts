@@ -7,9 +7,14 @@ import { REVIEW_ORDER_ID_PREFIX } from '../utils/reviewBypass';
 import { createOrder, getOrderDetails } from './paymentService';
 import { sanitizeRazorpayOrderData, sanitizeRazorpayData, sanitizeRazorpayPaymentData } from '../utils/paymentSanitizer';
 import { prisma, prismaDev } from '../config/prisma';
-import { getFeeStructureForCategory } from './feeConfigService';
+import { CategoryFeeMode, Prisma } from '@prisma/client';
+import {
+  getFeeStructureForCategory,
+  pickCategoryFeeConfigKey,
+  resolveBiddingPayoutFeePercents,
+  resolveEscrowCategoryFeeConfigKey,
+} from './feeConfigService';
 import { createLedgerEntry, getEscrowBalance } from './ledgerService';
-import { Prisma } from '@prisma/client';
 import { EmailServiceClient } from '../clients/EmailServiceClient';
 import { InAppNotificationClient } from '../clients/InAppNotificationClient';
 import { fireWhatsAppNotify } from '../clients/WhatsAppClient';
@@ -260,6 +265,28 @@ async function convertPostgresEscrowToFrontendFormat(postgresEscrow: any): Promi
       ? escrowMeta.taskTitle.trim()
       : undefined;
 
+  let appliedPlatformFeePercent = postgresEscrow.appliedPlatformFeePercent?.toString() ?? null;
+  let appliedGstPercent = postgresEscrow.appliedGstPercent?.toString() ?? null;
+
+  if (!isBookNowEscrowRecord(postgresEscrow)) {
+    try {
+      const resolved = await resolveBiddingPayoutFeePercents({
+        taskCategory: postgresEscrow.taskCategory,
+        categorySlug:
+          typeof escrowMeta.categorySlug === 'string' ? escrowMeta.categorySlug : undefined,
+        catalogId: typeof escrowMeta.catalogId === 'string' ? escrowMeta.catalogId : undefined,
+        metadata: escrowMeta,
+      });
+      appliedPlatformFeePercent = String(resolved.platformFeePercentage);
+      appliedGstPercent = String(resolved.gstPercentage);
+    } catch (error: any) {
+      logger.warn('Could not resolve live bidding payout fee percents for escrow', {
+        escrowId: postgresEscrow.escrowId,
+        error: error?.message,
+      });
+    }
+  }
+
   return {
     _id: postgresEscrow.id, // For backward compatibility
     id: postgresEscrow.id,
@@ -273,8 +300,8 @@ async function convertPostgresEscrowToFrontendFormat(postgresEscrow: any): Promi
     amount: postgresEscrow.amount.toString(),
     amountInRupees: postgresEscrow.amountInRupees.toString(),
     taskAmount: payoutTaskAmount.toString(),
-    appliedPlatformFeePercent: postgresEscrow.appliedPlatformFeePercent?.toString() ?? null,
-    appliedGstPercent: postgresEscrow.appliedGstPercent?.toString() ?? null,
+    appliedPlatformFeePercent,
+    appliedGstPercent,
     taskTitle,
     currency: postgresEscrow.currency,
     status: postgresEscrow.status,
@@ -294,6 +321,8 @@ async function convertPostgresEscrowToFrontendFormat(postgresEscrow: any): Promi
     razorpayOrderData: postgresEscrow.razorpayOrderData || null,
     razorpayPaymentData: postgresEscrow.razorpayPaymentData || null,
     metadata: postgresEscrow.metadata || null,
+    taskCategory: postgresEscrow.taskCategory || null,
+    appliedRazorpayGstPercent: postgresEscrow.appliedRazorpayGstPercent?.toString() ?? null,
     createdAt: postgresEscrow.createdAt,
     updatedAt: postgresEscrow.updatedAt,
   };
@@ -452,8 +481,19 @@ export async function createEscrow(params: {
       : null;
 
     try {
+      const isBookNowEscrow = metadata?.bookingMode === 'book_now';
+      const categoryFeeKey = resolveEscrowCategoryFeeConfigKey({
+        taskCategory,
+        categorySlug:
+          typeof metadata.categorySlug === 'string' ? metadata.categorySlug : undefined,
+        catalogId: typeof metadata.catalogId === 'string' ? metadata.catalogId : undefined,
+        metadata,
+      });
+
       // Resolve fee structure for this category and snapshot applied percentages
-      const feeForCategory = await getFeeStructureForCategory(taskCategory);
+      const feeForCategory = await getFeeStructureForCategory(categoryFeeKey, {
+        mode: isBookNowEscrow ? CategoryFeeMode.BOOK_NOW : CategoryFeeMode.BIDDING,
+      });
 
       const appliedGstPercent = feeForCategory.platformFee.gstPercentage !== undefined
         ? new Prisma.Decimal(feeForCategory.platformFee.gstPercentage.toString())
@@ -490,7 +530,7 @@ export async function createEscrow(params: {
           autoReleaseDate: autoReleaseDate,
           razorpayOrderData: sanitizedOrderData as any, // Store sanitized data in JSONB
           metadata: escrowMetadata as any, // JSONB: snapshot + client fields
-          taskCategory: taskCategory ?? null,
+          taskCategory: pickCategoryFeeConfigKey(categoryFeeKey, taskCategory) ?? null,
           appliedGstPercent: appliedGstPercent ?? null,
           appliedPlatformFeePercent: appliedPlatformFeePercent ?? null,
           appliedRazorpayGstPercent: appliedRazorpayGstPercent ?? null,
@@ -1309,6 +1349,40 @@ export async function getEscrowByOrderId(razorpayOrderId: string): Promise<any |
   }
 }
 
+async function findEscrowByBookNowLineTaskId(taskId: string) {
+  const trimmed = taskId?.trim();
+  if (!trimmed) return null;
+
+  const recentBookNow = await prisma.escrow.findMany({
+    where: {
+      OR: [
+        { bookingOrderId: { not: null } },
+        { metadata: { path: ['bookingMode'], equals: 'book_now' } },
+      ],
+    },
+    orderBy: { createdAt: 'desc' },
+    take: 80,
+  });
+
+  for (const row of recentBookNow) {
+    const meta =
+      row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata)
+        ? (row.metadata as Record<string, unknown>)
+        : {};
+    const lineItems = Array.isArray(meta.bookNowLineItems) ? meta.bookNowLineItems : [];
+    if (
+      lineItems.some((item) => {
+        const rowItem = item as { taskId?: string };
+        return String(rowItem?.taskId || '').trim() === trimmed;
+      })
+    ) {
+      return row;
+    }
+  }
+
+  return null;
+}
+
 /**
  * Get escrow by task ID
  * Now uses Postgres only
@@ -1340,8 +1414,38 @@ export async function getEscrowByTaskId(taskId: string): Promise<any | null> {
     }
 
     return postgresEscrow ? await convertPostgresEscrowToFrontendFormat(postgresEscrow) : null;
+    if (postgresEscrow) {
+      return convertPostgresEscrowToFrontendFormat(postgresEscrow);
+    }
+
+    const byBookingOrderId = await findEscrowByBookingOrderId(taskId);
+    if (byBookingOrderId) {
+      return convertPostgresEscrowToFrontendFormat(byBookingOrderId);
+    }
+
+    const byLineTask = await findEscrowByBookNowLineTaskId(taskId);
+    if (byLineTask) {
+      return convertPostgresEscrowToFrontendFormat(byLineTask);
+    }
+
+    return null;
   } catch (error: any) {
     logger.error('❌ Error getting escrow by task ID:', error);
+    return null;
+  }
+}
+
+/** Book Now: escrow is keyed by booking order id, not always the line task id. */
+export async function getEscrowByBookingOrderId(bookingOrderId: string): Promise<any | null> {
+  try {
+    if (!isPostgresConnected()) {
+      return null;
+    }
+
+    const postgresEscrow = await findEscrowByBookingOrderId(bookingOrderId);
+    return postgresEscrow ? await convertPostgresEscrowToFrontendFormat(postgresEscrow) : null;
+  } catch (error: any) {
+    logger.error('❌ Error getting escrow by booking order ID:', error);
     return null;
   }
 }

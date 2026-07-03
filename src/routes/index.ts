@@ -8,6 +8,7 @@ import earningsRoutes from './earnings';
 import transactionRoutes from './transactions';
 import feesRoutes from './fees';
 import adminRoutes from './admin';
+import cascadeDeleteRoutes from './cascadeDelete';
 import bankAccountRoutes from './bankAccounts';
 import dashboardRoutes from './dashboard';
 import { validateEnv } from '../config/env';
@@ -59,6 +60,9 @@ router.use('/fees', feesRoutes);
 
 // Admin auth routes
 router.use('/admin', adminRoutes);
+
+// Cascade delete routes (service auth)
+router.use('/cascade-delete', cascadeDeleteRoutes);
 
 // Internal dashboard routes (service auth)
 router.use('/dashboard', dashboardRoutes);

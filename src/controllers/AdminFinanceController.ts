@@ -216,50 +216,26 @@ export class AdminFinanceController {
       ];
     }
 
-    // Avoid COUNT(*) + include subquery — both are slow on large tables.
-    // Use a single query with window function for total, and batch payouts separately.
     let allRows: any[] = [];
     let total = 0;
 
-    // Fields needed from Escrow (avoid SELECT *)
-    const escrowSelect = {
-      id: true, escrowId: true, razorpayOrderId: true, razorpayPaymentId: true,
-      taskId: true, applicationId: true,
-      posterUid: true, performerUid: true,
-      status: true, paymentStatus: true,
-      amountInRupees: true, taskAmount: true,
-      createdAt: true, metadata: true,
-    } as const;
+    // Determine which DB to use based on the explicit 'environment' query param.
+    // 'production' (default) → prisma (ep-solitary-frost)
+    // 'development'          → prismaDev (ep-solitary-violet)
+    // Never fetch from both simultaneously.
+    const environment = typeof req.query.environment === 'string' ? req.query.environment : 'production';
+    const useDevDb = environment === 'development' && prismaDev != null;
+    const targetPrisma = useDevDb ? prismaDev! : prisma;
 
-    if (prismaDev) {
-      // Dual-DB: fetch limited rows from each, merge in JS
-      const BATCH = 200;
-      const [mainRows, devRows] = await Promise.all([
-        prisma.escrow.findMany({
-          where, select: escrowSelect,
-          orderBy: { createdAt: 'desc' },
-          take: BATCH, skip: 0,
-        }),
-        prismaDev.escrow.findMany({
-          where, select: escrowSelect,
-          orderBy: { createdAt: 'desc' },
-          take: BATCH, skip: 0,
-        }),
-      ]);
-      const seen = new Set(mainRows.map((r: any) => r.escrowId));
-      allRows = [...mainRows, ...devRows.filter((r: any) => !seen.has(r.escrowId))];
-      allRows.sort((a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-    } else {
-      // Single DB: use COUNT(*) OVER() window function — one round-trip, no separate count query
-      const query = buildEscrowQuery(where, limit, offset);
-      const raw: any[] = await prisma.$queryRawUnsafe(query.sql, ...query.params);
-      total = raw.length > 0 ? Number(raw[0]._total_count) : 0;
-      // Prisma raw does not map JSONB — parse manually
-      allRows = raw.map((r: any) => ({
-        ...r,
-        metadata: typeof r.metadata === 'string' ? JSON.parse(r.metadata) : (r.metadata ?? null),
-      }));
-    }
+    // Use COUNT(*) OVER() window function — single round-trip, no separate COUNT query
+    const query = buildEscrowQuery(where, limit, offset);
+    const raw: any[] = await targetPrisma.$queryRawUnsafe(query.sql, ...query.params);
+    total = raw.length > 0 ? Number(raw[0]._total_count) : 0;
+    // $queryRawUnsafe does not auto-parse JSONB — do it manually
+    allRows = raw.map((r: any) => ({
+      ...r,
+      metadata: typeof r.metadata === 'string' ? JSON.parse(r.metadata) : (r.metadata ?? null),
+    }));
 
     // Apply transactionType filter in JS (avoids Prisma JSONB NOT null-propagation bug)
     if (transactionType === 'real') {
@@ -267,13 +243,8 @@ export class AdminFinanceController {
     } else if (transactionType === 'team') {
       allRows = allRows.filter((r: any) => isTeamTest(r.metadata));
     }
-    if (!prismaDev) {
-      total = allRows.length;
-      allRows = allRows.slice(0, limit);
-    } else {
-      total = allRows.length;
-      allRows = allRows.slice(offset, offset + limit);
-    }
+    // total is already correct from COUNT(*) OVER() — do NOT overwrite with allRows.length.
+    // SQL already applied LIMIT/OFFSET so allRows is the correct page slice.
 
     // Batch fetch payouts for these escrows (instead of per-row include subquery)
     let payoutByEscrowId = new Map<string, any>();
@@ -662,53 +633,32 @@ export class AdminFinanceController {
       ];
     }
 
-    let mainPayoutTotal = 0;
-    let payoutRows: any[] = [];
+    // Route to single DB based on environment param — never both simultaneously
+    const environment = typeof req.query.environment === 'string' ? req.query.environment : 'production';
+    const useDevDb = environment === 'development' && prismaDev != null;
+    const targetPrisma = useDevDb ? prismaDev! : prisma;
 
-    [mainPayoutTotal, payoutRows] = await Promise.all([
-      prisma.payout.count({ where }),
-      prisma.payout.findMany({
+    // Fetch count and page in parallel — single DB, one round-trip pair
+    const [payoutTotal, payoutRows] = await Promise.all([
+      targetPrisma.payout.count({ where }),
+      targetPrisma.payout.findMany({
         where,
         orderBy: { createdAt: 'desc' },
-        take: prismaDev ? 2000 : limit,
-        skip: prismaDev ? 0 : offset,
+        take: limit,
+        skip: offset,
         include: { escrow: true },
       }),
     ]);
 
-    let payoutTotal = mainPayoutTotal;
-
-    if (prismaDev) {
-      try {
-        const [devPayoutTotal, devPayoutRows] = await Promise.all([
-          prismaDev.payout.count({ where }),
-          prismaDev.payout.findMany({
-            where,
-            orderBy: { createdAt: 'desc' },
-            take: 2000,
-            skip: 0,
-            include: { escrow: true },
-          }),
-        ]);
-        const seen = new Set(payoutRows.map((r: any) => r.payoutId));
-        const uniqueDev = devPayoutRows.filter((r: any) => !seen.has(r.payoutId));
-        payoutRows = [...payoutRows, ...uniqueDev];
-        payoutRows.sort((a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-      } catch (err: any) {
-        logger.warn('Failed to query secondary DB for payouts:', { message: err?.message });
-      }
-    }
-
     // Apply transactionType filter in JS (avoids Prisma JSONB NOT null-propagation bug)
+    let filteredRows = payoutRows as any[];
     if (transactionType === 'real') {
-      payoutRows = payoutRows.filter((r: any) => !isTeamTest(r.metadata) && !isTeamTest(r.escrow?.metadata));
+      filteredRows = filteredRows.filter((r: any) => !isTeamTest(r.metadata) && !isTeamTest(r.escrow?.metadata));
     } else if (transactionType === 'team') {
-      payoutRows = payoutRows.filter((r: any) => isTeamTest(r.metadata) || isTeamTest(r.escrow?.metadata));
+      filteredRows = filteredRows.filter((r: any) => isTeamTest(r.metadata) || isTeamTest(r.escrow?.metadata));
     }
-    payoutTotal = payoutRows.length;
-    payoutRows = payoutRows.slice(offset, offset + limit);
 
-    const data = payoutRows.map((row: any) => ({
+    const data = filteredRows.map((row: any) => ({
       payoutId: row.payoutId,
       performerUid: row.performerUid,
       taskId: row.taskId || row.escrow?.taskId || null,

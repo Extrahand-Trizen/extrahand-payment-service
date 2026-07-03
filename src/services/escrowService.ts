@@ -46,13 +46,21 @@ export async function findEscrowByBookingOrderId(bookingOrderId: string) {
   const id = bookingOrderId?.trim();
   if (!id) return null;
 
-  const byColumn = await prisma.escrow.findFirst({
+  let byColumn = await prisma.escrow.findFirst({
     where: { bookingOrderId: id },
     orderBy: { createdAt: 'desc' },
   });
+  
+  if (!byColumn && prismaDev) {
+    byColumn = await prismaDev.escrow.findFirst({
+      where: { bookingOrderId: id },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+  
   if (byColumn) return byColumn;
 
-  return prisma.escrow.findFirst({
+  let byMetadata = await prisma.escrow.findFirst({
     where: {
       metadata: {
         path: ['bookingOrderId'],
@@ -61,6 +69,35 @@ export async function findEscrowByBookingOrderId(bookingOrderId: string) {
     },
     orderBy: { createdAt: 'desc' },
   });
+  
+  if (!byMetadata && prismaDev) {
+    byMetadata = await prismaDev.escrow.findFirst({
+      where: {
+        metadata: {
+          path: ['bookingOrderId'],
+          equals: id,
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+  
+  return byMetadata;
+}
+
+export async function getEscrowByBookingOrderId(bookingOrderId: string): Promise<any | null> {
+  try {
+    if (!isPostgresConnected()) {
+      return null;
+    }
+
+    const postgresEscrow = await findEscrowByBookingOrderId(bookingOrderId);
+
+    return postgresEscrow ? await convertPostgresEscrowToFrontendFormat(postgresEscrow) : null;
+  } catch (error: any) {
+    logger.error('🛡️ Error getting escrow by booking order ID:', error);
+    return null;
+  }
 }
 
 export function isBookNowEscrowRecord(escrow: {
@@ -1228,9 +1265,15 @@ export async function getEscrowById(escrowId: string): Promise<any | null> {
       return null;
     }
 
-    const postgresEscrow = await prisma.escrow.findUnique({
+    let postgresEscrow = await prisma.escrow.findUnique({
       where: { escrowId },
     });
+    
+    if (!postgresEscrow && prismaDev) {
+      postgresEscrow = await prismaDev.escrow.findUnique({
+        where: { escrowId },
+      });
+    }
 
     return postgresEscrow ? await convertPostgresEscrowToFrontendFormat(postgresEscrow) : null;
   } catch (error: any) {
@@ -1249,9 +1292,15 @@ export async function getEscrowByOrderId(razorpayOrderId: string): Promise<any |
       return null;
     }
 
-    const postgresEscrow = await prisma.escrow.findUnique({
+    let postgresEscrow = await prisma.escrow.findUnique({
       where: { razorpayOrderId },
     });
+
+    if (!postgresEscrow && prismaDev) {
+      postgresEscrow = await prismaDev.escrow.findUnique({
+        where: { razorpayOrderId },
+      });
+    }
 
     return postgresEscrow ? await convertPostgresEscrowToFrontendFormat(postgresEscrow) : null;
   } catch (error: any) {
@@ -1270,7 +1319,7 @@ export async function getEscrowByTaskId(taskId: string): Promise<any | null> {
       return null;
     }
 
-    const postgresEscrow = await prisma.escrow.findFirst({
+    let postgresEscrow = await prisma.escrow.findFirst({
       where: {
         taskId,
       },
@@ -1278,6 +1327,17 @@ export async function getEscrowByTaskId(taskId: string): Promise<any | null> {
         createdAt: 'desc',
       },
     });
+
+    if (!postgresEscrow && prismaDev) {
+      postgresEscrow = await prismaDev.escrow.findFirst({
+        where: {
+          taskId,
+        },
+        orderBy: {
+          createdAt: 'desc',
+        },
+      });
+    }
 
     return postgresEscrow ? await convertPostgresEscrowToFrontendFormat(postgresEscrow) : null;
   } catch (error: any) {
@@ -1301,7 +1361,7 @@ export async function getEscrowByTaskIdAndVisitId(
       return null;
     }
 
-    const postgresEscrow = await prisma.escrow.findFirst({
+    let postgresEscrow = await prisma.escrow.findFirst({
       where: {
         taskId,
         metadata: {
@@ -1313,6 +1373,21 @@ export async function getEscrowByTaskIdAndVisitId(
         createdAt: 'desc',
       },
     });
+
+    if (!postgresEscrow && prismaDev) {
+      postgresEscrow = await prismaDev.escrow.findFirst({
+        where: {
+          taskId,
+          metadata: {
+            path: ['visitId'],
+            equals: trimmedVisitId,
+          },
+        },
+        orderBy: {
+          createdAt: 'desc',
+        },
+      });
+    }
 
     return postgresEscrow ? await convertPostgresEscrowToFrontendFormat(postgresEscrow) : null;
   } catch (error: any) {

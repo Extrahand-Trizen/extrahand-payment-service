@@ -38,6 +38,12 @@ router.get('/status/:escrowId', asyncHandler(EscrowController.getEscrowStatus));
 router.get('/task/:taskId', asyncHandler(EscrowController.getEscrowByTaskId));
 
 /**
+ * GET /api/v1/escrow/booking-order/:bookingOrderId
+ * Get escrow by booking order ID
+ */
+router.get('/booking-order/:bookingOrderId', asyncHandler(EscrowController.getEscrowByBookingOrderId));
+
+/**
  * Escrow release and auto-release disabled - handled elsewhere
  * POST /api/v1/escrow/release/:escrowId
  * router.post('/release/:escrowId', asyncHandler(EscrowController.releaseEscrow));

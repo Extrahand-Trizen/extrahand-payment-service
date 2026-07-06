@@ -275,25 +275,6 @@ export class EscrowController {
   }
 
   /**
-   * GET /api/v1/escrow/booking-order/:bookingOrderId
-   * Get escrow by booking order ID
-   */
-  static async getEscrowByBookingOrderId(req: Request, res: Response): Promise<void> {
-    const { bookingOrderId } = req.params;
-
-    const escrow = await getEscrowByBookingOrderId(bookingOrderId);
-
-    if (!escrow) {
-      throw new NotFoundError('Escrow not found for this booking order');
-    }
-
-    res.json({
-      success: true,
-      escrow,
-    });
-  }
-
-  /**
    * POST /api/v1/escrow/release/:escrowId
    * Release escrow funds to performer
    */

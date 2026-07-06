@@ -90,21 +90,6 @@ export async function findEscrowByBookingOrderId(bookingOrderId: string) {
   return byMetadata;
 }
 
-export async function getEscrowByBookingOrderId(bookingOrderId: string): Promise<any | null> {
-  try {
-    if (!isPostgresConnected()) {
-      return null;
-    }
-
-    const postgresEscrow = await findEscrowByBookingOrderId(bookingOrderId);
-
-    return postgresEscrow ? await convertPostgresEscrowToFrontendFormat(postgresEscrow) : null;
-  } catch (error: any) {
-    logger.error('🛡️ Error getting escrow by booking order ID:', error);
-    return null;
-  }
-}
-
 export function isBookNowEscrowRecord(escrow: {
   bookingOrderId?: string | null;
   metadata?: unknown;

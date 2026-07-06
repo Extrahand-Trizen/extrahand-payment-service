@@ -6,6 +6,10 @@ import {
   processTaskCompletionPayout,
   listManualOpsPayoutQueue,
 } from '../services/payoutService';
+import {
+  getTaskPayoutBundle,
+  getPayoutStatusBatch,
+} from '../services/payoutBundleService';
 import { BadRequestError, NotFoundError } from '../errors/AppError';
 
 export class PayoutController {
@@ -188,6 +192,57 @@ export class PayoutController {
       success: true,
       payouts: result.payouts ?? [],
       total: result.total ?? 0,
+    });
+  }
+
+  /**
+   * GET /api/v1/payouts/task/:taskId/bundle
+   * Escrow + payout + wallet + fee estimate in one response.
+   */
+  static async getTaskPayoutBundle(req: Request, res: Response): Promise<void> {
+    const { taskId } = req.params;
+    const performerUid =
+      typeof req.query.performerUid === 'string' ? req.query.performerUid : undefined;
+    const linkedRaw =
+      typeof req.query.linkedUserIds === 'string' ? req.query.linkedUserIds : undefined;
+    const linkedUserIds = linkedRaw
+      ? linkedRaw.split(',').map((s) => s.trim()).filter(Boolean)
+      : undefined;
+
+    if (!taskId?.trim()) {
+      throw new BadRequestError('taskId is required');
+    }
+
+    const result = await getTaskPayoutBundle({ taskId, performerUid, linkedUserIds });
+
+    if (!result.success) {
+      throw new BadRequestError(result.error || 'Failed to build payout bundle');
+    }
+
+    res.json({
+      success: true,
+      bundle: result.bundle,
+    });
+  }
+
+  /**
+   * POST /api/v1/payouts/status/batch
+   * Body: { payoutIds: string[] }
+   */
+  static async getPayoutStatusBatch(req: Request, res: Response): Promise<void> {
+    const payoutIds = Array.isArray(req.body?.payoutIds) ? req.body.payoutIds : [];
+
+    const result = await getPayoutStatusBatch(
+      payoutIds.map((id: unknown) => String(id)),
+    );
+
+    if (!result.success) {
+      throw new BadRequestError(result.error || 'Failed to fetch payout statuses');
+    }
+
+    res.json({
+      success: true,
+      payouts: result.payouts ?? [],
     });
   }
 }

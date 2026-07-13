@@ -1,4 +1,4 @@
-import { prisma } from '../config/prisma';
+import { prisma, prismaDev } from '../config/prisma';
 import logger from '../config/logger';
 import { Prisma } from '@prisma/client';
 import { resolveEscrowTaskAmountForPayout } from '../utils/escrowFinanceUtils';
@@ -698,7 +698,8 @@ export async function getUserTransactions(
     // allowing unbounded overfetch windows under high traffic.
     const fetchLimit = Math.min(Math.max(limit + 20, 50), 120);
 
-    const escrows = await prisma.escrow.findMany({
+    // Fetch escrows from PROD DB
+    const escrowsProd = await prisma.escrow.findMany({
       where: escrowWhere,
       include: {
         payouts: {
@@ -716,10 +717,42 @@ export async function getUserTransactions(
       skip: offset
     });
 
-    // Preload standalone payouts (escrowId = null) once so we can:
-    // 1) render them later
-    // 2) suppress duplicate performer "pending earnings" escrow rows for same task
-    const standalonePayouts =
+    // Fetch escrows from DEV DB and merge (deduplicate by escrowId)
+    let escrows = escrowsProd;
+    if (prismaDev) {
+      try {
+        const escrowsDev = await prismaDev.escrow.findMany({
+          where: escrowWhere,
+          include: {
+            payouts: {
+              where:
+                categoryFilter === 'earnings'
+                  ? { performerUid: { in: uidList }, status: statusFilter || undefined }
+                  : undefined,
+            },
+            refunds: {
+              where: statusFilter ? { status: statusFilter } : undefined,
+            }
+          },
+          orderBy: { createdAt: 'desc' },
+          take: fetchLimit,
+          skip: offset
+        });
+        if (escrowsDev.length > 0) {
+          const prodIds = new Set(escrowsProd.map((e) => e.escrowId));
+          const devOnly = escrowsDev.filter((e) => !prodIds.has(e.escrowId));
+          escrows = [...escrowsProd, ...devOnly].sort(
+            (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+          );
+          logger.info(`[TransactionHistory] Merged ${devOnly.length} extra escrows from DEV DB`);
+        }
+      } catch (devErr: any) {
+        logger.warn('[TransactionHistory] DEV DB escrow fetch failed (non-fatal):', devErr?.message);
+      }
+    }
+
+    // Preload standalone payouts (escrowId = null) from PROD DB
+    const standalonePayoutsProd =
       !typeFilter || typeFilter === 'payout'
         ? await prisma.payout.findMany({
             where: {
@@ -739,6 +772,40 @@ export async function getUserTransactions(
             take: fetchLimit,
           })
         : [];
+
+    // Merge standalone payouts from DEV DB
+    let standalonePayouts = standalonePayoutsProd;
+    if (prismaDev && (!typeFilter || typeFilter === 'payout')) {
+      try {
+        const standalonePayoutsDev = await prismaDev.payout.findMany({
+          where: {
+            performerUid: { in: uidList },
+            escrowId: null,
+            ...(statusFilter ? { status: statusFilter } : {}),
+            ...(startDate || endDate
+              ? {
+                  createdAt: {
+                    ...(startDate ? { gte: startDate } : {}),
+                    ...(endDate ? { lte: endDate } : {}),
+                  },
+                }
+              : {}),
+          },
+          orderBy: { createdAt: 'desc' },
+          take: fetchLimit,
+        });
+        if (standalonePayoutsDev.length > 0) {
+          const prodPayoutIds = new Set(standalonePayoutsProd.map((p) => p.payoutId));
+          const devOnlyPayouts = standalonePayoutsDev.filter((p) => !prodPayoutIds.has(p.payoutId));
+          standalonePayouts = [...standalonePayoutsProd, ...devOnlyPayouts].sort(
+            (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+          );
+          logger.info(`[TransactionHistory] Merged ${devOnlyPayouts.length} extra payouts from DEV DB`);
+        }
+      } catch (devErr: any) {
+        logger.warn('[TransactionHistory] DEV DB payout fetch failed (non-fatal):', devErr?.message);
+      }
+    }
 
     // Convert escrows to transactions
     // IMPORTANT: Always add all transactions with their correct category, then filter after
@@ -1475,18 +1542,83 @@ export async function getTransactionSummary(
     ]);
 
     const paymentAgg = paymentAggRows[0];
-    const totalPayments = paymentAgg?.total ?? new Prisma.Decimal('0');
-    const paymentEscrowCount = Number(paymentAgg?.count ?? 0);
+    let totalPayments = paymentAgg?.total ?? new Prisma.Decimal('0');
+    let paymentEscrowCount = Number(paymentAgg?.count ?? 0);
 
-    const totalPayouts = payoutsAgg._sum.netAmount || new Prisma.Decimal('0');
-    const totalRefunds = refundsAgg._sum.refundAmount || new Prisma.Decimal('0');
-    const totalCompensation = compensationAgg._sum.toOtherParty || new Prisma.Decimal('0');
-    const totalFees = new Prisma.Decimal('0');
-    const transactionCount =
+    let totalPayouts = payoutsAgg._sum.netAmount || new Prisma.Decimal('0');
+    let totalRefunds = refundsAgg._sum.refundAmount || new Prisma.Decimal('0');
+    let totalCompensation = compensationAgg._sum.toOtherParty || new Prisma.Decimal('0');
+    let transactionCount =
       paymentEscrowCount +
       (payoutsAgg._count.id || 0) +
       (refundsAgg._count.id || 0) +
       (compensationAgg._count.id || 0);
+
+    if (prismaDev) {
+      try {
+        const [devPayoutsAgg, devRefundsAgg, devCompensationAgg, devPaymentAggRows] = await Promise.all([
+          prismaDev.payout.aggregate({
+            where: payoutWhere,
+            _sum: { netAmount: true },
+            _count: { id: true },
+          }),
+          prismaDev.refund.aggregate({
+            where: {
+              ...refundWhere,
+              escrow: { posterUid: { in: uidList } },
+            },
+            _sum: { refundAmount: true },
+            _count: { id: true },
+          }),
+          prismaDev.refund.aggregate({
+            where: {
+              ...refundWhere,
+              cancelledBy: 'poster',
+              toOtherParty: { not: null },
+              escrow: { performerUid: { in: uidList } },
+            },
+            _sum: { toOtherParty: true },
+            _count: { id: true },
+          }),
+          prismaDev.$queryRaw<Array<{ total: Prisma.Decimal; count: bigint }>>`
+            SELECT
+              COALESCE(SUM(latest."amountInRupees"), 0) AS total,
+              COUNT(*)::bigint AS count
+            FROM (
+              SELECT DISTINCT ON ("taskId")
+                "taskId",
+                "amountInRupees"
+              FROM "Escrow"
+              WHERE "posterUid" IN (${Prisma.join(uidList)})
+                AND "status" IN (${Prisma.join(paymentStatuses)})
+                ${paymentDateSql}
+              ORDER BY "taskId", "createdAt" DESC
+            ) latest
+          `,
+        ]);
+        
+        const devPaymentAgg = devPaymentAggRows[0];
+        const devTotalPayments = devPaymentAgg?.total ?? new Prisma.Decimal('0');
+        const devPaymentEscrowCount = Number(devPaymentAgg?.count ?? 0);
+
+        totalPayments = totalPayments.plus(devTotalPayments);
+        paymentEscrowCount += devPaymentEscrowCount;
+        totalPayouts = totalPayouts.plus(devPayoutsAgg._sum.netAmount || new Prisma.Decimal('0'));
+        totalRefunds = totalRefunds.plus(devRefundsAgg._sum.refundAmount || new Prisma.Decimal('0'));
+        totalCompensation = totalCompensation.plus(devCompensationAgg._sum.toOtherParty || new Prisma.Decimal('0'));
+        
+        transactionCount +=
+          devPaymentEscrowCount +
+          (devPayoutsAgg._count.id || 0) +
+          (devRefundsAgg._count.id || 0) +
+          (devCompensationAgg._count.id || 0);
+
+      } catch (e: any) {
+        logger.warn('DEV DB merge failed in getTransactionSummary', { error: e.message });
+      }
+    }
+
+    const totalFees = new Prisma.Decimal('0');
 
     // Net earnings = payouts + compensation - fees
     const netEarnings = totalPayouts.plus(totalCompensation).minus(totalFees);

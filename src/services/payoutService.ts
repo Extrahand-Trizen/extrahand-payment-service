@@ -10,7 +10,7 @@ import { isPostgresConnected } from '../config/database';
 import { createLedgerEntry, getEscrowBalance } from './ledgerService';
 import { calculateFees, FeeBreakdown } from './feeCalculationService';
 import { transferToBank, getBankTransferStatus } from './mockBankTransferService';
-import { prisma } from '../config/prisma';
+import { prisma, prismaDev } from '../config/prisma';
 import { Prisma } from '@prisma/client';
 import mongoose from 'mongoose';
 import { updateUserPaymentProfile } from './userPaymentProfileService';
@@ -1553,12 +1553,31 @@ export async function getPayoutStatus(payoutId: string): Promise<{
       return { success: false, error: 'Postgres not connected' };
     }
 
-    const payout = await prisma.payout.findUnique({
+    let payout = await prisma.payout.findUnique({
       where: { payoutId },
       include: {
         escrow: true,
       },
     });
+    
+    let isDevPayout = false;
+
+    if (!payout && prismaDev) {
+      try {
+        const devPayout = await prismaDev.payout.findUnique({
+          where: { payoutId },
+          include: {
+            escrow: true,
+          },
+        });
+        if (devPayout) {
+          payout = devPayout as any;
+          isDevPayout = true;
+        }
+      } catch (devErr: any) {
+        logger.warn('DEV DB fetch failed in getPayoutStatus', { error: devErr.message });
+      }
+    }
 
     if (!payout) {
       return { success: false, error: 'Payout not found' };
@@ -1573,21 +1592,30 @@ export async function getPayoutStatus(payoutId: string): Promise<{
         const internalStatus = mapRazorpayPayoutStatusToInternal(razorpayStatus.status);
 
         if (internalStatus !== payout.status) {
-          await prisma.payout.update({
-            where: { id: payout.id },
-            data: {
-              status: internalStatus,
-              errorMessage:
-                internalStatus === 'failed' || internalStatus === 'reversed'
-                  ? razorpayStatus.failureReason || 'Payout failed'
-                  : undefined,
-              completedAt:
-                internalStatus === 'completed'
-                  ? (payout.completedAt ?? new Date())
-                  : payout.completedAt,
-              updatedAt: new Date(),
-            },
-          });
+          const updateData = {
+            status: internalStatus,
+            errorMessage:
+              internalStatus === 'failed' || internalStatus === 'reversed'
+                ? razorpayStatus.failureReason || 'Payout failed'
+                : undefined,
+            completedAt:
+              internalStatus === 'completed'
+                ? (payout.completedAt ?? new Date())
+                : payout.completedAt,
+            updatedAt: new Date(),
+          };
+
+          if (isDevPayout && prismaDev) {
+            await prismaDev.payout.update({
+              where: { id: payout.id },
+              data: updateData,
+            });
+          } else {
+            await prisma.payout.update({
+              where: { id: payout.id },
+              data: updateData,
+            });
+          }
 
           // Keep cached earnings in sync once Razorpay indicates completion.
           if (internalStatus === 'completed') {

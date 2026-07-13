@@ -1398,16 +1398,17 @@ export async function getEscrowByTaskId(taskId: string): Promise<any | null> {
       });
     }
 
-    return postgresEscrow ? await convertPostgresEscrowToFrontendFormat(postgresEscrow) : null;
     if (postgresEscrow) {
       return convertPostgresEscrowToFrontendFormat(postgresEscrow);
     }
 
+    // Fallback: Book Now escrows are keyed by bookingOrderId, not the materialized task _id
     const byBookingOrderId = await findEscrowByBookingOrderId(taskId);
     if (byBookingOrderId) {
       return convertPostgresEscrowToFrontendFormat(byBookingOrderId);
     }
 
+    // Fallback: Book Now line-item taskId embedded in escrow metadata
     const byLineTask = await findEscrowByBookNowLineTaskId(taskId);
     if (byLineTask) {
       return convertPostgresEscrowToFrontendFormat(byLineTask);

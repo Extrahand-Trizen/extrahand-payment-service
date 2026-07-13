@@ -5,7 +5,7 @@
  * Handles incremental updates when transactions occur
  */
 
-import { prisma } from '../config/prisma';
+import { prisma, prismaDev } from '../config/prisma';
 import logger from '../config/logger';
 import { Prisma } from '@prisma/client';
 
@@ -252,16 +252,51 @@ export async function recalculateUserPaymentProfile(
       _sum: { amount: true },
     });
 
-    const fromPayouts = payoutStats._sum.netAmount || new Prisma.Decimal('0');
-    const fromCompensation =
-      compensationStats._sum.toOtherParty || new Prisma.Decimal('0');
+    let fromPayouts = payoutStats._sum.netAmount || new Prisma.Decimal('0');
+    let fromCompensation = compensationStats._sum.toOtherParty || new Prisma.Decimal('0');
+    let totalPayouts = payoutStats._count.id || 0;
+    let totalCompensations = compensationStats._count.id || 0;
+    let totalPayments = paymentStats._sum.amountInRupees || new Prisma.Decimal('0');
+    let paymentCount = paymentStats._count.id || 0;
+    let totalRefunds = refundStats._sum.refundAmount || new Prisma.Decimal('0');
+    let refundCount = refundStats._count.id || 0;
+    let totalFees = feeStats._sum.amount?.abs() || new Prisma.Decimal('0');
+
+    // Merge from DEV DB
+    if (prismaDev) {
+      try {
+        const [devPayouts, devComp, devPayments, devRefunds, devFees] = await Promise.all([
+          prismaDev.payout.aggregate({ where: { performerUid: userId, status: 'completed' }, _sum: { netAmount: true }, _count: { id: true } }),
+          prismaDev.refund.aggregate({ where: { escrow: { performerUid: userId }, cancelledBy: 'poster', toOtherParty: { not: null }, status: 'completed' }, _sum: { toOtherParty: true }, _count: { id: true } }),
+          prismaDev.escrow.aggregate({ where: { posterUid: userId }, _sum: { amountInRupees: true }, _count: { id: true } }),
+          prismaDev.refund.aggregate({ where: { escrow: { posterUid: userId }, status: 'completed' }, _sum: { refundAmount: true }, _count: { id: true } }),
+          prismaDev.ledger.aggregate({ where: { escrow: { OR: [{ posterUid: userId }, { performerUid: userId }] }, type: { in: ['platform_commission', 'gst', 'tds', 'cancellation_fee', 'platform_fee', 'razorpay_fee'] } }, _sum: { amount: true } })
+        ]);
+        if ((devPayouts._count.id || 0) > totalPayouts) {
+          fromPayouts = fromPayouts.plus(devPayouts._sum.netAmount || new Prisma.Decimal('0'));
+          totalPayouts += devPayouts._count.id || 0;
+        }
+        if ((devComp._count.id || 0) > totalCompensations) {
+          fromCompensation = fromCompensation.plus(devComp._sum.toOtherParty || new Prisma.Decimal('0'));
+          totalCompensations += devComp._count.id || 0;
+        }
+        if ((devPayments._count.id || 0) > paymentCount) {
+          totalPayments = totalPayments.plus(devPayments._sum.amountInRupees || new Prisma.Decimal('0'));
+          paymentCount += devPayments._count.id || 0;
+        }
+        if ((devRefunds._count.id || 0) > refundCount) {
+          totalRefunds = totalRefunds.plus(devRefunds._sum.refundAmount || new Prisma.Decimal('0'));
+          refundCount += devRefunds._count.id || 0;
+        }
+        if (devFees._sum.amount) {
+          totalFees = totalFees.plus(devFees._sum.amount.abs());
+        }
+      } catch (devErr: any) {
+        logger.warn('DEV DB merge failed during profile recalculate', { error: devErr.message });
+      }
+    }
+
     const totalEarnings = fromPayouts.plus(fromCompensation);
-    const totalPayments =
-      paymentStats._sum.amountInRupees || new Prisma.Decimal('0');
-    const totalRefunds =
-      refundStats._sum.refundAmount || new Prisma.Decimal('0');
-    const totalFees =
-      feeStats._sum.amount?.abs() || new Prisma.Decimal('0');
 
     // Update or create profile
     await prisma.userPaymentProfile.upsert({
@@ -270,12 +305,12 @@ export async function recalculateUserPaymentProfile(
         totalEarnings,
         fromPayouts,
         fromCompensation,
-        payoutCount: payoutStats._count.id || 0,
-        compensationCount: compensationStats._count.id || 0,
+        payoutCount: totalPayouts,
+        compensationCount: totalCompensations,
         totalPayments,
-        paymentCount: paymentStats._count.id || 0,
+        paymentCount,
         totalRefunds,
-        refundCount: refundStats._count.id || 0,
+        refundCount,
         totalFees,
         averagePayout: payoutStats._avg.netAmount || null,
         largestPayout: payoutStats._max.netAmount || null,
@@ -289,12 +324,12 @@ export async function recalculateUserPaymentProfile(
         totalEarnings,
         fromPayouts,
         fromCompensation,
-        payoutCount: payoutStats._count.id || 0,
-        compensationCount: compensationStats._count.id || 0,
+        payoutCount: totalPayouts,
+        compensationCount: totalCompensations,
         totalPayments,
-        paymentCount: paymentStats._count.id || 0,
+        paymentCount,
         totalRefunds,
-        refundCount: refundStats._count.id || 0,
+        refundCount,
         totalFees,
         averagePayout: payoutStats._avg.netAmount || null,
         largestPayout: payoutStats._max.netAmount || null,

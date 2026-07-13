@@ -1,4 +1,4 @@
-import { prisma } from '../config/prisma';
+import { prisma, prismaDev } from '../config/prisma';
 import logger from '../config/logger';
 import { Prisma } from '@prisma/client';
 import {
@@ -41,19 +41,13 @@ export async function getUserEarnings(userId: string, linkedUserIds?: string[]):
     // This is used for legacy UID/_id migrations where cache rows may exist under different identifiers.
     if (uidList.length > 1) {
       const payoutsAgg = await prisma.payout.aggregate({
-        where: {
-          performerUid: { in: uidList },
-          status: 'completed',
-        },
+        where: { performerUid: { in: uidList }, status: 'completed' },
         _sum: { netAmount: true },
         _count: { _all: true },
       });
-
       const compensationsAgg = await prisma.refund.aggregate({
         where: {
-          escrow: {
-            performerUid: { in: uidList },
-          },
+          escrow: { performerUid: { in: uidList } },
           cancelledBy: 'poster',
           toOtherParty: { not: null },
           status: 'completed',
@@ -62,18 +56,57 @@ export async function getUserEarnings(userId: string, linkedUserIds?: string[]):
         _count: { _all: true },
       });
 
-      const fromPayouts = payoutsAgg._sum.netAmount || new Prisma.Decimal('0');
-      const fromCompensation = compensationsAgg._sum.toOtherParty || new Prisma.Decimal('0');
-      const totalEarnings = fromPayouts.plus(fromCompensation);
+      // Also aggregate from DEV DB and merge
+      let fromPayouts = payoutsAgg._sum.netAmount || new Prisma.Decimal('0');
+      let fromCompensation = compensationsAgg._sum.toOtherParty || new Prisma.Decimal('0');
+      let totalPayouts = payoutsAgg._count._all || 0;
+      let totalCompensations = compensationsAgg._count._all || 0;
 
+      if (prismaDev) {
+        try {
+          const devPayoutsAgg = await prismaDev.payout.aggregate({
+            where: { performerUid: { in: uidList }, status: 'completed' },
+            _sum: { netAmount: true },
+            _count: { _all: true },
+          });
+          const devCompAgg = await prismaDev.refund.aggregate({
+            where: {
+              escrow: { performerUid: { in: uidList } },
+              cancelledBy: 'poster',
+              toOtherParty: { not: null },
+              status: 'completed',
+            },
+            _sum: { toOtherParty: true },
+            _count: { _all: true },
+          });
+          // Deduplicate: only add DEV amounts if DEV has more payouts than PROD
+          // (avoids double-counting duplicated records)
+          const devPayoutCount = devPayoutsAgg._count._all || 0;
+          const devCompCount = devCompAgg._count._all || 0;
+          const devPayoutSum = devPayoutsAgg._sum.netAmount || new Prisma.Decimal('0');
+          const devCompSum = devCompAgg._sum.toOtherParty || new Prisma.Decimal('0');
+          if (devPayoutCount > totalPayouts) {
+            fromPayouts = fromPayouts.plus(devPayoutSum);
+            totalPayouts += devPayoutCount;
+          }
+          if (devCompCount > totalCompensations) {
+            fromCompensation = fromCompensation.plus(devCompSum);
+            totalCompensations += devCompCount;
+          }
+        } catch (devErr: any) {
+          logger.warn('[EarningsService] DEV DB aggregate failed (non-fatal):', devErr?.message);
+        }
+      }
+
+      const totalEarnings = fromPayouts.plus(fromCompensation);
       return {
         success: true,
         earnings: {
           totalEarnings: totalEarnings.toString(),
           fromPayouts: fromPayouts.toString(),
           fromCompensation: fromCompensation.toString(),
-          totalPayouts: payoutsAgg._count._all || 0,
-          totalCompensations: compensationsAgg._count._all || 0,
+          totalPayouts,
+          totalCompensations,
           labels: {
             fromPayouts: 'From Completed Tasks',
             fromCompensation: 'From Cancellations',
@@ -90,18 +123,13 @@ export async function getUserEarnings(userId: string, linkedUserIds?: string[]):
     const computeSingleUidFallback = async () => {
       const [payoutsAgg, compensationsAgg] = await Promise.all([
         prisma.payout.aggregate({
-          where: {
-            performerUid: userId,
-            status: 'completed',
-          },
+          where: { performerUid: userId, status: 'completed' },
           _sum: { netAmount: true },
           _count: { _all: true },
         }),
         prisma.refund.aggregate({
           where: {
-            escrow: {
-              performerUid: userId,
-            },
+            escrow: { performerUid: userId },
             cancelledBy: 'poster',
             toOtherParty: { not: null },
             status: 'completed',
@@ -111,18 +139,55 @@ export async function getUserEarnings(userId: string, linkedUserIds?: string[]):
         }),
       ]);
 
-      const fromPayouts = payoutsAgg._sum.netAmount || new Prisma.Decimal('0');
-      const fromCompensation = compensationsAgg._sum.toOtherParty || new Prisma.Decimal('0');
-      const totalEarnings = fromPayouts.plus(fromCompensation);
+      let fromPayouts = payoutsAgg._sum.netAmount || new Prisma.Decimal('0');
+      let fromCompensation = compensationsAgg._sum.toOtherParty || new Prisma.Decimal('0');
+      let totalPayouts = payoutsAgg._count._all || 0;
+      let totalCompensations = compensationsAgg._count._all || 0;
 
+      // Merge from DEV DB (deduplicate by count to avoid double-counting)
+      if (prismaDev) {
+        try {
+          const [devPayoutsAgg, devCompAgg] = await Promise.all([
+            prismaDev.payout.aggregate({
+              where: { performerUid: userId, status: 'completed' },
+              _sum: { netAmount: true },
+              _count: { _all: true },
+            }),
+            prismaDev.refund.aggregate({
+              where: {
+                escrow: { performerUid: userId },
+                cancelledBy: 'poster',
+                toOtherParty: { not: null },
+                status: 'completed',
+              },
+              _sum: { toOtherParty: true },
+              _count: { _all: true },
+            }),
+          ]);
+          const devPayoutCount = devPayoutsAgg._count._all || 0;
+          const devCompCount = devCompAgg._count._all || 0;
+          if (devPayoutCount > totalPayouts) {
+            fromPayouts = fromPayouts.plus(devPayoutsAgg._sum.netAmount || new Prisma.Decimal('0'));
+            totalPayouts += devPayoutCount;
+          }
+          if (devCompCount > totalCompensations) {
+            fromCompensation = fromCompensation.plus(devCompAgg._sum.toOtherParty || new Prisma.Decimal('0'));
+            totalCompensations += devCompCount;
+          }
+        } catch (devErr: any) {
+          logger.warn('[EarningsService] DEV DB single-uid aggregate failed (non-fatal):', devErr?.message);
+        }
+      }
+
+      const totalEarnings = fromPayouts.plus(fromCompensation);
       return {
         success: true as const,
         earnings: {
           totalEarnings: totalEarnings.toString(),
           fromPayouts: fromPayouts.toString(),
           fromCompensation: fromCompensation.toString(),
-          totalPayouts: payoutsAgg._count._all || 0,
-          totalCompensations: compensationsAgg._count._all || 0,
+          totalPayouts,
+          totalCompensations,
           labels: {
             fromPayouts: 'From Completed Tasks',
             fromCompensation: 'From Cancellations',
@@ -130,6 +195,7 @@ export async function getUserEarnings(userId: string, linkedUserIds?: string[]):
         },
       };
     };
+
 
     // If missing or stale, recalculate
     if (!profile || (profile && isProfileStale(profile.lastUpdatedAt))) {
@@ -220,7 +286,7 @@ export async function getEarningsByPeriod(
   try {
     const whereClause: Prisma.PayoutWhereInput = {
       performerUid: userId,
-      status: 'completed'
+      status: { in: ['completed', 'processing'] }
     };
 
     if (startDate || endDate) {

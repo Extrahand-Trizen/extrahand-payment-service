@@ -1,3 +1,4 @@
+import dns from 'node:dns';
 import mongoose from 'mongoose';
 import { validateEnv } from './env';
 import logger from './logger';
@@ -5,18 +6,18 @@ import { connectPrisma, disconnectPrisma } from './prisma';
 
 const env = validateEnv();
 
+// Temporary workaround for local Windows DNS issues with MongoDB Atlas.
+// Remove this once the system/network DNS issue is permanently fixed.
+dns.setServers(['8.8.8.8', '8.8.4.4']);
+
 let isMongoConnected = false;
 let isPrismaConnected = false;
 
 /**
  * Connect to both MongoDB and Postgres (Prisma)
- * Gracefully handles connection errors
  */
 export async function connectDatabase(): Promise<void> {
-  // Connect to MongoDB (for metadata)
   await connectMongoDB();
-  
-  // Connect to Postgres via Prisma (for financial data)
   await connectPostgres();
 }
 
@@ -30,24 +31,54 @@ async function connectMongoDB(): Promise<void> {
   }
 
   if (!env.MONGODB_URI) {
-    logger.warn('⚠️ MONGODB_URI not set - MongoDB features will be disabled');
+    logger.warn(
+      '⚠️ MONGODB_URI not set - MongoDB features will be disabled'
+    );
     return;
   }
 
   try {
-    const connection = await mongoose.connect(env.MONGODB_URI, {
+    const connectionOptions = {
       dbName: env.MONGODB_DB,
       serverSelectionTimeoutMS: 5000,
       socketTimeoutMS: 45000,
-    });
+      connectTimeoutMS: 10000,
+      maxPoolSize: 10,
+      minPoolSize: 2,
+    };
 
-    isMongoConnected = true;
-    logger.info(`✅ MongoDB connected: ${connection.connection.host}`);
+    logger.info('🔌 Attempting to connect to MongoDB...');
     logger.info(`📊 Database: ${env.MONGODB_DB}`);
 
-    // Handle connection events
+    const connection = await mongoose.connect(
+      env.MONGODB_URI,
+      connectionOptions
+    );
+
+    isMongoConnected = true;
+
+    logger.info(
+      `✅ MongoDB connected: ${connection.connection.host}`
+    );
+
+    logger.info(
+      `📊 Connected to database: ${
+        mongoose.connection.db?.databaseName || env.MONGODB_DB
+      }`
+    );
+
     mongoose.connection.on('error', (error) => {
-      logger.error('❌ MongoDB connection error:', error);
+      logger.error('❌ MongoDB connection error', {
+        error:
+          error instanceof Error
+            ? error.message
+            : String(error),
+        stack:
+          error instanceof Error
+            ? error.stack
+            : undefined,
+      });
+
       isMongoConnected = false;
     });
 
@@ -60,10 +91,16 @@ async function connectMongoDB(): Promise<void> {
       logger.info('✅ MongoDB reconnected');
       isMongoConnected = true;
     });
-
   } catch (error: any) {
-    logger.error('❌ Failed to connect to MongoDB:', error.message);
+    logger.error('❌ Failed to connect to MongoDB', {
+      error: error?.message || String(error),
+      name: error?.name,
+      code: error?.code,
+      stack: error?.stack,
+    });
+
     logger.warn('⚠️ MongoDB features will be disabled');
+
     isMongoConnected = false;
   }
 }
@@ -81,7 +118,11 @@ async function connectPostgres(): Promise<void> {
     await connectPrisma();
     isPrismaConnected = true;
   } catch (error: any) {
-    logger.error('❌ Failed to connect to Postgres via Prisma:', error.message);
+    logger.error('❌ Failed to connect to Postgres via Prisma', {
+      error: error?.message || String(error),
+      stack: error?.stack,
+    });
+
     logger.warn('⚠️ Postgres features will be disabled');
     isPrismaConnected = false;
   }
@@ -106,9 +147,12 @@ async function disconnectMongoDB(): Promise<void> {
   try {
     await mongoose.disconnect();
     isMongoConnected = false;
+
     logger.info('📦 MongoDB disconnected');
   } catch (error: any) {
-    logger.error('❌ Error disconnecting from MongoDB:', error.message);
+    logger.error('❌ Error disconnecting from MongoDB', {
+      error: error?.message || String(error),
+    });
   }
 }
 
@@ -124,7 +168,9 @@ async function disconnectPostgres(): Promise<void> {
     await disconnectPrisma();
     isPrismaConnected = false;
   } catch (error: any) {
-    logger.error('❌ Error disconnecting from Postgres:', error.message);
+    logger.error('❌ Error disconnecting from Postgres', {
+      error: error?.message || String(error),
+    });
   }
 }
 
@@ -132,7 +178,10 @@ async function disconnectPostgres(): Promise<void> {
  * Check if MongoDB is connected
  */
 export function isDatabaseConnected(): boolean {
-  return isMongoConnected && mongoose.connection.readyState === 1;
+  return (
+    isMongoConnected &&
+    mongoose.connection.readyState === 1
+  );
 }
 
 /**
@@ -146,35 +195,48 @@ const POSTGRES_RETRY_MS = 2000;
 const POSTGRES_MAX_ATTEMPTS = 5;
 
 /**
- * Ensure Postgres is reachable before escrow writes (Book Now + Post & Choose).
- * Retries connection when the service started before Neon was ready.
+ * Ensure Postgres is reachable before escrow writes.
  */
 export async function ensurePostgresReady(): Promise<boolean> {
   if (isPrismaConnected) {
     return true;
   }
 
-  for (let attempt = 1; attempt <= POSTGRES_MAX_ATTEMPTS; attempt += 1) {
+  for (
+    let attempt = 1;
+    attempt <= POSTGRES_MAX_ATTEMPTS;
+    attempt += 1
+  ) {
     try {
       await connectPrisma();
+
       isPrismaConnected = true;
-      logger.info('✅ Postgres ready for escrow operations', { attempt });
+
+      logger.info(
+        '✅ Postgres ready for escrow operations',
+        { attempt }
+      );
+
       return true;
     } catch (error: any) {
       isPrismaConnected = false;
-      logger.warn('Postgres connection attempt failed', {
-        attempt,
-        maxAttempts: POSTGRES_MAX_ATTEMPTS,
-        error: error?.message || String(error),
-      });
+
+      logger.warn(
+        'Postgres connection attempt failed',
+        {
+          attempt,
+          maxAttempts: POSTGRES_MAX_ATTEMPTS,
+          error: error?.message || String(error),
+        }
+      );
+
       if (attempt < POSTGRES_MAX_ATTEMPTS) {
-        await new Promise((resolve) => setTimeout(resolve, POSTGRES_RETRY_MS));
+        await new Promise((resolve) =>
+          setTimeout(resolve, POSTGRES_RETRY_MS)
+        );
       }
     }
   }
 
   return false;
 }
-
-
-

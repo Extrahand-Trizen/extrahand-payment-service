@@ -490,6 +490,11 @@ function buildPosterRefundTransaction(
     escrow.metadata && typeof escrow.metadata === 'object' && !Array.isArray(escrow.metadata)
       ? (escrow.metadata as Record<string, unknown>)
       : {};
+  const bookNowLineItemsSnapshot = readBookNowLineItems(escrowEm);
+  const bookNowItemCount = Math.max(
+    Number(escrowEm.itemCount) || 0,
+    bookNowLineItemsSnapshot.length,
+  );
   const recurringRefundDisplay = lineDisplay.isLineItem
     ? null
     : resolveRecurringPayoutDisplay(escrowEm);
@@ -539,6 +544,11 @@ function buildPosterRefundTransaction(
         ? {
             bookingMode: 'book_now',
             bookNowLineRefund: true,
+            // Needed so clients only label "Partial Refund" for multi-service checkouts.
+            itemCount: bookNowItemCount,
+            ...(bookNowLineItemsSnapshot.length > 0
+              ? { bookNowLineItems: bookNowLineItemsSnapshot }
+              : {}),
             lineItemAmount,
             originalAmount: lineItemAmount,
             taskAmount: lineItemAmount,
@@ -569,6 +579,30 @@ function buildPosterRefundTransaction(
       escrowEm,
     ),
   };
+}
+
+function shouldEmitPosterRefundAsStandalone(
+  refundTx: Transaction,
+  escrow: { metadata: unknown },
+): boolean {
+  const meta =
+    refundTx.metadata && typeof refundTx.metadata === 'object' && !Array.isArray(refundTx.metadata)
+      ? (refundTx.metadata as Record<string, unknown>)
+      : {};
+  if (meta.bookNowLineRefund !== true) return true;
+
+  const escrowEm =
+    escrow.metadata && typeof escrow.metadata === 'object' && !Array.isArray(escrow.metadata)
+      ? (escrow.metadata as Record<string, unknown>)
+      : {};
+  const itemCount = Math.max(
+    Number(meta.itemCount) || 0,
+    Number(escrowEm.itemCount) || 0,
+    Array.isArray(meta.bookNowLineItems) ? meta.bookNowLineItems.length : 0,
+    readBookNowLineItems(escrowEm).length,
+  );
+  // Multi-service line cancels are shown on the parent payment details only.
+  return itemCount < 2;
 }
 
 /**
@@ -1168,7 +1202,10 @@ export async function getUserTransactions(
 
           if (isPosterRefund) {
             const ctx = resolveEscrowFinanceContext(escrow);
-            transactions.push(buildPosterRefundTransaction(refund, escrow, ctx));
+            const refundTx = buildPosterRefundTransaction(refund, escrow, ctx);
+            if (shouldEmitPosterRefundAsStandalone(refundTx, escrow)) {
+              transactions.push(refundTx);
+            }
           } else if (isPerformerCompensation) {
             const recurringCompDisplay = resolveRecurringPayoutDisplay(em);
             const compensationDisplayTitle =
@@ -1243,7 +1280,9 @@ export async function getUserTransactions(
         for (const refund of posterRefunds) {
           if (!refund.escrow || seenRefundIds.has(refund.refundId)) continue;
           const ctx = resolveEscrowFinanceContext(refund.escrow);
-          transactions.push(buildPosterRefundTransaction(refund, refund.escrow, ctx));
+          const refundTx = buildPosterRefundTransaction(refund, refund.escrow, ctx);
+          if (!shouldEmitPosterRefundAsStandalone(refundTx, refund.escrow)) continue;
+          transactions.push(refundTx);
           seenRefundIds.add(refund.refundId);
         }
       } catch (refundFetchErr: unknown) {

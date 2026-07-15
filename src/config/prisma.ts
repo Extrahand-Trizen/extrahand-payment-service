@@ -8,32 +8,41 @@ const env = validateEnv();
 // Prisma Client singleton instance
 let prismaInstance: PrismaClient | null = null;
 
+function safeDbHost(connectionString: string): string {
+  try {
+    return new URL(connectionString).hostname;
+  } catch {
+    return 'unknown-host';
+  }
+}
+
 /**
- * Get or create Prisma Client instance (singleton pattern)
- * Uses Prisma 7+ adapter approach for PostgreSQL (Neon compatible)
+ * Get or create the single Prisma Client for this process.
+ * Target DB is selected by USE_DEV_POSTGRES:
+ * - true  → DEV_POSTGRESDB_URI
+ * - false → PROD_POSTGRESDB_URI
+ * (resolved into env.POSTGRESDB_URI by validateEnv)
  */
 function getPrismaClient(): PrismaClient {
   if (!prismaInstance) {
-    // Prisma 7+ requires adapter for PostgreSQL connection
-    // Use POSTGRESDB_URI from environment (Neon connection string)
     const connectionString = env.POSTGRESDB_URI;
 
     if (!connectionString) {
-      logger.error('❌ POSTGRESDB_URI is not set. Please set it in your .env file');
+      logger.error('❌ Resolved Postgres URI is not set');
       throw new Error('POSTGRESDB_URI is required for Prisma Client');
     }
 
-    // Create the Prisma adapter with connection string
-    // The adapter will handle connection pooling internally
     const adapter = new PrismaPg({ connectionString });
 
-    // For Prisma 7+, pass the adapter to PrismaClient constructor
     prismaInstance = new PrismaClient({
       adapter,
       log: env.NODE_ENV === 'development' ? ['error', 'warn'] : ['error'],
     });
 
-    logger.info('✅ Prisma Client initialized with Postgres adapter (Neon compatible)');
+    const target = env.USE_DEV_POSTGRES ? 'DEV' : 'PROD';
+    logger.info(
+      `✅ Prisma Client initialized (${target}) → ${safeDbHost(connectionString)}`
+    );
   }
   return prismaInstance;
 }
@@ -41,25 +50,12 @@ function getPrismaClient(): PrismaClient {
 // Export the Prisma client instance
 export const prisma = getPrismaClient();
 
-// Export the Prisma dev client instance (for dev database query)
-let prismaDevInstance: PrismaClient | null = null;
-
-function getPrismaDevClient(): PrismaClient | null {
-  const devUrl = env.DEV_POSTGRESDB_URI;
-  if (!devUrl) return null;
-
-  if (!prismaDevInstance) {
-    const adapter = new PrismaPg({ connectionString: devUrl });
-    prismaDevInstance = new PrismaClient({
-      adapter,
-      log: env.NODE_ENV === 'development' ? ['error', 'warn'] : ['error'],
-    });
-    logger.info('✅ Prisma Dev Client initialized with DEV_POSTGRESDB_URI adapter (Neon compatible)');
-  }
-  return prismaDevInstance;
-}
-
-export const prismaDev = getPrismaDevClient();
+/**
+ * Dual-DB merge client is disabled.
+ * Runtime always uses the single DB selected by USE_DEV_POSTGRES.
+ * Kept as null so legacy `if (prismaDev)` fallbacks no-op safely.
+ */
+export const prismaDev: PrismaClient | null = null;
 
 /**
  * Connect to Postgres database via Prisma
@@ -67,7 +63,8 @@ export const prismaDev = getPrismaDevClient();
 export async function connectPrisma(): Promise<void> {
   try {
     await prisma.$connect();
-    logger.info('✅ Prisma connected to Postgres database');
+    const target = env.USE_DEV_POSTGRES ? 'DEV' : 'PROD';
+    logger.info(`✅ Prisma connected to ${target} Postgres database`);
   } catch (error: any) {
     logger.error('❌ Failed to connect to Postgres via Prisma:', error.message);
     throw error;
@@ -94,4 +91,3 @@ export function isPrismaConnected(): boolean {
   // We'll use a simple query to check
   return true; // Will be checked via actual queries
 }
-

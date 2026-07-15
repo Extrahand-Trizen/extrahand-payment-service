@@ -13,10 +13,10 @@ import { transferToBank, getBankTransferStatus } from './mockBankTransferService
 import { prisma, prismaDev } from '../config/prisma';
 import { Prisma } from '@prisma/client';
 import mongoose from 'mongoose';
-import { updateUserPaymentProfile } from './userPaymentProfileService';
+import { applyPayoutStatusToProfile } from './userPaymentProfileService';
 import { createRazorpayXPayout, getRazorpayXPayoutStatus } from './razorpayxService';
 import { applyPenaltyLinesInTx, planPenaltyDeductionsFromGross } from './performerPenaltyService';
-import { notifyPayoutInitiated } from './paymentNotificationService';
+import { notifyPayoutCompleted, notifyPayoutInitiated } from './paymentNotificationService';
 import { getFeeStructureForCategory, resolveBiddingPayoutFeePercents, resolveEscrowCategoryFeeConfigKey } from './feeConfigService';
 import { applyExtraCoinsForPayout, awardExtraCoinsForCompletedTask } from './extraCoinsService';
 import { paymentRewardsFlags } from '../config/rewardsFlags';
@@ -805,14 +805,11 @@ export async function processPayout(params: {
       // Escrow already updated in Postgres above (line ~190)
 
       // Update UserPaymentProfile cache (async, don't wait)
-      updateUserPaymentProfile(performerUid, {
-        type: 'payout',
-        amount: netPayoutAmount,
-        payoutId,
-        escrowId: postgresEscrow.id,
-      }).catch((error) => {
-        logger.warn('Failed to update UserPaymentProfile (non-critical):', error);
-      });
+      applyPayoutStatusToProfile(performerUid, null, 'completed', netPayoutAmount, payoutId).catch(
+        (error) => {
+          logger.warn('Failed to update UserPaymentProfile (non-critical):', error);
+        },
+      );
 
       logger.info('✅ Payout processed successfully', {
         payoutId,
@@ -1476,15 +1473,14 @@ export async function processTaskCompletionPayout(params: {
       }
     }
 
-    if (status === 'completed') {
-      updateUserPaymentProfile(performerUid, {
-        type: 'payout',
-        amount: netAmount,
-        payoutId,
-      }).catch((error) => {
+    if (status === 'completed' || status === 'processing' || status === 'pending') {
+      applyPayoutStatusToProfile(performerUid, null, status, netAmount, payoutId).catch((error) => {
         logger.warn('Failed to update UserPaymentProfile after task completion payout', error);
       });
+    }
 
+    // Notify on create for both auto-completed and manual-ops (processing) so helper apps can refresh.
+    if (status === 'completed' || status === 'processing') {
       const performerContact = await getProfileContact(performerUid);
       notifyPayoutInitiated({
         performerUid,
@@ -1583,11 +1579,26 @@ export async function getPayoutStatus(payoutId: string): Promise<{
       return { success: false, error: 'Payout not found' };
     }
 
+    // Manual-ops rows (or any payout without a Razorpay transfer id) must not hit RazorpayX.
+    // Ops portal is the status authority until live payouts are enabled.
+    const payoutMeta =
+      payout.metadata && typeof payout.metadata === 'object' && !Array.isArray(payout.metadata)
+        ? (payout.metadata as Record<string, unknown>)
+        : {};
+    const isManualOpsPayout = payoutMeta.payoutMode === 'manual_ops';
+    const hasRazorpayTransferId =
+      typeof payout.bankTransferId === 'string' && payout.bankTransferId.trim().length > 0;
+
     // If this is a RazorpayX task-completion payout, poll RazorpayX for latest status.
     // This prevents "stuck processing" in the UI when the initial create call returns queued/processing.
-    if (payout.type === 'task_completion' && payout.status === 'processing') {
+    if (
+      payout.type === 'task_completion' &&
+      payout.status === 'processing' &&
+      !isManualOpsPayout &&
+      hasRazorpayTransferId
+    ) {
       try {
-        const razorpayLookupId = payout.bankTransferId || payout.payoutId;
+        const razorpayLookupId = payout.bankTransferId as string;
         const razorpayStatus = await getRazorpayXPayoutStatus(razorpayLookupId);
         const internalStatus = mapRazorpayPayoutStatusToInternal(razorpayStatus.status);
 
@@ -1617,7 +1628,21 @@ export async function getPayoutStatus(payoutId: string): Promise<{
             });
           }
 
-          // Keep cached earnings in sync once Razorpay indicates completion.
+          // Keep cached earnings in sync for any status transition (processing → completed/failed).
+          applyPayoutStatusToProfile(
+            payout.performerUid,
+            payout.status,
+            internalStatus,
+            payout.netAmount,
+            payout.payoutId,
+          ).catch((err) => {
+            logger.warn('Failed to update UserPaymentProfile after Razorpay payout status refresh', {
+              payoutId: payout.payoutId,
+              performerUid: payout.performerUid,
+              error: err?.message || 'Unknown error',
+            });
+          });
+
           if (internalStatus === 'completed') {
             const md =
               payout.metadata && typeof payout.metadata === 'object' && !Array.isArray(payout.metadata)
@@ -1664,19 +1689,6 @@ export async function getPayoutStatus(payoutId: string): Promise<{
                 });
               }
             }
-
-            updateUserPaymentProfile(payout.performerUid, {
-              type: 'payout',
-              amount: payout.netAmount,
-              payoutId: payout.payoutId,
-              escrowId: payout.escrowId || undefined,
-            }).catch((err) => {
-              logger.warn('Failed to update UserPaymentProfile after Razorpay payout status refresh', {
-                payoutId: payout.payoutId,
-                performerUid: payout.performerUid,
-                error: err?.message || 'Unknown error',
-              });
-            });
 
             const taskId = typeof md.taskId === 'string' ? md.taskId : '';
             if (taskId) {

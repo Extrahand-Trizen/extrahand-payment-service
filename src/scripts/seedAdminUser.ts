@@ -10,10 +10,12 @@ if (useProd) {
     console.error('PROD_POSTGRESDB_URI is required when using --prod');
     process.exit(1);
   }
-  process.env.POSTGRESDB_URI = prodUrl;
-  console.log('[seed:admin] Target: PROD');
+  process.env.USE_DEV_POSTGRES = 'false';
+  process.env.PROD_POSTGRESDB_URI = prodUrl;
+  console.log('[seed:admin] Target: PROD (USE_DEV_POSTGRES=false)');
 } else {
-  console.log('[seed:admin] Target: DEV (POSTGRESDB_URI)');
+  process.env.USE_DEV_POSTGRES = 'true';
+  console.log('[seed:admin] Target: DEV (USE_DEV_POSTGRES=true)');
 }
 
 const USERNAME = process.env.ADMIN_SEED_USERNAME || 'admin';

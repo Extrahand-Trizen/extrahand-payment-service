@@ -56,7 +56,13 @@ export async function notifyPaymentReceived(params: {
     userId: posterUid,
     title: 'Payment received',
     body: `We received ₹${amount} for${taskTitle ? ` ${taskTitle}` : ' your task'}.`,
-    data: { taskId, amount },
+    data: {
+      taskId,
+      amount,
+      eventKey: 'PAYMENT_RECEIVED',
+      entityType: 'payment',
+      category: 'payments',
+    },
   });
 
   fireWhatsAppNotify({
@@ -88,7 +94,13 @@ export async function notifyPayoutCompleted(params: {
     userId: performerUid,
     title: 'Payout credited',
     body: `₹${amount} has been sent to your account${taskTitle ? ` for ${taskTitle}` : ''}.`,
-    data: { taskId, amount },
+    data: {
+      taskId,
+      amount,
+      eventKey: 'PAYOUT_COMPLETED',
+      entityType: 'payout',
+      category: 'payments',
+    },
   });
 
   fireWhatsAppNotify({
@@ -128,7 +140,15 @@ export async function notifyRefundInitiated(params: {
     userId: posterUid,
     title: 'Task cancelled',
     body: `The task${taskTitle ? ` "${taskTitle}"` : ''} has been cancelled. Your amount will be refunded within 5-7 days.`,
-    data: { taskId, amount, reason, actionUrl },
+    data: {
+      taskId,
+      amount,
+      reason,
+      actionUrl,
+      eventKey: 'REFUND_INITIATED',
+      entityType: 'refund',
+      category: 'payments',
+    },
   });
 
   if (email && userName) {
@@ -165,7 +185,13 @@ export async function notifyPayoutInitiated(params: {
     userId: performerUid,
     title: 'Payout initiated',
     body: `Your payout of ₹${amount}${taskTitle ? ` for ${taskTitle}` : ''} has been initiated. It will be sent in a few minutes.`,
-    data: { taskId, amount },
+    data: {
+      taskId,
+      amount,
+      eventKey: 'PAYOUT_INITIATED',
+      entityType: 'payout',
+      category: 'payments',
+    },
   });
 
   if (email && userName) {
@@ -210,7 +236,14 @@ export async function notifyRefundProcessed(params: {
     userId: posterUid,
     title: 'Refund processed',
     body: `We processed your refund of ₹${amount}${taskTitle ? ` for ${taskTitle}` : ''}.`,
-    data: { taskId, amount, reason },
+    data: {
+      taskId,
+      amount,
+      reason,
+      eventKey: 'REFUND_PROCESSED',
+      entityType: 'refund',
+      category: 'payments',
+    },
   });
 }
 
@@ -231,6 +264,12 @@ export async function notifyPenaltyCreated(params: {
     userId: performerUid,
     title: 'Penalty applied',
     body: `A penalty of ₹${amount} has been applied${taskTitle ? ` for ${taskTitle}` : ''}. It will be adjusted in your next payout.`,
-    data: { taskId, amount },
+    data: {
+      taskId,
+      amount,
+      eventKey: 'PAYOUT_PENALTY',
+      entityType: 'payout',
+      category: 'payments',
+    },
   });
 }

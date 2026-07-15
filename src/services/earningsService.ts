@@ -69,6 +69,23 @@ function scheduleEarningsRecalc(userId: string, reason: string): void {
   });
 }
 
+async function livePendingAggregate(
+  uidList: string[],
+): Promise<{ pendingPayouts: Prisma.Decimal; pendingPayoutCount: number }> {
+  const pendingAgg = await prisma.payout.aggregate({
+    where: {
+      performerUid: { in: uidList },
+      status: { in: ['pending', 'processing'] },
+    },
+    _sum: { netAmount: true },
+    _count: { _all: true },
+  });
+  return {
+    pendingPayouts: pendingAgg._sum.netAmount || new Prisma.Decimal('0'),
+    pendingPayoutCount: pendingAgg._count._all || 0,
+  };
+}
+
 async function liveAggregateFallback(uidList: string[]): Promise<EarningsPayload> {
   const [payoutsAgg, compensationsAgg, pendingAgg] = await Promise.all([
     prisma.payout.aggregate({
@@ -86,14 +103,7 @@ async function liveAggregateFallback(uidList: string[]): Promise<EarningsPayload
       _sum: { toOtherParty: true },
       _count: { _all: true },
     }),
-    prisma.payout.aggregate({
-      where: {
-        performerUid: { in: uidList },
-        status: { in: ['pending', 'processing'] },
-      },
-      _sum: { netAmount: true },
-      _count: { _all: true },
-    }),
+    livePendingAggregate(uidList),
   ]);
 
   const fromPayouts = payoutsAgg._sum.netAmount || new Prisma.Decimal('0');
@@ -103,8 +113,8 @@ async function liveAggregateFallback(uidList: string[]): Promise<EarningsPayload
     totalEarnings: fromPayouts.plus(fromCompensation).toString(),
     fromPayouts: fromPayouts.toString(),
     fromCompensation: fromCompensation.toString(),
-    pendingPayouts: (pendingAgg._sum.netAmount || new Prisma.Decimal('0')).toString(),
-    pendingPayoutCount: pendingAgg._count._all || 0,
+    pendingPayouts: pendingAgg.pendingPayouts.toString(),
+    pendingPayoutCount: pendingAgg.pendingPayoutCount,
     totalPayouts: payoutsAgg._count._all || 0,
     totalCompensations: compensationsAgg._count._all || 0,
     labels: { ...EARNINGS_LABELS },
@@ -112,8 +122,26 @@ async function liveAggregateFallback(uidList: string[]): Promise<EarningsPayload
 }
 
 /**
+ * Overlay live pending onto a cached earnings payload.
+ * Pending/processing → completed transitions must not leave the Overview stuck
+ * on denormalized UserPaymentProfile.pendingPayouts.
+ */
+function withLivePending(
+  base: EarningsPayload,
+  live: { pendingPayouts: Prisma.Decimal; pendingPayoutCount: number },
+): EarningsPayload {
+  return {
+    ...base,
+    pendingPayouts: live.pendingPayouts.toString(),
+    pendingPayoutCount: live.pendingPayoutCount,
+  };
+}
+
+/**
  * Get total earnings for a user.
- * Cache-first (UserPaymentProfile); never awaits full recalc on the request path.
+ * Cache-first for completed totals; always live-read pending/processing so the
+ * Overview never shows a payout as "Processing" after it completed.
+ * When the profile is stale/missing, return a full live aggregate (and seed cache).
  */
 export async function getUserEarnings(
   userId: string,
@@ -126,10 +154,11 @@ export async function getUserEarnings(
   const started = Date.now();
   let path:
     | 'cache'
-    | 'stale'
-    | 'miss'
+    | 'stale_live'
+    | 'miss_live'
     | 'linked_merge'
-    | 'fallback_aggregate' = 'miss';
+    | 'linked_stale_live'
+    | 'fallback_aggregate' = 'miss_live';
 
   try {
     const uidList = [
@@ -140,48 +169,26 @@ export async function getUserEarnings(
       ),
     ];
 
+    if (uidList.length === 0) {
+      return { success: false, error: 'User ID is required' };
+    }
+
     if (uidList.length > 1) {
       const profiles = await prisma.userPaymentProfile.findMany({
         where: { userId: { in: uidList } },
       });
 
-      if (profiles.length > 0) {
-        path = 'linked_merge';
-        let fromPayouts = new Prisma.Decimal('0');
-        let fromCompensation = new Prisma.Decimal('0');
-        let pendingPayouts = new Prisma.Decimal('0');
-        let pendingPayoutCount = 0;
-        let totalPayouts = 0;
-        let totalCompensations = 0;
-        let anyStale = false;
+      const anyStale =
+        profiles.length === 0 ||
+        profiles.length < uidList.length ||
+        profiles.some((p) => isProfileStale(p.lastUpdatedAt));
 
-        for (const p of profiles) {
-          fromPayouts = fromPayouts.plus(p.fromPayouts);
-          fromCompensation = fromCompensation.plus(p.fromCompensation);
-          pendingPayouts = pendingPayouts.plus(p.pendingPayouts);
-          pendingPayoutCount += p.pendingPayoutCount || 0;
-          totalPayouts += p.payoutCount;
-          totalCompensations += p.compensationCount;
-          if (isProfileStale(p.lastUpdatedAt)) anyStale = true;
+      if (anyStale || profiles.length === 0) {
+        path = profiles.length === 0 ? 'fallback_aggregate' : 'linked_stale_live';
+        const earnings = await liveAggregateFallback(uidList);
+        for (const uid of uidList) {
+          scheduleEarningsRecalc(uid, path);
         }
-
-        if (anyStale || profiles.length < uidList.length) {
-          for (const uid of uidList) {
-            scheduleEarningsRecalc(uid, 'linked_partial_or_stale');
-          }
-        }
-
-        const earnings: EarningsPayload = {
-          totalEarnings: fromPayouts.plus(fromCompensation).toString(),
-          fromPayouts: fromPayouts.toString(),
-          fromCompensation: fromCompensation.toString(),
-          pendingPayouts: pendingPayouts.toString(),
-          pendingPayoutCount,
-          totalPayouts,
-          totalCompensations,
-          labels: { ...EARNINGS_LABELS },
-        };
-
         logger.info('[EarningsService] getUserEarnings', {
           userId,
           path,
@@ -189,18 +196,57 @@ export async function getUserEarnings(
           linkedCount: uidList.length,
           profileCount: profiles.length,
         });
-
         return { success: true, earnings };
       }
 
-      path = 'fallback_aggregate';
-      const earnings = await liveAggregateFallback(uidList);
-      scheduleEarningsRecalc(userId, 'linked_all_missing');
+      path = 'linked_merge';
+      let fromPayouts = new Prisma.Decimal('0');
+      let fromCompensation = new Prisma.Decimal('0');
+      let totalPayouts = 0;
+      let totalCompensations = 0;
+
+      for (const p of profiles) {
+        fromPayouts = fromPayouts.plus(p.fromPayouts);
+        fromCompensation = fromCompensation.plus(p.fromCompensation);
+        totalPayouts += p.payoutCount;
+        totalCompensations += p.compensationCount;
+      }
+
+      const livePending = await livePendingAggregate(uidList);
+      const earnings = withLivePending(
+        {
+          totalEarnings: fromPayouts.plus(fromCompensation).toString(),
+          fromPayouts: fromPayouts.toString(),
+          fromCompensation: fromCompensation.toString(),
+          pendingPayouts: '0',
+          pendingPayoutCount: 0,
+          totalPayouts,
+          totalCompensations,
+          labels: { ...EARNINGS_LABELS },
+        },
+        livePending,
+      );
+
+      // Heal denormalized pending if cache drifted.
+      const cachedPending = profiles.reduce(
+        (sum, p) => sum.plus(p.pendingPayouts || 0),
+        new Prisma.Decimal('0'),
+      );
+      if (!cachedPending.equals(livePending.pendingPayouts)) {
+        for (const uid of uidList) {
+          scheduleEarningsRecalc(uid, 'linked_pending_drift');
+        }
+      }
+
       logger.info('[EarningsService] getUserEarnings', {
         userId,
         path,
         durationMs: Date.now() - started,
+        linkedCount: uidList.length,
+        profileCount: profiles.length,
+        livePending: livePending.pendingPayouts.toString(),
       });
+
       return { success: true, earnings };
     }
 
@@ -209,27 +255,44 @@ export async function getUserEarnings(
     });
 
     if (profile) {
-      const stale = isProfileStale(profile.lastUpdatedAt);
-      path = stale ? 'stale' : 'cache';
-      if (stale) {
+      if (isProfileStale(profile.lastUpdatedAt)) {
+        path = 'stale_live';
+        const earnings = await liveAggregateFallback([userId]);
         scheduleEarningsRecalc(userId, 'stale');
+        logger.info('[EarningsService] getUserEarnings', {
+          userId,
+          path,
+          durationMs: Date.now() - started,
+        });
+        return { success: true, earnings };
       }
+
+      path = 'cache';
+      const livePending = await livePendingAggregate([userId]);
+      const earnings = withLivePending(fromProfileRow(profile), livePending);
+
+      if (!profile.pendingPayouts.equals(livePending.pendingPayouts)) {
+        scheduleEarningsRecalc(userId, 'pending_drift');
+      }
+
       logger.info('[EarningsService] getUserEarnings', {
         userId,
         path,
         durationMs: Date.now() - started,
+        livePending: livePending.pendingPayouts.toString(),
       });
-      return { success: true, earnings: fromProfileRow(profile) };
+      return { success: true, earnings };
     }
 
-    path = 'miss';
+    path = 'miss_live';
+    const earnings = await liveAggregateFallback([userId]);
     scheduleEarningsRecalc(userId, 'miss');
     logger.info('[EarningsService] getUserEarnings', {
       userId,
       path,
       durationMs: Date.now() - started,
     });
-    return { success: true, earnings: zeroEarnings() };
+    return { success: true, earnings };
   } catch (error: any) {
     logger.error('Error getting user earnings:', {
       error: error.message,

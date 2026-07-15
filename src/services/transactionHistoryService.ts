@@ -1328,11 +1328,20 @@ export async function getUserTransactions(
           .map((entry) => entry.transactionId),
       );
 
-      for (const refund of posterRefunds) {
+      type PosterRefundWithEscrow = (typeof posterRefunds)[number] & {
+        escrow?: EscrowHistoryRow | null;
+        refundId: string;
+      };
+
+      for (const refund of posterRefunds as PosterRefundWithEscrow[]) {
         if (!refund.escrow || seenRefundIds.has(refund.refundId)) continue;
 
         const ctx = resolveEscrowFinanceContext(refund.escrow);
-        const refundTx = buildPosterRefundTransaction(refund, refund.escrow, ctx);
+        const refundTx = buildPosterRefundTransaction(
+          refund as unknown as RefundHistoryRow,
+          refund.escrow,
+          ctx,
+        );
         // Multi-service Book Now line cancels stay on the parent payment only.
         if (!shouldEmitPosterRefundAsStandalone(refundTx, refund.escrow)) continue;
 

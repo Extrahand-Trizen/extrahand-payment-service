@@ -446,7 +446,14 @@ export async function recalculateUserPaymentProfile(userId: string): Promise<voi
   }
 }
 
+/**
+ * Profiles older than this are treated as stale: Overview returns a live
+ * aggregate and re-seeds the denormalized cache in the background.
+ * Keep this short so processing → completed is self-healing even if an
+ * incremental applyPayoutStatusToProfile update was missed.
+ */
+const PROFILE_STALE_MS = 2 * 60 * 1000; // 2 minutes
+
 export function isProfileStale(lastUpdatedAt: Date): boolean {
-  const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
-  return lastUpdatedAt < oneHourAgo;
+  return lastUpdatedAt.getTime() < Date.now() - PROFILE_STALE_MS;
 }

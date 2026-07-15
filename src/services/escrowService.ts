@@ -1421,48 +1421,8 @@ export async function getEscrowByTaskId(taskId: string): Promise<any | null> {
       return null;
     }
 
-<<<<<<< Updated upstream
-    let postgresEscrow = await prisma.escrow.findFirst({
-      where: {
-        taskId,
-      },
-      orderBy: {
-        createdAt: 'desc',
-      },
-    });
-
-    if (!postgresEscrow && prismaDev) {
-      postgresEscrow = await prismaDev.escrow.findFirst({
-        where: {
-          taskId,
-        },
-        orderBy: {
-          createdAt: 'desc',
-        },
-      });
-    }
-
-    if (postgresEscrow) {
-      return convertPostgresEscrowToFrontendFormat(postgresEscrow);
-    }
-
-    // Fallback: Book Now escrows are keyed by bookingOrderId, not the materialized task _id
-    const byBookingOrderId = await findEscrowByBookingOrderId(taskId);
-    if (byBookingOrderId) {
-      return convertPostgresEscrowToFrontendFormat(byBookingOrderId);
-    }
-
-    // Fallback: Book Now line-item taskId embedded in escrow metadata
-    const byLineTask = await findEscrowByBookNowLineTaskId(taskId);
-    if (byLineTask) {
-      return convertPostgresEscrowToFrontendFormat(byLineTask);
-    }
-
-    return null;
-=======
     const postgresEscrow = await resolveEscrowRecordForTaskId(taskId);
     return postgresEscrow ? await convertPostgresEscrowToFrontendFormat(postgresEscrow) : null;
->>>>>>> Stashed changes
   } catch (error: any) {
     logger.error('❌ Error getting escrow by task ID:', error);
     return null;

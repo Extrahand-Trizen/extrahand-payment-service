@@ -702,7 +702,6 @@ export async function getUserTransactions(
       ),
     ];
 
-    const startedAt = Date.now();
     logger.info(
       `[TransactionHistory] Fetching transactions for userIds ${uidList.join(',')} category: ${categoryFilter || 'all'}`
     );
@@ -713,16 +712,10 @@ export async function getUserTransactions(
       return { success: false, error: 'User ID is required' };
     }
 
-    // Category-aware escrow match: earnings ≈ performer side; payments ≈ poster side.
-    const escrowOr: Prisma.EscrowWhereInput[] =
-      categoryFilter === 'earnings'
-        ? [{ performerUid: { in: uidList } }]
-        : categoryFilter === 'payments'
-          ? [{ posterUid: { in: uidList } }]
-          : [{ posterUid: { in: uidList } }, { performerUid: { in: uidList } }];
-
+    // 1. Get escrows where user is poster or performer
+    // Apply database-level filtering for better performance
     const escrowWhere: Prisma.EscrowWhereInput = {
-      OR: escrowOr,
+      OR: [{ posterUid: { in: uidList } }, { performerUid: { in: uidList } }],
     };
 
     if (startDate || endDate) {
@@ -735,121 +728,32 @@ export async function getUserTransactions(
       escrowWhere.status = statusFilter;
     }
 
-    // Bound overfetch per source; final pagination is applied after merge/sort.
-    // Do not `skip: offset` on each source — that double-paginates and drops rows.
-    const fetchWindow = Math.min(Math.max(limit + offset + 20, 50), 200);
-    const needEscrows =
-      !typeFilter ||
-      typeFilter === 'payment' ||
-      typeFilter === 'escrow' ||
-      typeFilter === 'payout' ||
-      typeFilter === 'refund' ||
-      typeFilter === 'compensation' ||
-      typeFilter === 'fee';
-    const needStandalonePayouts =
-      (!typeFilter || typeFilter === 'payout') && categoryFilter !== 'payments';
-    const needPosterRefunds =
-      (!typeFilter || typeFilter === 'refund') && categoryFilter !== 'earnings';
-    const needPenalties =
-      (!typeFilter || typeFilter === 'cancellation_penalty') && categoryFilter !== 'earnings';
+    // Keep a small headroom for post-merge in-memory filters/dedupe without
+    // allowing unbounded overfetch windows under high traffic.
+    const fetchLimit = Math.min(Math.max(limit + 20, 50), 120);
 
-    const dateRangeWhere =
-      startDate || endDate
-        ? {
-            createdAt: {
-              ...(startDate ? { gte: startDate } : {}),
-              ...(endDate ? { lte: endDate } : {}),
-            },
-          }
-        : {};
+    // Fetch escrows from PROD DB
+    const escrowsProd = await prisma.escrow.findMany({
+      where: escrowWhere,
+      include: {
+        payouts: {
+          where:
+            categoryFilter === 'earnings'
+              ? { performerUid: { in: uidList }, status: statusFilter || undefined }
+              : undefined,
+        },
+        refunds: {
+          where: statusFilter ? { status: statusFilter } : undefined,
+        }
+      },
+      orderBy: { createdAt: 'desc' },
+      take: fetchLimit,
+      skip: offset
+    });
 
-    const t0 = Date.now();
-    const [escrowsProd, standalonePayoutsProd, posterRefundsResult, penaltiesResult] =
-      await Promise.all([
-        needEscrows
-          ? prisma.escrow.findMany({
-              where: escrowWhere,
-              include: {
-                payouts: {
-                  where:
-                    categoryFilter === 'payments'
-                      ? { id: { in: [] } }
-                      : categoryFilter === 'earnings'
-                        ? {
-                            performerUid: { in: uidList },
-                            ...(statusFilter ? { status: statusFilter } : {}),
-                          }
-                        : statusFilter
-                          ? { status: statusFilter }
-                          : undefined,
-                },
-                refunds: {
-                  where: statusFilter ? { status: statusFilter } : undefined,
-                },
-              },
-              orderBy: { createdAt: 'desc' },
-              take: fetchWindow,
-            })
-          : Promise.resolve([]),
-        needStandalonePayouts
-          ? prisma.payout.findMany({
-              where: {
-                performerUid: { in: uidList },
-                escrowId: null,
-                ...(statusFilter ? { status: statusFilter } : {}),
-                ...dateRangeWhere,
-              },
-              orderBy: { createdAt: 'desc' },
-              take: fetchWindow,
-            })
-          : Promise.resolve([]),
-        needPosterRefunds
-          ? prisma.refund
-              .findMany({
-                where: {
-                  escrow: { posterUid: { in: uidList } },
-                  ...(statusFilter ? { status: statusFilter } : {}),
-                  ...dateRangeWhere,
-                },
-                include: { escrow: true },
-                orderBy: { createdAt: 'desc' },
-                take: fetchWindow,
-              })
-              .catch((refundFetchErr: unknown) => {
-                logger.warn('[TransactionHistory] Standalone refund fetch failed', {
-                  message:
-                    refundFetchErr instanceof Error
-                      ? refundFetchErr.message
-                      : String(refundFetchErr),
-                });
-                return [] as Awaited<ReturnType<typeof prisma.refund.findMany>>;
-              })
-          : Promise.resolve([]),
-        needPenalties
-          ? prisma.performerCancellationPenalty
-              .findMany({
-                where: {
-                  performerUid: { in: uidList },
-                  status: 'pending',
-                  remainingAmount: { gt: new Prisma.Decimal(0) },
-                },
-                orderBy: { createdAt: 'desc' },
-                take: fetchWindow,
-              })
-              .catch((penErr: any) => {
-                logger.warn('[TransactionHistory] Skipping cancellation_penalty rows', {
-                  message: penErr?.message,
-                });
-                return [] as Awaited<
-                  ReturnType<typeof prisma.performerCancellationPenalty.findMany>
-                >;
-              })
-          : Promise.resolve([]),
-      ]);
-    const queryMs = Date.now() - t0;
-
+    // Fetch escrows from DEV DB and merge (deduplicate by escrowId)
     let escrows = escrowsProd;
-    if (prismaDev && needEscrows) {
+    if (prismaDev) {
       try {
         const escrowsDev = await prismaDev.escrow.findMany({
           where: escrowWhere,
@@ -862,10 +766,11 @@ export async function getUserTransactions(
             },
             refunds: {
               where: statusFilter ? { status: statusFilter } : undefined,
-            },
+            }
           },
           orderBy: { createdAt: 'desc' },
-          take: fetchWindow,
+          take: fetchLimit,
+          skip: offset
         });
         if (escrowsDev.length > 0) {
           const prodIds = new Set(escrowsProd.map((e) => e.escrowId));
@@ -880,18 +785,48 @@ export async function getUserTransactions(
       }
     }
 
+    // Preload standalone payouts (escrowId = null) from PROD DB
+    const standalonePayoutsProd =
+      !typeFilter || typeFilter === 'payout'
+        ? await prisma.payout.findMany({
+            where: {
+              performerUid: { in: uidList },
+              escrowId: null,
+              ...(statusFilter ? { status: statusFilter } : {}),
+              ...(startDate || endDate
+                ? {
+                    createdAt: {
+                      ...(startDate ? { gte: startDate } : {}),
+                      ...(endDate ? { lte: endDate } : {}),
+                    },
+                  }
+                : {}),
+            },
+            orderBy: { createdAt: 'desc' },
+            take: fetchLimit,
+          })
+        : [];
+
+    // Merge standalone payouts from DEV DB
     let standalonePayouts = standalonePayoutsProd;
-    if (prismaDev && needStandalonePayouts) {
+    if (prismaDev && (!typeFilter || typeFilter === 'payout')) {
       try {
         const standalonePayoutsDev = await prismaDev.payout.findMany({
           where: {
             performerUid: { in: uidList },
             escrowId: null,
             ...(statusFilter ? { status: statusFilter } : {}),
-            ...dateRangeWhere,
+            ...(startDate || endDate
+              ? {
+                  createdAt: {
+                    ...(startDate ? { gte: startDate } : {}),
+                    ...(endDate ? { lte: endDate } : {}),
+                  },
+                }
+              : {}),
           },
           orderBy: { createdAt: 'desc' },
-          take: fetchWindow,
+          take: fetchLimit,
         });
         if (standalonePayoutsDev.length > 0) {
           const prodPayoutIds = new Set(standalonePayoutsProd.map((p) => p.payoutId));
@@ -906,12 +841,8 @@ export async function getUserTransactions(
       }
     }
 
-    const posterRefunds = Array.isArray(posterRefundsResult) ? posterRefundsResult : [];
-    const penalties = Array.isArray(penaltiesResult) ? penaltiesResult : [];
-
     // Convert escrows to transactions
     // IMPORTANT: Always add all transactions with their correct category, then filter after
-    const assembleStartedAt = Date.now();
     escrows.forEach((escrow) => {
       const isPoster = uidList.includes(escrow.posterUid);
       const isPerformer = escrow.performerUid ? uidList.includes(escrow.performerUid) : false;
@@ -1320,67 +1251,94 @@ export async function getUserTransactions(
       });
     });
 
-    // Poster refunds (prefetched) — parent escrow may fall outside escrow window
-    if (needPosterRefunds && posterRefunds.length > 0) {
-      const seenRefundIds = new Set(
-        transactions
-          .filter((entry) => entry.type === 'refund')
-          .map((entry) => entry.transactionId),
-      );
-
-      type PosterRefundWithEscrow = (typeof posterRefunds)[number] & {
-        escrow?: EscrowHistoryRow | null;
-        refundId: string;
-      };
-
-      for (const refund of posterRefunds as PosterRefundWithEscrow[]) {
-        if (!refund.escrow || seenRefundIds.has(refund.refundId)) continue;
-
-        const ctx = resolveEscrowFinanceContext(refund.escrow);
-        const refundTx = buildPosterRefundTransaction(
-          refund as unknown as RefundHistoryRow,
-          refund.escrow,
-          ctx,
+    // Poster refunds queried directly — parent escrow may fall outside escrow pagination window
+    if (!typeFilter || typeFilter === 'refund') {
+      try {
+        const seenRefundIds = new Set(
+          transactions
+            .filter((entry) => entry.type === 'refund')
+            .map((entry) => entry.transactionId),
         );
-        // Multi-service Book Now line cancels stay on the parent payment only.
-        if (!shouldEmitPosterRefundAsStandalone(refundTx, refund.escrow)) continue;
+        const posterRefunds = await prisma.refund.findMany({
+          where: {
+            escrow: { posterUid: { in: uidList } },
+            ...(statusFilter ? { status: statusFilter } : {}),
+            ...(startDate || endDate
+              ? {
+                  createdAt: {
+                    ...(startDate ? { gte: startDate } : {}),
+                    ...(endDate ? { lte: endDate } : {}),
+                  },
+                }
+              : {}),
+          },
+          include: { escrow: true },
+          orderBy: { createdAt: 'desc' },
+          take: fetchLimit,
+        });
 
-        transactions.push(refundTx);
-        seenRefundIds.add(refund.refundId);
+        for (const refund of posterRefunds) {
+          if (!refund.escrow || seenRefundIds.has(refund.refundId)) continue;
+          const ctx = resolveEscrowFinanceContext(refund.escrow);
+          const refundTx = buildPosterRefundTransaction(refund, refund.escrow, ctx);
+          if (!shouldEmitPosterRefundAsStandalone(refundTx, refund.escrow)) continue;
+          transactions.push(refundTx);
+          seenRefundIds.add(refund.refundId);
+        }
+      } catch (refundFetchErr: unknown) {
+        logger.warn('[TransactionHistory] Standalone refund fetch failed', {
+          message: refundFetchErr instanceof Error ? refundFetchErr.message : String(refundFetchErr),
+        });
       }
     }
 
-    // Tasker cancellation penalties (prefetched)
-    if (needPenalties && penalties.length > 0) {
-      penalties.forEach((pen: (typeof penalties)[number]) => {
-        transactions.push({
-          id: pen.id,
-          transactionId: pen.penaltyId,
-          type: 'cancellation_penalty',
-          amount: pen.remainingAmount.toString(),
-          status: 'pending',
-          description: pen.taskTitle
-            ? `Cancellation penalty — ${pen.taskTitle}`
-            : `Cancellation penalty for task ${pen.taskId}`,
-          date: pen.cancelledAt.toISOString(),
-          relatedEntityId: pen.penaltyId,
-          category: 'payments',
-          metadata: {
-            taskId: pen.taskId,
-            taskTitle: pen.taskTitle,
-            penaltyId: pen.penaltyId,
-            originalPenaltyAmount: pen.amount.toString(),
-            remainingAmount: pen.remainingAmount.toString(),
-            feePercentage: pen.feePercentage?.toString(),
-            reason: pen.reason,
-            escrowStatus: 'pending_penalty',
+    // Tasker cancellation penalties — optional DB features must not break core history
+    if (!typeFilter || typeFilter === 'cancellation_penalty') {
+      try {
+        const penalties = await prisma.performerCancellationPenalty.findMany({
+          where: {
+            performerUid: { in: uidList },
+            status: 'pending',
+            remainingAmount: { gt: new Prisma.Decimal(0) },
           },
+          orderBy: { createdAt: 'desc' },
+          take: fetchLimit,
         });
-      });
+
+        penalties.forEach((pen: (typeof penalties)[number]) => {
+          transactions.push({
+            id: pen.id,
+            transactionId: pen.penaltyId,
+            type: 'cancellation_penalty',
+            amount: pen.remainingAmount.toString(),
+            status: 'pending',
+            description: pen.taskTitle
+              ? `Cancellation penalty — ${pen.taskTitle}`
+              : `Cancellation penalty for task ${pen.taskId}`,
+            date: pen.cancelledAt.toISOString(),
+            relatedEntityId: pen.penaltyId,
+            category: 'payments',
+            metadata: {
+              taskId: pen.taskId,
+              taskTitle: pen.taskTitle,
+              penaltyId: pen.penaltyId,
+              originalPenaltyAmount: pen.amount.toString(),
+              remainingAmount: pen.remainingAmount.toString(),
+              feePercentage: pen.feePercentage?.toString(),
+              reason: pen.reason,
+              escrowStatus: 'pending_penalty',
+            },
+          });
+        });
+      } catch (penErr: any) {
+        logger.warn('[TransactionHistory] Skipping cancellation_penalty rows', {
+          message: penErr?.message,
+        });
+      }
     }
 
-    // Include payouts that are not linked to an escrow (RazorpayX-only / manual-ops flow)
-    if (needStandalonePayouts) {
+    // Include payouts that are not linked to an escrow (RazorpayX-only flow)
+    if (!typeFilter || typeFilter === 'payout') {
       try {
         standalonePayouts.forEach((payout) => {
           const payoutStandaloneMeta = (payout as { metadata?: unknown }).metadata;
@@ -1497,18 +1455,7 @@ export async function getUserTransactions(
     // 6. Apply pagination on final filtered rows.
     const paginatedTransactions = filteredTransactions.slice(offset, offset + limit);
 
-    logger.info('[TransactionHistory] Returning page', {
-      count: paginatedTransactions.length,
-      total,
-      category: categoryFilter || 'all',
-      queryMs,
-      assembleMs: Date.now() - assembleStartedAt,
-      durationMs: Date.now() - startedAt,
-      escrowCount: escrows.length,
-      standalonePayoutCount: standalonePayouts.length,
-      posterRefundCount: posterRefunds.length,
-      penaltyCount: penalties.length,
-    });
+    logger.info(`[TransactionHistory] Returning ${paginatedTransactions.length} transactions (total: ${total}) after pagination`);
 
     return {
       success: true,
@@ -1547,7 +1494,6 @@ export async function getTransactionSummary(
   error?: string;
 }> {
   try {
-    const summaryStartedAt = Date.now();
     const uidList = [
       ...new Set(
         [userId, ...(linkedUserIds || [])].filter(
@@ -1555,10 +1501,6 @@ export async function getTransactionSummary(
         )
       ),
     ];
-
-    if (uidList.length === 0) {
-      return { success: false, error: 'User ID is required' };
-    }
 
     const payoutWhere: Prisma.PayoutWhereInput = {
       performerUid: { in: uidList },
@@ -1725,12 +1667,6 @@ export async function getTransactionSummary(
       new Prisma.Decimal('0'),
       totalPayments.minus(totalRefunds),
     );
-
-    logger.info('[TransactionHistory] Summary computed', {
-      userId,
-      durationMs: Date.now() - summaryStartedAt,
-      transactionCount,
-    });
 
     return {
       success: true,

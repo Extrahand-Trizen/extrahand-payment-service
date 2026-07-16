@@ -21,6 +21,8 @@ router.get('/payouts', asyncHandler(AdminFinanceController.getPayouts));
 router.get('/payouts/:id', asyncHandler(AdminFinanceController.getPayoutById));
 router.post('/payouts/:id/retry', asyncHandler(AdminFinanceController.retryPayout));
 router.post('/payouts/:id/hold', asyncHandler(AdminFinanceController.holdPayout));
+// Status update (ops portal) — same handler as /dashboard/payouts/:id/status
+router.patch('/payouts/:id/status', asyncHandler(AdminFinanceController.updatePayoutStatus));
 
 // Refunds
 router.get('/refunds', asyncHandler(AdminFinanceController.getRefunds));

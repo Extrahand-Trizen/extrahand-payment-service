@@ -565,7 +565,14 @@ export class AdminFinanceController {
   }
 
   static async updatePayoutStatus(req: Request, res: Response): Promise<void> {
-    const { id } = req.params;
+    // Express may leave encoded path segments as-is depending on settings; normalize both forms.
+    const rawId = String(req.params.id || '').trim();
+    let id = rawId;
+    try {
+      id = decodeURIComponent(rawId);
+    } catch {
+      id = rawId;
+    }
     const { status } = req.body || {};
     if (!id) throw new BadRequestError('Payout id is required');
     if (!status || typeof status !== 'string') {
@@ -578,18 +585,29 @@ export class AdminFinanceController {
     }
 
     let targetPrisma = prisma;
+    // Match by internal UUID, business payoutId, or bankTransferId (RazorpayX pout_*)
     let payout = await prisma.payout.findFirst({
-      where: { OR: [{ id }, { payoutId: id }] },
+      where: {
+        OR: [{ id }, { payoutId: id }, { bankTransferId: id }],
+      },
     });
     if (!payout && prismaDev) {
       payout = await prismaDev.payout.findFirst({
-        where: { OR: [{ id }, { payoutId: id }] },
+        where: {
+          OR: [{ id }, { payoutId: id }, { bankTransferId: id }],
+        },
       });
       if (payout) {
         targetPrisma = prismaDev;
       }
     }
-    if (!payout) throw new NotFoundError('Payout not found');
+    if (!payout) {
+      logger.warn('Admin payout status update: payout not found', {
+        lookupId: id,
+        status,
+      });
+      throw new NotFoundError('Payout not found');
+    }
 
     const updated = await targetPrisma.payout.update({
       where: { id: payout.id },

@@ -1396,6 +1396,7 @@ export async function processTaskCompletionPayout(params: {
             tds,
             bankTransferId: null,
             status,
+            source: 'task_completion',
             type: 'task_completion',
             description: duplicateDescription,
             metadata: manualMetadata as Prisma.InputJsonValue,

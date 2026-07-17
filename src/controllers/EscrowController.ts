@@ -12,6 +12,7 @@ import {
   releaseEscrow,
   updateEscrowAutoRelease,
 } from '../services/escrowService';
+import { getTaskDeletionSafety } from '../services/deletionSafetyService';
 import { BadRequestError, NotFoundError } from '../errors/AppError';
 
 export class EscrowController {
@@ -242,6 +243,25 @@ export class EscrowController {
     res.json({
       success: true,
       escrow,
+    });
+  }
+
+  /**
+   * GET /api/v1/escrow/task/:taskId/deletion-safety
+   * Financial safety snapshot for task hard/soft delete decisions.
+   */
+  static async getTaskDeletionSafety(req: Request, res: Response): Promise<void> {
+    const { taskId } = req.params;
+    if (!taskId?.trim()) {
+      throw new BadRequestError('taskId is required');
+    }
+    const bookingOrderId =
+      typeof req.query.bookingOrderId === 'string' ? req.query.bookingOrderId.trim() : undefined;
+
+    const safety = await getTaskDeletionSafety(taskId.trim(), { bookingOrderId });
+    res.json({
+      success: true,
+      ...safety,
     });
   }
 

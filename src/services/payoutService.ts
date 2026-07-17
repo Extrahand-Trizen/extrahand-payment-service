@@ -1032,6 +1032,20 @@ export async function processTaskCompletionPayout(params: {
       });
     }
 
+    if (!taskEscrow) {
+      return {
+        success: false,
+        error: 'Escrow not found for this task. Payout cannot be processed.',
+      };
+    }
+
+    if (String(taskEscrow.status || '').toLowerCase() !== 'held') {
+      return {
+        success: false,
+        error: 'Payout cannot be processed for the current escrow state.',
+      };
+    }
+
     let grossAmount = resolveEscrowTaskAmountForPayout(taskEscrow, amount).toDecimalPlaces(2);
     const clientAmount = new Prisma.Decimal(String(amount || '0')).toDecimalPlaces(2);
     if (trimmedVisitId && clientAmount.gt(0) && clientAmount.gt(grossAmount)) {
@@ -1307,10 +1321,17 @@ export async function processTaskCompletionPayout(params: {
       status = 'completed';
 
       await prisma.$transaction(async (tx) => {
+        const claimed = await tx.escrow.updateMany({
+          where: { id: taskEscrow!.id, status: 'held' },
+          data: { status: 'released', releasedAt: new Date() },
+        });
+        if (claimed.count === 0) {
+          throw new Error('Payout cannot be processed for the current escrow state.');
+        }
         await tx.payout.create({
           data: {
             payoutId,
-            escrowId: null,
+            escrowId: taskEscrow!.id,
             performerUid,
             amount: grossAmount,
             netAmount,
@@ -1356,6 +1377,13 @@ export async function processTaskCompletionPayout(params: {
       };
 
       await prisma.$transaction(async (tx) => {
+        const claimed = await tx.escrow.updateMany({
+          where: { id: taskEscrow!.id, status: 'held' },
+          data: { status: 'released', releasedAt: new Date() },
+        });
+        if (claimed.count === 0) {
+          throw new Error('Payout cannot be processed for the current escrow state.');
+        }
         await tx.payout.create({
           data: {
             payoutId,
@@ -1393,6 +1421,18 @@ export async function processTaskCompletionPayout(params: {
           error: 'Selected bank account is not linked to RazorpayX fund account',
         };
       }
+
+      const claimedEscrow = await prisma.escrow.updateMany({
+        where: { id: taskEscrow!.id, status: 'held' },
+        data: { status: 'released', releasedAt: new Date() },
+      });
+      if (claimedEscrow.count === 0) {
+        return {
+          success: false,
+          error: 'Payout cannot be processed for the current escrow state.',
+        };
+      }
+
       logger.debug('[payoutService] Creating RazorpayX payout with penalty deduction applied', {
         performerUid,
         taskId,
@@ -1407,13 +1447,14 @@ export async function processTaskCompletionPayout(params: {
 
       status = mapRazorpayPayoutStatusToInternal(payoutResponse.status);
       const completedAt = status === 'completed' ? new Date() : null;
+      const postgresEscrowId = taskEscrow!.id;
 
       if (status === 'completed' && penaltyPlan.lines.length > 0) {
         await prisma.$transaction(async (tx) => {
           await tx.payout.create({
             data: {
               payoutId,
-              escrowId: null,
+              escrowId: postgresEscrowId,
               performerUid,
               amount: grossAmount,
               netAmount,
@@ -1441,7 +1482,7 @@ export async function processTaskCompletionPayout(params: {
         await prisma.payout.create({
           data: {
             payoutId,
-            escrowId: null,
+            escrowId: postgresEscrowId,
             performerUid,
             amount: grossAmount,
             netAmount,

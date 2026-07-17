@@ -41,6 +41,15 @@ router.get(
 );
 
 /**
+ * GET /api/v1/escrow/task/:taskId/deletion-safety
+ * Financial footprint for hard/soft delete decisions (service-to-service).
+ */
+router.get(
+  '/task/:taskId/deletion-safety',
+  asyncHandler(EscrowController.getTaskDeletionSafety),
+);
+
+/**
  * GET /api/v1/escrow/task/:taskId
  * Get escrow by task ID
  */

@@ -8,6 +8,7 @@ export type WhatsAppTemplateKey =
   | 'wa_earnings_credited'
   | 'wa_withdrawal_processed'
   | 'wa_withdrawal_failed'
+  | 'wa_invoice_ready'
   | 'extrahand_invoice_ready'
   | 'extrahand_payment_released'
   | 'extrahand_earnings_credited'

@@ -8,7 +8,11 @@ export type WhatsAppTemplateKey =
   | 'wa_earnings_credited'
   | 'wa_withdrawal_processed'
   | 'wa_withdrawal_failed'
-  | 'wa_invoice_ready';
+  | 'extrahand_invoice_ready'
+  | 'extrahand_payment_released'
+  | 'extrahand_earnings_credited'
+  | 'extrahand_withdrawal_processed'
+  | 'extrahand_withdrawal_failed';
 
 export type WhatsAppNotifyPayload = {
   uid: string;
@@ -49,6 +53,17 @@ export class WhatsAppClient {
 
     if (!payload?.uid || !payload.templateKey) {
       return false;
+    }
+
+    const suppressLegacy = String(process.env.WHATSAPP_SUPPRESS_LEGACY || '')
+      .trim()
+      .toLowerCase();
+    if (suppressLegacy === '1' || suppressLegacy === 'true' || suppressLegacy === 'yes') {
+      logger.info('WhatsAppClient: skipped (dialog push bridge owns WhatsApp)', {
+        templateKey: payload.templateKey,
+        uid: payload.uid,
+      });
+      return true;
     }
 
     if (!this.serviceAuthToken) {

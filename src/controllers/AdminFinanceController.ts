@@ -575,18 +575,13 @@ export class AdminFinanceController {
       throw new BadRequestError(`Invalid payout status. Allowed values: ${allowedStatuses.join(', ')}`);
     }
 
-    let targetPrisma = prisma;
-    let payout = await prisma.payout.findFirst({
+    const environment = typeof req.query.environment === 'string' ? req.query.environment : 'production';
+    const useDevDb = environment === 'development' && prismaDev != null;
+    const targetPrisma = useDevDb ? prismaDev! : prisma;
+
+    let payout = await targetPrisma.payout.findFirst({
       where: { OR: [{ id }, { payoutId: id }] },
     });
-    if (!payout && prismaDev) {
-      payout = await prismaDev.payout.findFirst({
-        where: { OR: [{ id }, { payoutId: id }] },
-      });
-      if (payout) {
-        targetPrisma = prismaDev;
-      }
-    }
     if (!payout) throw new NotFoundError('Payout not found');
 
     const updated = await targetPrisma.payout.update({

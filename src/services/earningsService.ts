@@ -108,7 +108,7 @@ export async function getUserEarnings(userId: string, linkedUserIds?: string[]):
           totalPayouts,
           totalCompensations,
           labels: {
-            fromPayouts: 'From Completed Tasks',
+            fromPayouts: 'From Completed Works',
             fromCompensation: 'From Cancellations',
           },
         },
@@ -189,7 +189,7 @@ export async function getUserEarnings(userId: string, linkedUserIds?: string[]):
           totalPayouts,
           totalCompensations,
           labels: {
-            fromPayouts: 'From Completed Tasks',
+            fromPayouts: 'From Completed Works',
             fromCompensation: 'From Cancellations',
           },
         },
@@ -229,7 +229,7 @@ export async function getUserEarnings(userId: string, linkedUserIds?: string[]):
           totalPayouts: 0,
           totalCompensations: 0,
           labels: {
-            fromPayouts: 'From Completed Tasks',
+            fromPayouts: 'From Completed Works',
             fromCompensation: 'From Cancellations',
           },
         },
@@ -246,7 +246,7 @@ export async function getUserEarnings(userId: string, linkedUserIds?: string[]):
         totalPayouts: profile.payoutCount,
         totalCompensations: profile.compensationCount,
         labels: {
-          fromPayouts: 'From Completed Tasks',
+          fromPayouts: 'From Completed Works',
           fromCompensation: 'From Cancellations',
         },
       },
@@ -368,7 +368,7 @@ export async function getEarningsByPeriod(
           payoutCount: payoutData.count,
           compensationCount: compensationData.count,
           labels: {
-            fromPayouts: 'Completed Tasks',
+            fromPayouts: 'Completed Works',
             fromCompensation: 'Cancellations',
           },
         };

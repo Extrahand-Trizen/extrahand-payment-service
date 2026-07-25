@@ -29,6 +29,7 @@ import {
 } from './bankAccountSecrets';
 import { resolveEscrowTaskAmountForPayout } from '../utils/escrowFinanceUtils';
 import { enrichRecurringPayoutMetadata } from '../utils/recurringPayoutDisplay';
+import { mapRazorpayPayoutStatusToInternal } from '../utils/payoutStatusMapping';
 
 /**
  * Generate unique payout ID
@@ -143,21 +144,6 @@ async function getProfileContact(uid: string): Promise<{ email?: string; name?: 
     logger.debug('Failed to load profile contact for payout notification', { error, uid });
     return null;
   }
-}
-
-function mapRazorpayPayoutStatusToInternal(razorpayStatus?: string | null): string {
-  const s = String(razorpayStatus || '').toLowerCase();
-
-  if (!s) return 'processing';
-
-  if (s === 'processed' || s === 'completed' || s === 'success') return 'completed';
-  if (s === 'failed' || s === 'failure') return 'failed';
-  if (s === 'reversed') return 'reversed';
-
-  // Common "still in progress" states returned by payout APIs.
-  if (s === 'processing' || s === 'created' || s === 'queued') return 'processing';
-
-  return 'processing';
 }
 
 async function enqueuePendingTaskCompletionPayout(params: {
@@ -1362,6 +1348,7 @@ export async function processTaskCompletionPayout(params: {
         await tx.payout.create({
           data: {
             payoutId,
+            taskId,
             escrowId: postgresEscrowId,
             performerUid,
             amount: grossAmount,
@@ -1416,6 +1403,7 @@ export async function processTaskCompletionPayout(params: {
           await tx.payout.create({
             data: {
               payoutId,
+              taskId,
               escrowId: null,
               performerUid,
               amount: grossAmount,
@@ -1444,6 +1432,7 @@ export async function processTaskCompletionPayout(params: {
         await prisma.payout.create({
           data: {
             payoutId,
+            taskId,
             escrowId: null,
             performerUid,
             amount: grossAmount,

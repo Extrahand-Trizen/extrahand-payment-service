@@ -1,100 +1,240 @@
-import { prisma, prismaDev } from '../config/prisma';
+import { prisma } from '../config/prisma';
 import logger from '../config/logger';
 import { Prisma } from '@prisma/client';
 import {
-  recalculateUserPaymentProfile,
+  recalculateUserEarningsProfile,
   isProfileStale,
 } from './userPaymentProfileService';
 
-/**
- * Get total earnings for a user
- * Uses UserPaymentProfile cache for fast access, falls back to calculation if missing/stale
- * Includes:
- * - Completed payouts (netAmount after fees)
- * - Cancellation compensation (toOtherParty when poster cancels)
- */
-export async function getUserEarnings(userId: string, linkedUserIds?: string[]): Promise<{
-  success: boolean;
-  earnings?: {
-    totalEarnings: string;
+const EARNINGS_LABELS = {
+  fromPayouts: 'From Completed Tasks',
+  fromCompensation: 'From Cancellations',
+} as const;
+
+type EarningsPayload = {
+  totalEarnings: string;
+  fromPayouts: string;
+  fromCompensation: string;
+  pendingPayouts: string;
+  pendingPayoutCount: number;
+  totalPayouts: number;
+  totalCompensations: number;
+  labels: {
     fromPayouts: string;
     fromCompensation: string;
-    totalPayouts: number;
-    totalCompensations: number;
-    labels?: {
-      fromPayouts: string;
-      fromCompensation: string;
-    };
   };
+};
+
+function zeroEarnings(): EarningsPayload {
+  return {
+    totalEarnings: '0',
+    fromPayouts: '0',
+    fromCompensation: '0',
+    pendingPayouts: '0',
+    pendingPayoutCount: 0,
+    totalPayouts: 0,
+    totalCompensations: 0,
+    labels: { ...EARNINGS_LABELS },
+  };
+}
+
+function fromProfileRow(profile: {
+  totalEarnings: Prisma.Decimal;
+  fromPayouts: Prisma.Decimal;
+  fromCompensation: Prisma.Decimal;
+  pendingPayouts: Prisma.Decimal;
+  pendingPayoutCount: number;
+  payoutCount: number;
+  compensationCount: number;
+}): EarningsPayload {
+  return {
+    totalEarnings: profile.totalEarnings.toString(),
+    fromPayouts: profile.fromPayouts.toString(),
+    fromCompensation: profile.fromCompensation.toString(),
+    pendingPayouts: profile.pendingPayouts.toString(),
+    pendingPayoutCount: profile.pendingPayoutCount || 0,
+    totalPayouts: profile.payoutCount,
+    totalCompensations: profile.compensationCount,
+    labels: { ...EARNINGS_LABELS },
+  };
+}
+
+function scheduleEarningsRecalc(userId: string, reason: string): void {
+  void recalculateUserEarningsProfile(userId).catch((err: any) => {
+    logger.warn('[EarningsService] Background earnings recalc failed', {
+      userId,
+      reason,
+      error: err?.message,
+    });
+  });
+}
+
+async function livePendingAggregate(
+  uidList: string[],
+): Promise<{ pendingPayouts: Prisma.Decimal; pendingPayoutCount: number }> {
+  const pendingAgg = await prisma.payout.aggregate({
+    where: {
+      performerUid: { in: uidList },
+      status: { in: ['pending', 'processing'] },
+    },
+    _sum: { netAmount: true },
+    _count: { _all: true },
+  });
+  return {
+    pendingPayouts: pendingAgg._sum.netAmount || new Prisma.Decimal('0'),
+    pendingPayoutCount: pendingAgg._count._all || 0,
+  };
+}
+
+async function liveAggregateFallback(uidList: string[]): Promise<EarningsPayload> {
+  const [payoutsAgg, compensationsAgg, pendingAgg] = await Promise.all([
+    prisma.payout.aggregate({
+      where: { performerUid: { in: uidList }, status: 'completed' },
+      _sum: { netAmount: true },
+      _count: { _all: true },
+    }),
+    prisma.refund.aggregate({
+      where: {
+        escrow: { performerUid: { in: uidList } },
+        cancelledBy: 'poster',
+        toOtherParty: { not: null },
+        status: 'completed',
+      },
+      _sum: { toOtherParty: true },
+      _count: { _all: true },
+    }),
+    livePendingAggregate(uidList),
+  ]);
+
+  const fromPayouts = payoutsAgg._sum.netAmount || new Prisma.Decimal('0');
+  const fromCompensation = compensationsAgg._sum.toOtherParty || new Prisma.Decimal('0');
+
+  return {
+    totalEarnings: fromPayouts.plus(fromCompensation).toString(),
+    fromPayouts: fromPayouts.toString(),
+    fromCompensation: fromCompensation.toString(),
+    pendingPayouts: pendingAgg.pendingPayouts.toString(),
+    pendingPayoutCount: pendingAgg.pendingPayoutCount,
+    totalPayouts: payoutsAgg._count._all || 0,
+    totalCompensations: compensationsAgg._count._all || 0,
+    labels: { ...EARNINGS_LABELS },
+  };
+}
+
+/**
+ * Overlay live pending onto a cached earnings payload.
+ * Pending/processing → completed transitions must not leave the Overview stuck
+ * on denormalized UserPaymentProfile.pendingPayouts.
+ */
+function withLivePending(
+  base: EarningsPayload,
+  live: { pendingPayouts: Prisma.Decimal; pendingPayoutCount: number },
+): EarningsPayload {
+  return {
+    ...base,
+    pendingPayouts: live.pendingPayouts.toString(),
+    pendingPayoutCount: live.pendingPayoutCount,
+  };
+}
+
+/**
+ * Get total earnings for a user.
+ * Cache-first for completed totals; always live-read pending/processing so the
+ * Overview never shows a payout as "Processing" after it completed.
+ * When the profile is stale/missing, return a full live aggregate (and seed cache).
+ */
+export async function getUserEarnings(
+  userId: string,
+  linkedUserIds?: string[],
+): Promise<{
+  success: boolean;
+  earnings?: EarningsPayload;
   error?: string;
 }> {
+  const started = Date.now();
+  let path:
+    | 'cache'
+    | 'stale_live'
+    | 'miss_live'
+    | 'linked_merge'
+    | 'linked_stale_live'
+    | 'fallback_aggregate' = 'miss_live';
+
   try {
     const uidList = [
       ...new Set(
         [userId, ...(linkedUserIds || [])].filter(
-          (x): x is string => typeof x === 'string' && x.trim().length > 0
-        )
+          (x): x is string => typeof x === 'string' && x.trim().length > 0,
+        ),
       ),
     ];
 
-    // When linked IDs are supplied, aggregate directly across all IDs.
-    // This is used for legacy UID/_id migrations where cache rows may exist under different identifiers.
+    if (uidList.length === 0) {
+      return { success: false, error: 'User ID is required' };
+    }
+
     if (uidList.length > 1) {
-      const payoutsAgg = await prisma.payout.aggregate({
-        where: { performerUid: { in: uidList }, status: 'completed' },
-        _sum: { netAmount: true },
-        _count: { _all: true },
+      const profiles = await prisma.userPaymentProfile.findMany({
+        where: { userId: { in: uidList } },
       });
-      const compensationsAgg = await prisma.refund.aggregate({
-        where: {
-          escrow: { performerUid: { in: uidList } },
-          cancelledBy: 'poster',
-          toOtherParty: { not: null },
-          status: 'completed',
+
+      const anyStale =
+        profiles.length === 0 ||
+        profiles.length < uidList.length ||
+        profiles.some((p) => isProfileStale(p.lastUpdatedAt));
+
+      if (anyStale || profiles.length === 0) {
+        path = profiles.length === 0 ? 'fallback_aggregate' : 'linked_stale_live';
+        const earnings = await liveAggregateFallback(uidList);
+        for (const uid of uidList) {
+          scheduleEarningsRecalc(uid, path);
+        }
+        logger.info('[EarningsService] getUserEarnings', {
+          userId,
+          path,
+          durationMs: Date.now() - started,
+          linkedCount: uidList.length,
+          profileCount: profiles.length,
+        });
+        return { success: true, earnings };
+      }
+
+      path = 'linked_merge';
+      let fromPayouts = new Prisma.Decimal('0');
+      let fromCompensation = new Prisma.Decimal('0');
+      let totalPayouts = 0;
+      let totalCompensations = 0;
+
+      for (const p of profiles) {
+        fromPayouts = fromPayouts.plus(p.fromPayouts);
+        fromCompensation = fromCompensation.plus(p.fromCompensation);
+        totalPayouts += p.payoutCount;
+        totalCompensations += p.compensationCount;
+      }
+
+      const livePending = await livePendingAggregate(uidList);
+      const earnings = withLivePending(
+        {
+          totalEarnings: fromPayouts.plus(fromCompensation).toString(),
+          fromPayouts: fromPayouts.toString(),
+          fromCompensation: fromCompensation.toString(),
+          pendingPayouts: '0',
+          pendingPayoutCount: 0,
+          totalPayouts,
+          totalCompensations,
+          labels: { ...EARNINGS_LABELS },
         },
-        _sum: { toOtherParty: true },
-        _count: { _all: true },
-      });
+        livePending,
+      );
 
-      // Also aggregate from DEV DB and merge
-      let fromPayouts = payoutsAgg._sum.netAmount || new Prisma.Decimal('0');
-      let fromCompensation = compensationsAgg._sum.toOtherParty || new Prisma.Decimal('0');
-      let totalPayouts = payoutsAgg._count._all || 0;
-      let totalCompensations = compensationsAgg._count._all || 0;
-
-      if (prismaDev) {
-        try {
-          const devPayoutsAgg = await prismaDev.payout.aggregate({
-            where: { performerUid: { in: uidList }, status: 'completed' },
-            _sum: { netAmount: true },
-            _count: { _all: true },
-          });
-          const devCompAgg = await prismaDev.refund.aggregate({
-            where: {
-              escrow: { performerUid: { in: uidList } },
-              cancelledBy: 'poster',
-              toOtherParty: { not: null },
-              status: 'completed',
-            },
-            _sum: { toOtherParty: true },
-            _count: { _all: true },
-          });
-          // Deduplicate: only add DEV amounts if DEV has more payouts than PROD
-          // (avoids double-counting duplicated records)
-          const devPayoutCount = devPayoutsAgg._count._all || 0;
-          const devCompCount = devCompAgg._count._all || 0;
-          const devPayoutSum = devPayoutsAgg._sum.netAmount || new Prisma.Decimal('0');
-          const devCompSum = devCompAgg._sum.toOtherParty || new Prisma.Decimal('0');
-          if (devPayoutCount > totalPayouts) {
-            fromPayouts = fromPayouts.plus(devPayoutSum);
-            totalPayouts += devPayoutCount;
-          }
-          if (devCompCount > totalCompensations) {
-            fromCompensation = fromCompensation.plus(devCompSum);
-            totalCompensations += devCompCount;
-          }
-        } catch (devErr: any) {
-          logger.warn('[EarningsService] DEV DB aggregate failed (non-fatal):', devErr?.message);
+      // Heal denormalized pending if cache drifted.
+      const cachedPending = profiles.reduce(
+        (sum, p) => sum.plus(p.pendingPayouts || 0),
+        new Prisma.Decimal('0'),
+      );
+      if (!cachedPending.equals(livePending.pendingPayouts)) {
+        for (const uid of uidList) {
+          scheduleEarningsRecalc(uid, 'linked_pending_drift');
         }
       }
 
@@ -113,10 +253,19 @@ export async function getUserEarnings(userId: string, linkedUserIds?: string[]):
           },
         },
       };
+      logger.info('[EarningsService] getUserEarnings', {
+        userId,
+        path,
+        durationMs: Date.now() - started,
+        linkedCount: uidList.length,
+        profileCount: profiles.length,
+        livePending: livePending.pendingPayouts.toString(),
+      });
+
+      return { success: true, earnings };
     }
 
-    // Try cache first
-    let profile = await prisma.userPaymentProfile.findUnique({
+    const profile = await prisma.userPaymentProfile.findUnique({
       where: { userId },
     });
 
@@ -211,11 +360,34 @@ export async function getUserEarnings(userId: string, linkedUserIds?: string[]):
         });
       } catch (recalcError: any) {
         logger.warn('UserPaymentProfile recalculation failed, using aggregate fallback', {
+    if (profile) {
+      if (isProfileStale(profile.lastUpdatedAt)) {
+        path = 'stale_live';
+        const earnings = await liveAggregateFallback([userId]);
+        scheduleEarningsRecalc(userId, 'stale');
+        logger.info('[EarningsService] getUserEarnings', {
           userId,
-          error: recalcError?.message,
+          path,
+          durationMs: Date.now() - started,
         });
-        return computeSingleUidFallback();
+        return { success: true, earnings };
       }
+
+      path = 'cache';
+      const livePending = await livePendingAggregate([userId]);
+      const earnings = withLivePending(fromProfileRow(profile), livePending);
+
+      if (!profile.pendingPayouts.equals(livePending.pendingPayouts)) {
+        scheduleEarningsRecalc(userId, 'pending_drift');
+      }
+
+      logger.info('[EarningsService] getUserEarnings', {
+        userId,
+        path,
+        durationMs: Date.now() - started,
+        livePending: livePending.pendingPayouts.toString(),
+      });
+      return { success: true, earnings };
     }
 
     // If still no profile (user has no transactions), return zeros
@@ -251,8 +423,21 @@ export async function getUserEarnings(userId: string, linkedUserIds?: string[]):
         },
       },
     };
+    path = 'miss_live';
+    const earnings = await liveAggregateFallback([userId]);
+    scheduleEarningsRecalc(userId, 'miss');
+    logger.info('[EarningsService] getUserEarnings', {
+      userId,
+      path,
+      durationMs: Date.now() - started,
+    });
+    return { success: true, earnings };
   } catch (error: any) {
-    logger.error('Error getting user earnings:', error);
+    logger.error('Error getting user earnings:', {
+      error: error.message,
+      durationMs: Date.now() - started,
+      path,
+    });
     return {
       success: false,
       error: error.message || 'Failed to get earnings',
@@ -261,16 +446,16 @@ export async function getUserEarnings(userId: string, linkedUserIds?: string[]):
 }
 
 /**
- * Get earnings breakdown by period (monthly)
+ * Get earnings breakdown by period (monthly) via SQL GROUP BY.
  */
 export async function getEarningsByPeriod(
   userId: string,
   startDate?: Date,
-  endDate?: Date
+  endDate?: Date,
 ): Promise<{
   success: boolean;
   earnings?: Array<{
-    period: string; // YYYY-MM format
+    period: string;
     totalEarnings: string;
     fromPayouts: string;
     fromCompensation: string;
@@ -284,80 +469,85 @@ export async function getEarningsByPeriod(
   error?: string;
 }> {
   try {
-    const whereClause: Prisma.PayoutWhereInput = {
-      performerUid: userId,
-      status: { in: ['completed', 'processing'] }
-    };
+    const payoutDateFilter =
+      startDate && endDate
+        ? Prisma.sql`AND p."createdAt" >= ${startDate} AND p."createdAt" <= ${endDate}`
+        : startDate
+          ? Prisma.sql`AND p."createdAt" >= ${startDate}`
+          : endDate
+            ? Prisma.sql`AND p."createdAt" <= ${endDate}`
+            : Prisma.empty;
+    const refundDateFilter =
+      startDate && endDate
+        ? Prisma.sql`AND r."createdAt" >= ${startDate} AND r."createdAt" <= ${endDate}`
+        : startDate
+          ? Prisma.sql`AND r."createdAt" >= ${startDate}`
+          : endDate
+            ? Prisma.sql`AND r."createdAt" <= ${endDate}`
+            : Prisma.empty;
 
-    if (startDate || endDate) {
-      whereClause.createdAt = {};
-      if (startDate) whereClause.createdAt.gte = startDate;
-      if (endDate) whereClause.createdAt.lte = endDate;
-    }
+    const [payoutRows, compensationRows] = await Promise.all([
+      prisma.$queryRaw<Array<{ period: string; total: Prisma.Decimal; count: bigint }>>`
+        SELECT
+          to_char(date_trunc('month', p."createdAt"), 'YYYY-MM') AS period,
+          COALESCE(SUM(p."netAmount"), 0) AS total,
+          COUNT(*)::bigint AS count
+        FROM "Payout" p
+        WHERE p."performerUid" = ${userId}
+          AND p."status" IN ('completed', 'processing')
+          ${payoutDateFilter}
+        GROUP BY date_trunc('month', p."createdAt")
+        ORDER BY period ASC
+      `,
+      prisma.$queryRaw<Array<{ period: string; total: Prisma.Decimal; count: bigint }>>`
+        SELECT
+          to_char(date_trunc('month', r."createdAt"), 'YYYY-MM') AS period,
+          COALESCE(SUM(r."toOtherParty"), 0) AS total,
+          COUNT(*)::bigint AS count
+        FROM "Refund" r
+        INNER JOIN "Escrow" e ON e."id" = r."escrowId"
+        WHERE e."performerUid" = ${userId}
+          AND r."cancelledBy" = 'poster'
+          AND r."toOtherParty" IS NOT NULL
+          AND r."status" = 'completed'
+          ${refundDateFilter}
+        GROUP BY date_trunc('month', r."createdAt")
+        ORDER BY period ASC
+      `,
+    ]);
 
-    // Get all payouts grouped by month
-    const payouts = await prisma.payout.findMany({
-      where: whereClause,
-      orderBy: { createdAt: 'asc' }
-    });
-
-    // Group payouts by month
     const monthlyPayouts: Record<string, { total: Prisma.Decimal; count: number }> = {};
-    
-    payouts.forEach(payout => {
-      const monthKey = payout.createdAt.toISOString().substring(0, 7); // YYYY-MM
-      if (!monthlyPayouts[monthKey]) {
-        monthlyPayouts[monthKey] = { total: new Prisma.Decimal('0'), count: 0 };
-      }
-      monthlyPayouts[monthKey].total = monthlyPayouts[monthKey].total.plus(payout.netAmount);
-      monthlyPayouts[monthKey].count += 1;
-    });
-
-    // Get compensations grouped by month
-    const compensationWhere: Prisma.RefundWhereInput = {
-      escrow: {
-        performerUid: userId
-      },
-      cancelledBy: 'poster',
-      toOtherParty: { not: null },
-      status: 'completed'
-    };
-
-    if (startDate || endDate) {
-      compensationWhere.createdAt = {};
-      if (startDate) compensationWhere.createdAt.gte = startDate;
-      if (endDate) compensationWhere.createdAt.lte = endDate;
+    for (const row of payoutRows) {
+      monthlyPayouts[row.period] = {
+        total: new Prisma.Decimal(row.total ?? 0),
+        count: Number(row.count ?? 0),
+      };
     }
 
-    const compensations = await prisma.refund.findMany({
-      where: compensationWhere,
-      include: { escrow: true },
-      orderBy: { createdAt: 'asc' }
-    });
-
-    // Group compensations by month
     const monthlyCompensations: Record<string, { total: Prisma.Decimal; count: number }> = {};
-    
-    compensations.forEach(refund => {
-      const monthKey = refund.createdAt.toISOString().substring(0, 7); // YYYY-MM
-      if (!monthlyCompensations[monthKey]) {
-        monthlyCompensations[monthKey] = { total: new Prisma.Decimal('0'), count: 0 };
-      }
-      monthlyCompensations[monthKey].total = monthlyCompensations[monthKey].total.plus(refund.toOtherParty || new Prisma.Decimal('0'));
-      monthlyCompensations[monthKey].count += 1;
-    });
+    for (const row of compensationRows) {
+      monthlyCompensations[row.period] = {
+        total: new Prisma.Decimal(row.total ?? 0),
+        count: Number(row.count ?? 0),
+      };
+    }
 
-    // Combine and format results
     const allMonths = new Set([
       ...Object.keys(monthlyPayouts),
-      ...Object.keys(monthlyCompensations)
+      ...Object.keys(monthlyCompensations),
     ]);
 
     const earnings = Array.from(allMonths)
       .sort()
-      .map(period => {
-        const payoutData = monthlyPayouts[period] || { total: new Prisma.Decimal('0'), count: 0 };
-        const compensationData = monthlyCompensations[period] || { total: new Prisma.Decimal('0'), count: 0 };
+      .map((period) => {
+        const payoutData = monthlyPayouts[period] || {
+          total: new Prisma.Decimal('0'),
+          count: 0,
+        };
+        const compensationData = monthlyCompensations[period] || {
+          total: new Prisma.Decimal('0'),
+          count: 0,
+        };
         const totalEarnings = payoutData.total.plus(compensationData.total);
 
         return {
@@ -374,15 +564,12 @@ export async function getEarningsByPeriod(
         };
       });
 
-    return {
-      success: true,
-      earnings
-    };
+    return { success: true, earnings };
   } catch (error: any) {
     logger.error('Error calculating earnings by period:', error);
     return {
       success: false,
-      error: error.message || 'Failed to calculate earnings by period'
+      error: error.message || 'Failed to calculate earnings by period',
     };
   }
 }
@@ -414,26 +601,19 @@ export async function getEarningsStats(userId: string): Promise<{
   error?: string;
 }> {
   try {
-    // Get total earnings (uses cache)
     const earningsResult = await getUserEarnings(userId);
     if (!earningsResult.success || !earningsResult.earnings) {
-      return earningsResult;
+      return earningsResult as any;
     }
 
-    // Get profile for stats (cached)
     let profile = await prisma.userPaymentProfile.findUnique({
       where: { userId },
     });
 
-    // If missing or stale, recalculate
-    if (!profile || (profile && isProfileStale(profile.lastUpdatedAt))) {
-      await recalculateUserPaymentProfile(userId);
-      profile = await prisma.userPaymentProfile.findUnique({
-        where: { userId },
-      });
+    if (!profile || isProfileStale(profile.lastUpdatedAt)) {
+      scheduleEarningsRecalc(userId, 'stats_stale_or_miss');
     }
 
-    // If no profile, return zeros
     if (!profile) {
       return {
         success: true,
@@ -457,19 +637,15 @@ export async function getEarningsStats(userId: string): Promise<{
       };
     }
 
-    // Get last compensation date (not cached, but infrequent query)
     const lastCompensation = await prisma.refund.findFirst({
       where: {
-        escrow: {
-          performerUid: userId,
-        },
+        escrow: { performerUid: userId },
         cancelledBy: 'poster',
         toOtherParty: { not: null },
         status: 'completed',
       },
       orderBy: { createdAt: 'desc' },
     });
-    const lastCompensationDate = lastCompensation?.createdAt.toISOString();
 
     return {
       success: true,
@@ -481,7 +657,7 @@ export async function getEarningsStats(userId: string): Promise<{
         largestPayout: profile.largestPayout?.toString() || '0',
         smallestPayout: profile.smallestPayout?.toString() || '0',
         lastPayoutDate: profile.lastPayoutDate?.toISOString(),
-        lastCompensationDate,
+        lastCompensationDate: lastCompensation?.createdAt.toISOString(),
         labels: {
           totalPayouts: 'Completed Tasks',
           totalCompensations: 'Cancellations',
@@ -501,5 +677,3 @@ export async function getEarningsStats(userId: string): Promise<{
     };
   }
 }
-
-

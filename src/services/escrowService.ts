@@ -1411,6 +1411,49 @@ async function findEscrowByBookNowLineTaskId(taskId: string) {
   return null;
 }
 
+/** Extract booking order id from `booknow-pending-{orderId}` escrow task keys. */
+export function bookingOrderIdFromPendingTaskId(taskId: string): string | null {
+  const match = /^booknow-pending-(.+)$/i.exec(String(taskId || '').trim());
+  return match?.[1]?.trim() || null;
+}
+
+/**
+ * Resolve Postgres escrow for cancel / lookups.
+ * Tries exact taskId, Book Now line metadata, then pending-placebooker order id.
+ */
+export async function resolveEscrowRecordForTaskId(taskId: string) {
+  const trimmed = String(taskId || '').trim();
+  if (!trimmed || !isPostgresConnected()) return null;
+
+  let postgresEscrow = await prisma.escrow.findFirst({
+    where: { taskId: trimmed },
+    orderBy: { createdAt: 'desc' },
+  });
+
+  if (!postgresEscrow && prismaDev) {
+    postgresEscrow = await prismaDev.escrow.findFirst({
+      where: { taskId: trimmed },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+  if (postgresEscrow) return postgresEscrow;
+
+  const byLineTask = await findEscrowByBookNowLineTaskId(trimmed);
+  if (byLineTask) return byLineTask;
+
+  const pendingOrderId = bookingOrderIdFromPendingTaskId(trimmed);
+  if (pendingOrderId) {
+    const byPendingOrder = await findEscrowByBookingOrderId(pendingOrderId);
+    if (byPendingOrder) return byPendingOrder;
+  }
+
+  // Callers sometimes pass bookingOrderId as taskId for Book Now.
+  const byOrderId = await findEscrowByBookingOrderId(trimmed);
+  if (byOrderId) return byOrderId;
+
+  return null;
+}
+
 /**
  * Get escrow by task ID
  * Now uses Postgres only
@@ -1421,43 +1464,8 @@ export async function getEscrowByTaskId(taskId: string): Promise<any | null> {
       return null;
     }
 
-    let postgresEscrow = await prisma.escrow.findFirst({
-      where: {
-        taskId,
-      },
-      orderBy: {
-        createdAt: 'desc',
-      },
-    });
-
-    if (!postgresEscrow && prismaDev) {
-      postgresEscrow = await prismaDev.escrow.findFirst({
-        where: {
-          taskId,
-        },
-        orderBy: {
-          createdAt: 'desc',
-        },
-      });
-    }
-
-    if (postgresEscrow) {
-      return convertPostgresEscrowToFrontendFormat(postgresEscrow);
-    }
-
-    // Fallback: Book Now escrows are keyed by bookingOrderId, not the materialized task _id
-    const byBookingOrderId = await findEscrowByBookingOrderId(taskId);
-    if (byBookingOrderId) {
-      return convertPostgresEscrowToFrontendFormat(byBookingOrderId);
-    }
-
-    // Fallback: Book Now line-item taskId embedded in escrow metadata
-    const byLineTask = await findEscrowByBookNowLineTaskId(taskId);
-    if (byLineTask) {
-      return convertPostgresEscrowToFrontendFormat(byLineTask);
-    }
-
-    return null;
+    const postgresEscrow = await resolveEscrowRecordForTaskId(taskId);
+    return postgresEscrow ? await convertPostgresEscrowToFrontendFormat(postgresEscrow) : null;
   } catch (error: any) {
     logger.error('❌ Error getting escrow by task ID:', error);
     return null;

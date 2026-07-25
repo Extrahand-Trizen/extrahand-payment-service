@@ -453,11 +453,10 @@ export async function cancelEscrowByBookingOrderId(params: {
 
 /**
  * Cancel escrow by task ID
- * 
- * @param taskId - Task ID
- * @param reason - Cancellation reason (optional)
- * @param userId - User ID who is cancelling (for audit)
- * @returns Success status
+ *
+ * Book Now escrows are often stored under `booknow-pending-{bookingOrderId}` while
+ * cancel callers pass the materialized Mongo task id — resolve via line metadata and
+ * pending-id prefix before failing.
  */
 export async function cancelEscrowByTaskId(params: {
   taskId: string;
@@ -485,21 +484,17 @@ export async function cancelEscrowByTaskId(params: {
       partnerReachedLocation,
     } = params;
 
-    // Get escrow from Postgres
     if (!isPostgresConnected()) {
       return { success: false, error: 'Postgres not connected' };
     }
 
-    const postgresEscrow = await prisma.escrow.findFirst({
-      where: { taskId },
-      orderBy: { createdAt: 'desc' },
-    });
+    const { resolveEscrowRecordForTaskId } = await import('./escrowService');
+    const postgresEscrow = await resolveEscrowRecordForTaskId(taskId);
 
     if (!postgresEscrow) {
       return { success: false, error: 'Escrow not found for task' };
     }
 
-    // Cancel using order ID
     return await cancelPayment({
       razorpayOrderId: postgresEscrow.razorpayOrderId,
       reason,

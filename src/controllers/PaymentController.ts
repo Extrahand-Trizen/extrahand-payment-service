@@ -282,9 +282,10 @@ export class PaymentController {
         catalogId: typeof catalogId === 'string' ? catalogId : undefined,
         partnerReachedLocation: Boolean(partnerReachedLocation),
       });
-    } else if (escrowId) {
-      result = await cancelEscrow({
-        escrowId,
+    } else if (bookingOrderId) {
+      // Book Now: escrow.taskId is often `booknow-pending-{orderId}`; prefer booking order.
+      result = await cancelEscrowByBookingOrderId({
+        bookingOrderId: String(bookingOrderId),
         reason,
         userId,
         cancelledBy,
@@ -295,9 +296,9 @@ export class PaymentController {
         catalogId: typeof catalogId === 'string' ? catalogId : undefined,
         partnerReachedLocation: Boolean(partnerReachedLocation),
       });
-    } else if (bookingOrderId) {
-      result = await cancelEscrowByBookingOrderId({
-        bookingOrderId: String(bookingOrderId),
+    } else if (escrowId) {
+      result = await cancelEscrow({
+        escrowId,
         reason,
         userId,
         cancelledBy,
@@ -332,6 +333,7 @@ export class PaymentController {
         razorpayOrderId,
         escrowId,
         taskId,
+        bookingOrderId,
         cancelledBy,
         error: result.error,
       });

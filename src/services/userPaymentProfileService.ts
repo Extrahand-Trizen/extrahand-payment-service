@@ -1,17 +1,23 @@
 /**
  * User Payment Profile Service
- * 
- * Manages cached user payment profiles for fast earnings/payment queries
- * Handles incremental updates when transactions occur
+ *
+ * Manages cached user payment profiles for fast earnings/payment queries.
+ * Handles incremental updates when transactions occur.
  */
 
-import { prisma, prismaDev } from '../config/prisma';
+import { prisma } from '../config/prisma';
 import logger from '../config/logger';
 import { Prisma } from '@prisma/client';
 
+const PENDING_STATUSES = new Set(['pending', 'processing']);
+
+function isPendingStatus(status: string | null | undefined): boolean {
+  return PENDING_STATUSES.has(String(status || '').toLowerCase());
+}
+
 /**
- * Update user payment profile incrementally when a transaction occurs
- * This keeps the cache up-to-date without recalculating everything
+ * Update user payment profile incrementally when a transaction occurs.
+ * This keeps the cache up-to-date without recalculating everything.
  */
 export async function updateUserPaymentProfile(
   userId: string,
@@ -25,9 +31,8 @@ export async function updateUserPaymentProfile(
   }
 ): Promise<void> {
   try {
-    const { type, amount, payoutId, escrowId, refundId, metadata } = update;
+    const { type, amount, payoutId } = update;
 
-    // Get current profile or create if doesn't exist
     const currentProfile = await prisma.userPaymentProfile.findUnique({
       where: { userId },
     });
@@ -38,19 +43,11 @@ export async function updateUserPaymentProfile(
 
     switch (type) {
       case 'payout':
-        // Increment earnings from payouts
-        updateData.totalEarnings = {
-          increment: amount,
-        };
-        updateData.fromPayouts = {
-          increment: amount,
-        };
-        updateData.payoutCount = {
-          increment: 1,
-        };
+        updateData.totalEarnings = { increment: amount };
+        updateData.fromPayouts = { increment: amount };
+        updateData.payoutCount = { increment: 1 };
         updateData.lastPayoutDate = new Date();
 
-        // Update stats incrementally (much faster than fetching all payouts)
         if (payoutId && currentProfile) {
           const payout = await prisma.payout.findUnique({
             where: { payoutId },
@@ -58,30 +55,23 @@ export async function updateUserPaymentProfile(
           });
 
           if (payout) {
-            // Incremental calculation: Update average, largest, smallest without fetching all payouts
             const currentCount = currentProfile.payoutCount || 0;
             const currentAverage = currentProfile.averagePayout || new Prisma.Decimal('0');
             const currentLargest = currentProfile.largestPayout || new Prisma.Decimal('0');
             const currentSmallest = currentProfile.smallestPayout || new Prisma.Decimal('0');
 
-            // Calculate new average incrementally: (old_avg * old_count + new_amount) / new_count
             const newCount = currentCount + 1;
-            const newAverage = currentCount > 0
-              ? currentAverage.mul(currentCount).plus(amount).dividedBy(newCount)
-              : amount;
-
-            // Update largest and smallest
-            const newLargest = amount.greaterThan(currentLargest) ? amount : currentLargest;
-            const newSmallest = currentCount === 0 || amount.lessThan(currentSmallest)
-              ? amount
-              : currentSmallest;
+            const newAverage =
+              currentCount > 0
+                ? currentAverage.mul(currentCount).plus(amount).dividedBy(newCount)
+                : amount;
 
             updateData.averagePayout = newAverage;
-            updateData.largestPayout = newLargest;
-            updateData.smallestPayout = newSmallest;
+            updateData.largestPayout = amount.greaterThan(currentLargest) ? amount : currentLargest;
+            updateData.smallestPayout =
+              currentCount === 0 || amount.lessThan(currentSmallest) ? amount : currentSmallest;
           }
         } else if (payoutId && !currentProfile) {
-          // First payout - stats are simple
           const payout = await prisma.payout.findUnique({
             where: { payoutId },
             select: { netAmount: true },
@@ -95,41 +85,23 @@ export async function updateUserPaymentProfile(
         break;
 
       case 'compensation':
-        // Increment earnings from compensation
-        updateData.totalEarnings = {
-          increment: amount,
-        };
-        updateData.fromCompensation = {
-          increment: amount,
-        };
-        updateData.compensationCount = {
-          increment: 1,
-        };
+        updateData.totalEarnings = { increment: amount };
+        updateData.fromCompensation = { increment: amount };
+        updateData.compensationCount = { increment: 1 };
         break;
 
       case 'payment':
-        // Increment payments (as poster)
-        updateData.totalPayments = {
-          increment: amount,
-        };
-        updateData.paymentCount = {
-          increment: 1,
-        };
+        updateData.totalPayments = { increment: amount };
+        updateData.paymentCount = { increment: 1 };
         updateData.lastPaymentDate = new Date();
         break;
 
       case 'refund':
-        // Increment refunds (as poster)
-        updateData.totalRefunds = {
-          increment: amount,
-        };
-        updateData.refundCount = {
-          increment: 1,
-        };
+        updateData.totalRefunds = { increment: amount };
+        updateData.refundCount = { increment: 1 };
         break;
     }
 
-    // Update or create profile
     await prisma.userPaymentProfile.upsert({
       where: { userId },
       update: updateData,
@@ -144,6 +116,8 @@ export async function updateUserPaymentProfile(
         paymentCount: type === 'payment' ? 1 : 0,
         totalRefunds: type === 'refund' ? amount : new Prisma.Decimal('0'),
         refundCount: type === 'refund' ? 1 : 0,
+        pendingPayouts: new Prisma.Decimal('0'),
+        pendingPayoutCount: 0,
         lastPayoutDate: type === 'payout' ? new Date() : null,
         lastPaymentDate: type === 'payment' ? new Date() : null,
         averagePayout: updateData.averagePayout as Prisma.Decimal | null | undefined,
@@ -163,155 +137,276 @@ export async function updateUserPaymentProfile(
       userId,
       error: error.message,
     });
-    // Don't throw - profile update failure shouldn't break transaction
   }
 }
 
 /**
- * Recalculate user payment profile from scratch
- * Use this when cache might be stale or for data migration
+ * Idempotent pending/completed cache updates when a payout status changes.
+ * previousStatus=null means newly created row.
  */
-export async function recalculateUserPaymentProfile(
-  userId: string
+export async function applyPayoutStatusToProfile(
+  userId: string,
+  previousStatus: string | null,
+  newStatus: string,
+  netAmount: Prisma.Decimal,
+  payoutId?: string,
 ): Promise<void> {
   try {
-    // Calculate from payouts
-    const payoutStats = await prisma.payout.aggregate({
-      where: {
-        performerUid: userId,
-        status: 'completed',
-      },
-      _sum: { netAmount: true },
-      _count: { id: true },
-      _avg: { netAmount: true },
-      _min: { netAmount: true },
-      _max: { netAmount: true },
-    });
+    const prev = String(previousStatus || '').toLowerCase() || null;
+    const next = String(newStatus || '').toLowerCase();
+    if (prev === next) return;
 
-    const lastPayout = await prisma.payout.findFirst({
-      where: {
-        performerUid: userId,
-        status: 'completed',
-      },
-      orderBy: { createdAt: 'desc' },
-      select: { createdAt: true },
-    });
+    const wasPending = isPendingStatus(prev);
+    const isPending = isPendingStatus(next);
+    const becameCompleted = next === 'completed' && prev !== 'completed';
 
-    // Calculate from compensation
-    const compensationStats = await prisma.refund.aggregate({
-      where: {
-        escrow: { performerUid: userId },
-        cancelledBy: 'poster',
-        toOtherParty: { not: null },
-        status: 'completed',
-      },
-      _sum: { toOtherParty: true },
-      _count: { id: true },
-    });
-
-    // Calculate payments
-    const paymentStats = await prisma.escrow.aggregate({
-      where: { posterUid: userId },
-      _sum: { amountInRupees: true },
-      _count: { id: true },
-    });
-
-    const lastPayment = await prisma.escrow.findFirst({
-      where: { posterUid: userId },
-      orderBy: { createdAt: 'desc' },
-      select: { createdAt: true },
-    });
-
-    // Calculate refunds
-    const refundStats = await prisma.refund.aggregate({
-      where: {
-        escrow: { posterUid: userId },
-        status: 'completed',
-      },
-      _sum: { refundAmount: true },
-      _count: { id: true },
-    });
-
-    // Calculate fees
-    const feeStats = await prisma.ledger.aggregate({
-      where: {
-        escrow: {
-          OR: [{ posterUid: userId }, { performerUid: userId }],
+    if (wasPending !== isPending) {
+      await prisma.userPaymentProfile.upsert({
+        where: { userId },
+        create: {
+          userId,
+          pendingPayouts: isPending ? netAmount : new Prisma.Decimal('0'),
+          pendingPayoutCount: isPending ? 1 : 0,
+          lastUpdatedAt: new Date(),
         },
-        type: {
-          in: [
-            'platform_commission',
-            'gst',
-            'tds',
-            'cancellation_fee',
-            'platform_fee',
-            'razorpay_fee',
-          ],
+        update: {
+          lastUpdatedAt: new Date(),
+          ...(wasPending && !isPending
+            ? {
+                pendingPayouts: { decrement: netAmount },
+                pendingPayoutCount: { decrement: 1 },
+              }
+            : {
+                pendingPayouts: { increment: netAmount },
+                pendingPayoutCount: { increment: 1 },
+              }),
         },
-      },
-      _sum: { amount: true },
-    });
+      });
 
-    let fromPayouts = payoutStats._sum.netAmount || new Prisma.Decimal('0');
-    let fromCompensation = compensationStats._sum.toOtherParty || new Prisma.Decimal('0');
-    let totalPayouts = payoutStats._count.id || 0;
-    let totalCompensations = compensationStats._count.id || 0;
-    let totalPayments = paymentStats._sum.amountInRupees || new Prisma.Decimal('0');
-    let paymentCount = paymentStats._count.id || 0;
-    let totalRefunds = refundStats._sum.refundAmount || new Prisma.Decimal('0');
-    let refundCount = refundStats._count.id || 0;
-    let totalFees = feeStats._sum.amount?.abs() || new Prisma.Decimal('0');
-
-    // Merge from DEV DB
-    if (prismaDev) {
-      try {
-        const [devPayouts, devComp, devPayments, devRefunds, devFees] = await Promise.all([
-          prismaDev.payout.aggregate({ where: { performerUid: userId, status: 'completed' }, _sum: { netAmount: true }, _count: { id: true } }),
-          prismaDev.refund.aggregate({ where: { escrow: { performerUid: userId }, cancelledBy: 'poster', toOtherParty: { not: null }, status: 'completed' }, _sum: { toOtherParty: true }, _count: { id: true } }),
-          prismaDev.escrow.aggregate({ where: { posterUid: userId }, _sum: { amountInRupees: true }, _count: { id: true } }),
-          prismaDev.refund.aggregate({ where: { escrow: { posterUid: userId }, status: 'completed' }, _sum: { refundAmount: true }, _count: { id: true } }),
-          prismaDev.ledger.aggregate({ where: { escrow: { OR: [{ posterUid: userId }, { performerUid: userId }] }, type: { in: ['platform_commission', 'gst', 'tds', 'cancellation_fee', 'platform_fee', 'razorpay_fee'] } }, _sum: { amount: true } })
-        ]);
-        if ((devPayouts._count.id || 0) > totalPayouts) {
-          fromPayouts = fromPayouts.plus(devPayouts._sum.netAmount || new Prisma.Decimal('0'));
-          totalPayouts += devPayouts._count.id || 0;
-        }
-        if ((devComp._count.id || 0) > totalCompensations) {
-          fromCompensation = fromCompensation.plus(devComp._sum.toOtherParty || new Prisma.Decimal('0'));
-          totalCompensations += devComp._count.id || 0;
-        }
-        if ((devPayments._count.id || 0) > paymentCount) {
-          totalPayments = totalPayments.plus(devPayments._sum.amountInRupees || new Prisma.Decimal('0'));
-          paymentCount += devPayments._count.id || 0;
-        }
-        if ((devRefunds._count.id || 0) > refundCount) {
-          totalRefunds = totalRefunds.plus(devRefunds._sum.refundAmount || new Prisma.Decimal('0'));
-          refundCount += devRefunds._count.id || 0;
-        }
-        if (devFees._sum.amount) {
-          totalFees = totalFees.plus(devFees._sum.amount.abs());
-        }
-      } catch (devErr: any) {
-        logger.warn('DEV DB merge failed during profile recalculate', { error: devErr.message });
+      if (wasPending && !isPending) {
+        await prisma.$executeRaw`
+          UPDATE "UserPaymentProfile"
+          SET
+            "pendingPayouts" = GREATEST("pendingPayouts", 0),
+            "pendingPayoutCount" = GREATEST("pendingPayoutCount", 0)
+          WHERE "userId" = ${userId}
+        `;
       }
     }
 
-    const totalEarnings = fromPayouts.plus(fromCompensation);
+    if (becameCompleted) {
+      await updateUserPaymentProfile(userId, {
+        type: 'payout',
+        amount: netAmount,
+        payoutId,
+      });
+    }
+  } catch (error: any) {
+    logger.error('❌ Error applying payout status to profile:', {
+      userId,
+      previousStatus,
+      newStatus,
+      error: error.message,
+    });
+  }
+}
 
-    // Update or create profile
+/**
+ * Earnings-only recalculate for Overview SWR background seed.
+ * Parallel aggregates: completed payouts, last payout, compensation, pending.
+ */
+export async function recalculateUserEarningsProfile(userId: string): Promise<void> {
+  try {
+    const [payoutStats, lastPayout, compensationStats, pendingStats] = await Promise.all([
+      prisma.payout.aggregate({
+        where: { performerUid: userId, status: 'completed' },
+        _sum: { netAmount: true },
+        _count: { id: true },
+        _avg: { netAmount: true },
+        _min: { netAmount: true },
+        _max: { netAmount: true },
+      }),
+      prisma.payout.findFirst({
+        where: { performerUid: userId, status: 'completed' },
+        orderBy: { createdAt: 'desc' },
+        select: { createdAt: true },
+      }),
+      prisma.refund.aggregate({
+        where: {
+          escrow: { performerUid: userId },
+          cancelledBy: 'poster',
+          toOtherParty: { not: null },
+          status: 'completed',
+        },
+        _sum: { toOtherParty: true },
+        _count: { id: true },
+      }),
+      prisma.payout.aggregate({
+        where: {
+          performerUid: userId,
+          status: { in: ['pending', 'processing'] },
+        },
+        _sum: { netAmount: true },
+        _count: { id: true },
+      }),
+    ]);
+
+    const fromPayouts = payoutStats._sum.netAmount || new Prisma.Decimal('0');
+    const fromCompensation = compensationStats._sum.toOtherParty || new Prisma.Decimal('0');
+    const totalEarnings = fromPayouts.plus(fromCompensation);
+    const pendingPayouts = pendingStats._sum.netAmount || new Prisma.Decimal('0');
+    const pendingPayoutCount = pendingStats._count.id || 0;
+
     await prisma.userPaymentProfile.upsert({
       where: { userId },
       update: {
         totalEarnings,
         fromPayouts,
         fromCompensation,
-        payoutCount: totalPayouts,
-        compensationCount: totalCompensations,
+        payoutCount: payoutStats._count.id || 0,
+        compensationCount: compensationStats._count.id || 0,
+        pendingPayouts,
+        pendingPayoutCount,
+        averagePayout: payoutStats._avg.netAmount || null,
+        largestPayout: payoutStats._max.netAmount || null,
+        smallestPayout: payoutStats._min.netAmount || null,
+        lastPayoutDate: lastPayout?.createdAt || null,
+        lastUpdatedAt: new Date(),
+      },
+      create: {
+        userId,
+        totalEarnings,
+        fromPayouts,
+        fromCompensation,
+        payoutCount: payoutStats._count.id || 0,
+        compensationCount: compensationStats._count.id || 0,
+        pendingPayouts,
+        pendingPayoutCount,
+        averagePayout: payoutStats._avg.netAmount || null,
+        largestPayout: payoutStats._max.netAmount || null,
+        smallestPayout: payoutStats._min.netAmount || null,
+        lastPayoutDate: lastPayout?.createdAt || null,
+      },
+    });
+
+    logger.info('✅ Recalculated UserPaymentProfile (earnings-only)', { userId });
+  } catch (error: any) {
+    logger.error('❌ Error recalculating earnings UserPaymentProfile:', {
+      userId,
+      error: error.message,
+    });
+    throw error;
+  }
+}
+
+/**
+ * Full profile recalculate (admin / migration / explicit repair).
+ * Prefer recalculateUserEarningsProfile for Overview background seeding.
+ */
+export async function recalculateUserPaymentProfile(userId: string): Promise<void> {
+  try {
+    const [
+      payoutStats,
+      lastPayout,
+      compensationStats,
+      paymentStats,
+      lastPayment,
+      refundStats,
+      feeStats,
+      pendingStats,
+    ] = await Promise.all([
+      prisma.payout.aggregate({
+        where: { performerUid: userId, status: 'completed' },
+        _sum: { netAmount: true },
+        _count: { id: true },
+        _avg: { netAmount: true },
+        _min: { netAmount: true },
+        _max: { netAmount: true },
+      }),
+      prisma.payout.findFirst({
+        where: { performerUid: userId, status: 'completed' },
+        orderBy: { createdAt: 'desc' },
+        select: { createdAt: true },
+      }),
+      prisma.refund.aggregate({
+        where: {
+          escrow: { performerUid: userId },
+          cancelledBy: 'poster',
+          toOtherParty: { not: null },
+          status: 'completed',
+        },
+        _sum: { toOtherParty: true },
+        _count: { id: true },
+      }),
+      prisma.escrow.aggregate({
+        where: { posterUid: userId },
+        _sum: { amountInRupees: true },
+        _count: { id: true },
+      }),
+      prisma.escrow.findFirst({
+        where: { posterUid: userId },
+        orderBy: { createdAt: 'desc' },
+        select: { createdAt: true },
+      }),
+      prisma.refund.aggregate({
+        where: {
+          escrow: { posterUid: userId },
+          status: 'completed',
+        },
+        _sum: { refundAmount: true },
+        _count: { id: true },
+      }),
+      prisma.ledger.aggregate({
+        where: {
+          escrow: {
+            OR: [{ posterUid: userId }, { performerUid: userId }],
+          },
+          type: {
+            in: [
+              'platform_commission',
+              'gst',
+              'tds',
+              'cancellation_fee',
+              'platform_fee',
+              'razorpay_fee',
+            ],
+          },
+        },
+        _sum: { amount: true },
+      }),
+      prisma.payout.aggregate({
+        where: {
+          performerUid: userId,
+          status: { in: ['pending', 'processing'] },
+        },
+        _sum: { netAmount: true },
+        _count: { id: true },
+      }),
+    ]);
+
+    const fromPayouts = payoutStats._sum.netAmount || new Prisma.Decimal('0');
+    const fromCompensation = compensationStats._sum.toOtherParty || new Prisma.Decimal('0');
+    const totalEarnings = fromPayouts.plus(fromCompensation);
+    const totalPayments = paymentStats._sum.amountInRupees || new Prisma.Decimal('0');
+    const totalRefunds = refundStats._sum.refundAmount || new Prisma.Decimal('0');
+    const totalFees = feeStats._sum.amount?.abs() || new Prisma.Decimal('0');
+    const pendingPayouts = pendingStats._sum.netAmount || new Prisma.Decimal('0');
+
+    await prisma.userPaymentProfile.upsert({
+      where: { userId },
+      update: {
+        totalEarnings,
+        fromPayouts,
+        fromCompensation,
+        payoutCount: payoutStats._count.id || 0,
+        compensationCount: compensationStats._count.id || 0,
         totalPayments,
-        paymentCount,
+        paymentCount: paymentStats._count.id || 0,
         totalRefunds,
-        refundCount,
+        refundCount: refundStats._count.id || 0,
         totalFees,
+        pendingPayouts,
+        pendingPayoutCount: pendingStats._count.id || 0,
         averagePayout: payoutStats._avg.netAmount || null,
         largestPayout: payoutStats._max.netAmount || null,
         smallestPayout: payoutStats._min.netAmount || null,
@@ -324,13 +419,15 @@ export async function recalculateUserPaymentProfile(
         totalEarnings,
         fromPayouts,
         fromCompensation,
-        payoutCount: totalPayouts,
-        compensationCount: totalCompensations,
+        payoutCount: payoutStats._count.id || 0,
+        compensationCount: compensationStats._count.id || 0,
         totalPayments,
-        paymentCount,
+        paymentCount: paymentStats._count.id || 0,
         totalRefunds,
-        refundCount,
+        refundCount: refundStats._count.id || 0,
         totalFees,
+        pendingPayouts,
+        pendingPayoutCount: pendingStats._count.id || 0,
         averagePayout: payoutStats._avg.netAmount || null,
         largestPayout: payoutStats._max.netAmount || null,
         smallestPayout: payoutStats._min.netAmount || null,
@@ -350,10 +447,13 @@ export async function recalculateUserPaymentProfile(
 }
 
 /**
- * Check if profile cache is stale (older than 1 hour)
+ * Profiles older than this are treated as stale: Overview returns a live
+ * aggregate and re-seeds the denormalized cache in the background.
+ * Keep this short so processing → completed is self-healing even if an
+ * incremental applyPayoutStatusToProfile update was missed.
  */
-export function isProfileStale(lastUpdatedAt: Date): boolean {
-  const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
-  return lastUpdatedAt < oneHourAgo;
-}
+const PROFILE_STALE_MS = 2 * 60 * 1000; // 2 minutes
 
+export function isProfileStale(lastUpdatedAt: Date): boolean {
+  return lastUpdatedAt.getTime() < Date.now() - PROFILE_STALE_MS;
+}

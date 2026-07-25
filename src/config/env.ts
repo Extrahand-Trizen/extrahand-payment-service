@@ -10,10 +10,23 @@ const envSchema = z.object({
   // MongoDB
   MONGODB_URI: z.string().url().optional(),
   MONGODB_DB: z.string().default('extrahand'),
-  
-  // Postgres (Neon DB)
-  POSTGRESDB_URI: z.string().url('POSTGRESDB_URI must be a valid URL'),
+
+  /**
+   * When true, connect Prisma to DEV_POSTGRESDB_URI.
+   * When false, connect Prisma to PROD_POSTGRESDB_URI.
+   * Only one Postgres client is created — never both.
+   */
+  USE_DEV_POSTGRES: z
+    .enum(['true', 'false', '1', '0'])
+    .optional()
+    .default('false')
+    .transform((v) => v === 'true' || v === '1'),
+
+  // Postgres (Neon). Prefer DEV_/PROD_ + USE_DEV_POSTGRES.
+  // POSTGRESDB_URI remains as a legacy fallback if the selected URI is unset.
+  POSTGRESDB_URI: z.string().url('POSTGRESDB_URI must be a valid URL').optional(),
   DEV_POSTGRESDB_URI: z.string().url('DEV_POSTGRESDB_URI must be a valid URL').optional(),
+  PROD_POSTGRESDB_URI: z.string().url('PROD_POSTGRESDB_URI must be a valid URL').optional(),
   
   // Razorpay
   RAZORPAY_KEY_ID: z.string().min(1, 'RAZORPAY_KEY_ID is required'),
@@ -78,8 +91,26 @@ export function validateEnv() {
       process.exit(1);
     }
 
+    const useDevPostgres = env.USE_DEV_POSTGRES === true;
+    const selectedPostgresUri = useDevPostgres
+      ? env.DEV_POSTGRESDB_URI || env.POSTGRESDB_URI
+      : env.PROD_POSTGRESDB_URI || env.POSTGRESDB_URI;
+
+    if (!selectedPostgresUri) {
+      console.error('❌ Environment validation failed: Postgres URI missing');
+      console.error(
+        useDevPostgres
+          ? '  - USE_DEV_POSTGRES=true requires DEV_POSTGRESDB_URI (or legacy POSTGRESDB_URI)'
+          : '  - USE_DEV_POSTGRES=false requires PROD_POSTGRESDB_URI (or legacy POSTGRESDB_URI)'
+      );
+      process.exit(1);
+    }
+
     return {
       ...env,
+      USE_DEV_POSTGRES: useDevPostgres,
+      /** Resolved active Postgres URI used by the single Prisma client */
+      POSTGRESDB_URI: selectedPostgresUri,
       RAZORPAYX_KEY_ID: payoutKeyId,
       RAZORPAYX_KEY_SECRET: payoutKeySecret,
       RAZORPAYX_ACCOUNT_NUMBER: payoutAccountNumber,

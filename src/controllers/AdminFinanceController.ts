@@ -1,5 +1,7 @@
 import { Request, Response } from 'express';
 import { prisma, prismaDev } from '../config/prisma';
+import { applyPayoutStatusToProfile } from '../services/userPaymentProfileService';
+import { notifyPayoutCompleted } from '../services/paymentNotificationService';
 import { Prisma } from '@prisma/client';
 import { BadRequestError, NotFoundError } from '../errors/AppError';
 import { createRefundAmountPaise } from '../services/paymentService';
@@ -563,7 +565,14 @@ export class AdminFinanceController {
   }
 
   static async updatePayoutStatus(req: Request, res: Response): Promise<void> {
-    const { id } = req.params;
+    // Express may leave encoded path segments as-is depending on settings; normalize both forms.
+    const rawId = String(req.params.id || '').trim();
+    let id = rawId;
+    try {
+      id = decodeURIComponent(rawId);
+    } catch {
+      id = rawId;
+    }
     const { status } = req.body || {};
     if (!id) throw new BadRequestError('Payout id is required');
     if (!status || typeof status !== 'string') {
@@ -583,6 +592,30 @@ export class AdminFinanceController {
       where: { OR: [{ id }, { payoutId: id }] },
     });
     if (!payout) throw new NotFoundError('Payout not found');
+    let targetPrisma = prisma;
+    // Match by internal UUID, business payoutId, or bankTransferId (RazorpayX pout_*)
+    let payout = await prisma.payout.findFirst({
+      where: {
+        OR: [{ id }, { payoutId: id }, { bankTransferId: id }],
+      },
+    });
+    if (!payout && prismaDev) {
+      payout = await prismaDev.payout.findFirst({
+        where: {
+          OR: [{ id }, { payoutId: id }, { bankTransferId: id }],
+        },
+      });
+      if (payout) {
+        targetPrisma = prismaDev;
+      }
+    }
+    if (!payout) {
+      logger.warn('Admin payout status update: payout not found', {
+        lookupId: id,
+        status,
+      });
+      throw new NotFoundError('Payout not found');
+    }
 
     const updated = await targetPrisma.payout.update({
       where: { id: payout.id },
@@ -593,6 +626,41 @@ export class AdminFinanceController {
           : {}),
       },
     });
+
+    if (targetPrisma === prisma) {
+      applyPayoutStatusToProfile(
+        payout.performerUid,
+        payout.status,
+        status,
+        payout.netAmount,
+        payout.payoutId,
+      ).catch((err) => {
+        logger.warn('Failed to sync UserPaymentProfile after admin payout status change', {
+          payoutId: payout.payoutId,
+          error: err?.message,
+        });
+      });
+
+      if (status === 'completed' && payout.status !== 'completed') {
+        const metadata =
+          payout.metadata && typeof payout.metadata === 'object' && !Array.isArray(payout.metadata)
+            ? (payout.metadata as Record<string, unknown>)
+            : {};
+        const taskId = typeof metadata.taskId === 'string' ? metadata.taskId : null;
+        const taskTitle = typeof metadata.taskTitle === 'string' ? metadata.taskTitle : null;
+        notifyPayoutCompleted({
+          performerUid: payout.performerUid,
+          amount: payout.netAmount.toString(),
+          taskId,
+          taskTitle,
+        }).catch((err) => {
+          logger.warn('Failed to send payout completed notification after admin status change', {
+            payoutId: payout.payoutId,
+            error: err?.message,
+          });
+        });
+      }
+    }
 
     await targetPrisma.auditLog.create({
       data: {

@@ -96,6 +96,13 @@ export async function processRefund(params: {
       return { success: false, error: 'Escrow already refunded' };
     }
 
+    if (postgresEscrow.status === 'released') {
+      return {
+        success: false,
+        error: 'Refund cannot be processed after payout release.',
+      };
+    }
+
     // Idempotency check: Check if a refund is already in progress or completed for this payment
     const existingRefund = await prisma.refund.findFirst({
       where: {
@@ -816,6 +823,12 @@ export async function processBookNowLineItemRefund(params: {
     }
     if (!isBookNowEscrowRecord(postgresEscrow)) {
       return { success: false, error: 'Not a Book Now escrow' };
+    }
+    if (String(postgresEscrow.status || '').toLowerCase() === 'released') {
+      return {
+        success: false,
+        error: 'Refund cannot be processed after payout release.',
+      };
     }
     const razorpayPaymentId = postgresEscrow.razorpayPaymentId;
     if (!razorpayPaymentId) {

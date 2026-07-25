@@ -335,6 +335,10 @@ model UserPaymentProfile {
   lastPayoutDate  DateTime?
   lastPaymentDate DateTime?
 
+  // Pending payouts (denormalized — avoids live aggregate on GET /earnings)
+  pendingPayouts     Decimal @default(0) @db.Decimal(12, 2)
+  pendingPayoutCount Int     @default(0)
+
   // Payment Preferences
   defaultBankAccountId String? // Reference to BankAccount.id
   currency             String  @default("INR") // Kept for future multi-currency support

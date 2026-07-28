@@ -589,25 +589,12 @@ export class AdminFinanceController {
     const targetPrisma = useDevDb ? prismaDev! : prisma;
 
     let payout = await targetPrisma.payout.findFirst({
-      where: { OR: [{ id }, { payoutId: id }] },
-    });
-    if (!payout) throw new NotFoundError('Payout not found');
-    let targetPrisma = prisma;
-    // Match by internal UUID, business payoutId, or bankTransferId (RazorpayX pout_*)
-    let payout = await prisma.payout.findFirst({
       where: {
         OR: [{ id }, { payoutId: id }, { bankTransferId: id }],
       },
     });
-    if (!payout && prismaDev) {
-      payout = await prismaDev.payout.findFirst({
-        where: {
-          OR: [{ id }, { payoutId: id }, { bankTransferId: id }],
-        },
-      });
-      if (payout) {
-        targetPrisma = prismaDev;
-      }
+    if (!payout) {
+      throw new NotFoundError('Payout not found');
     }
     if (!payout) {
       logger.warn('Admin payout status update: payout not found', {

@@ -3,6 +3,7 @@ import logger from '../config/logger';
 import { Prisma } from '@prisma/client';
 import {
   recalculateUserEarningsProfile,
+  recalculateUserPaymentProfile,
   isProfileStale,
 } from './userPaymentProfileService';
 
@@ -42,8 +43,8 @@ function fromProfileRow(profile: {
   totalEarnings: Prisma.Decimal;
   fromPayouts: Prisma.Decimal;
   fromCompensation: Prisma.Decimal;
-  pendingPayouts: Prisma.Decimal;
-  pendingPayoutCount: number;
+  pendingPayouts?: Prisma.Decimal | null;
+  pendingPayoutCount?: number | null;
   payoutCount: number;
   compensationCount: number;
 }): EarningsPayload {
@@ -51,7 +52,7 @@ function fromProfileRow(profile: {
     totalEarnings: profile.totalEarnings.toString(),
     fromPayouts: profile.fromPayouts.toString(),
     fromCompensation: profile.fromCompensation.toString(),
-    pendingPayouts: profile.pendingPayouts.toString(),
+    pendingPayouts: (profile.pendingPayouts || new Prisma.Decimal('0')).toString(),
     pendingPayoutCount: profile.pendingPayoutCount || 0,
     totalPayouts: profile.payoutCount,
     totalCompensations: profile.compensationCount,
@@ -183,7 +184,7 @@ export async function getUserEarnings(
         profiles.length < uidList.length ||
         profiles.some((p) => isProfileStale(p.lastUpdatedAt));
 
-      if (anyStale || profiles.length === 0) {
+      if (anyStale) {
         path = profiles.length === 0 ? 'fallback_aggregate' : 'linked_stale_live';
         const earnings = await liveAggregateFallback(uidList);
         for (const uid of uidList) {
@@ -227,9 +228,8 @@ export async function getUserEarnings(
         livePending,
       );
 
-      // Heal denormalized pending if cache drifted.
       const cachedPending = profiles.reduce(
-        (sum, p) => sum.plus(p.pendingPayouts || 0),
+        (sum, p) => sum.plus((p as { pendingPayouts?: Prisma.Decimal }).pendingPayouts || 0),
         new Prisma.Decimal('0'),
       );
       if (!cachedPending.equals(livePending.pendingPayouts)) {
@@ -238,21 +238,6 @@ export async function getUserEarnings(
         }
       }
 
-      const totalEarnings = fromPayouts.plus(fromCompensation);
-      return {
-        success: true,
-        earnings: {
-          totalEarnings: totalEarnings.toString(),
-          fromPayouts: fromPayouts.toString(),
-          fromCompensation: fromCompensation.toString(),
-          totalPayouts,
-          totalCompensations,
-          labels: {
-            fromPayouts: 'From Completed Works',
-            fromCompensation: 'From Cancellations',
-          },
-        },
-      };
       logger.info('[EarningsService] getUserEarnings', {
         userId,
         path,
@@ -265,89 +250,11 @@ export async function getUserEarnings(
       return { success: true, earnings };
     }
 
-    const profile = await prisma.userPaymentProfile.findUnique({
+    let profile = await prisma.userPaymentProfile.findUnique({
       where: { userId },
     });
 
-    const computeSingleUidFallback = async () => {
-      const [payoutsAgg, compensationsAgg] = await Promise.all([
-        prisma.payout.aggregate({
-          where: { performerUid: userId, status: 'completed' },
-          _sum: { netAmount: true },
-          _count: { _all: true },
-        }),
-        prisma.refund.aggregate({
-          where: {
-            escrow: { performerUid: userId },
-            cancelledBy: 'poster',
-            toOtherParty: { not: null },
-            status: 'completed',
-          },
-          _sum: { toOtherParty: true },
-          _count: { _all: true },
-        }),
-      ]);
-
-      let fromPayouts = payoutsAgg._sum.netAmount || new Prisma.Decimal('0');
-      let fromCompensation = compensationsAgg._sum.toOtherParty || new Prisma.Decimal('0');
-      let totalPayouts = payoutsAgg._count._all || 0;
-      let totalCompensations = compensationsAgg._count._all || 0;
-
-      // Merge from DEV DB (deduplicate by count to avoid double-counting)
-      if (prismaDev) {
-        try {
-          const [devPayoutsAgg, devCompAgg] = await Promise.all([
-            prismaDev.payout.aggregate({
-              where: { performerUid: userId, status: 'completed' },
-              _sum: { netAmount: true },
-              _count: { _all: true },
-            }),
-            prismaDev.refund.aggregate({
-              where: {
-                escrow: { performerUid: userId },
-                cancelledBy: 'poster',
-                toOtherParty: { not: null },
-                status: 'completed',
-              },
-              _sum: { toOtherParty: true },
-              _count: { _all: true },
-            }),
-          ]);
-          const devPayoutCount = devPayoutsAgg._count._all || 0;
-          const devCompCount = devCompAgg._count._all || 0;
-          if (devPayoutCount > totalPayouts) {
-            fromPayouts = fromPayouts.plus(devPayoutsAgg._sum.netAmount || new Prisma.Decimal('0'));
-            totalPayouts += devPayoutCount;
-          }
-          if (devCompCount > totalCompensations) {
-            fromCompensation = fromCompensation.plus(devCompAgg._sum.toOtherParty || new Prisma.Decimal('0'));
-            totalCompensations += devCompCount;
-          }
-        } catch (devErr: any) {
-          logger.warn('[EarningsService] DEV DB single-uid aggregate failed (non-fatal):', devErr?.message);
-        }
-      }
-
-      const totalEarnings = fromPayouts.plus(fromCompensation);
-      return {
-        success: true as const,
-        earnings: {
-          totalEarnings: totalEarnings.toString(),
-          fromPayouts: fromPayouts.toString(),
-          fromCompensation: fromCompensation.toString(),
-          totalPayouts,
-          totalCompensations,
-          labels: {
-            fromPayouts: 'From Completed Works',
-            fromCompensation: 'From Cancellations',
-          },
-        },
-      };
-    };
-
-
-    // If missing or stale, recalculate
-    if (!profile || (profile && isProfileStale(profile.lastUpdatedAt))) {
+    if (!profile || isProfileStale(profile.lastUpdatedAt)) {
       logger.debug('UserPaymentProfile missing or stale, recalculating...', {
         userId,
         hasProfile: !!profile,
@@ -360,6 +267,12 @@ export async function getUserEarnings(
         });
       } catch (recalcError: any) {
         logger.warn('UserPaymentProfile recalculation failed, using aggregate fallback', {
+          userId,
+          error: recalcError?.message,
+        });
+      }
+    }
+
     if (profile) {
       if (isProfileStale(profile.lastUpdatedAt)) {
         path = 'stale_live';
@@ -390,39 +303,6 @@ export async function getUserEarnings(
       return { success: true, earnings };
     }
 
-    // If still no profile (user has no transactions), return zeros
-    if (!profile) {
-      return {
-        success: true,
-        earnings: {
-          totalEarnings: '0',
-          fromPayouts: '0',
-          fromCompensation: '0',
-          totalPayouts: 0,
-          totalCompensations: 0,
-          labels: {
-            fromPayouts: 'From Completed Works',
-            fromCompensation: 'From Cancellations',
-          },
-        },
-      };
-    }
-
-    // Return from cache with user-friendly labels
-    return {
-      success: true,
-      earnings: {
-        totalEarnings: profile.totalEarnings.toString(),
-        fromPayouts: profile.fromPayouts.toString(),
-        fromCompensation: profile.fromCompensation.toString(),
-        totalPayouts: profile.payoutCount,
-        totalCompensations: profile.compensationCount,
-        labels: {
-          fromPayouts: 'From Completed Works',
-          fromCompensation: 'From Cancellations',
-        },
-      },
-    };
     path = 'miss_live';
     const earnings = await liveAggregateFallback([userId]);
     scheduleEarningsRecalc(userId, 'miss');

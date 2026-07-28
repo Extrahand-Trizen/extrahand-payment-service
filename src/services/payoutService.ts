@@ -1443,7 +1443,6 @@ export async function processTaskCompletionPayout(params: {
             data: {
               payoutId,
               taskId,
-              escrowId: null,
               escrowId: postgresEscrowId,
               performerUid,
               amount: grossAmount,
@@ -1473,7 +1472,6 @@ export async function processTaskCompletionPayout(params: {
           data: {
             payoutId,
             taskId,
-            escrowId: null,
             escrowId: postgresEscrowId,
             performerUid,
             amount: grossAmount,

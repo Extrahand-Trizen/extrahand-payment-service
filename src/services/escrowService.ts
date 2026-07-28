@@ -16,8 +16,11 @@ import {
 } from './feeConfigService';
 import { createLedgerEntry, getEscrowBalance } from './ledgerService';
 import { EmailServiceClient } from '../clients/EmailServiceClient';
-import { InAppNotificationClient } from '../clients/InAppNotificationClient';
 import { fireWhatsAppNotify } from '../clients/WhatsAppClient';
+import {
+  notifyPaymentReceived,
+  notifyPayoutCompleted,
+} from './paymentNotificationService';
 import { logEscrowCreated, logPaymentCaptured, logPaymentFailed } from './auditLogService';
 import mongoose from 'mongoose';
 import { buildEscrowMetadataSnapshot, getTaskDisplayTitleFromEscrow } from '../utils/escrowMetadataSnapshot';
@@ -1142,20 +1145,7 @@ export async function updateEscrowOnPaymentCapture(
       (async () => {
         try {
           const amountStr = updatedEscrow.amountInRupees.toString();
-
-          // In-app Notification: send regardless of profile lookup/FCM tokens
-          await InAppNotificationClient.send({
-            userId: postgresEscrow.posterUid,
-            title: 'Amount received',
-            body: `Rs ${amountStr} payment received for task.`,
-            type: 'success',
-            category: 'payments',
-            data: {
-              taskId: postgresEscrow.taskId,
-              escrowId: postgresEscrow.escrowId,
-              actionUrl: '/profile?section=payments'
-            }
-          });
+          let notifyUid = String(postgresEscrow.posterUid || '');
 
           if (mongoose.connection.readyState === 1) {
             const Profile = mongoose.connection.collection('profiles');
@@ -1164,7 +1154,19 @@ export async function updateEscrowOnPaymentCapture(
               (mongoose.isValidObjectId(postgresEscrow.posterUid)
                 ? await Profile.findOne({ _id: new mongoose.Types.ObjectId(postgresEscrow.posterUid) })
                 : null);
-            
+
+            if (posterProfile?.uid) {
+              notifyUid = String(posterProfile.uid);
+            }
+
+            // In-app + push (Firebase uid so FCM tokens resolve)
+            await notifyPaymentReceived({
+              posterUid: notifyUid,
+              amount: amountStr,
+              taskTitle: getTaskDisplayTitleFromEscrow(postgresEscrow),
+              taskId: postgresEscrow.taskId,
+            });
+
             if (posterProfile?.email) {
               await EmailServiceClient.sendPaymentReceived(
                 posterProfile.email,
@@ -1178,6 +1180,13 @@ export async function updateEscrowOnPaymentCapture(
                 }
               );
             }
+          } else {
+            await notifyPaymentReceived({
+              posterUid: notifyUid,
+              amount: amountStr,
+              taskTitle: getTaskDisplayTitleFromEscrow(postgresEscrow),
+              taskId: postgresEscrow.taskId,
+            });
           }
         } catch (err) {
           logger.error('Error sending payment received notifications:', err);
@@ -1623,35 +1632,15 @@ export async function releaseEscrow(
           
           if (performerProfile) {
             const amountStr = postgresEscrow.amountInRupees.toString();
-            
-            // In-app Notification
-            await InAppNotificationClient.send({
-              userId: performerUid,
-              title: 'Amount credited',
-              body: `Rs ${amountStr} payout credited.`,
-              type: 'success',
-              category: 'payments',
-              data: {
-                taskId: postgresEscrow.taskId,
-                escrowId: postgresEscrow.escrowId,
-                actionUrl: '/profile?section=payments'
-              }
-            });
+            const performerNotifyUid = String(
+              performerProfile.uid || performerUid || '',
+            );
 
-            fireWhatsAppNotify({
-              uid: performerUid,
-              templateKey: 'wa_earnings_credited',
-              category: 'payments',
-              templateBody: {
-                var_1: amountStr,
-                var_2: getTaskDisplayTitleFromEscrow(postgresEscrow) || 'your task',
-              },
-              idempotencyKey: `escrow-released:${postgresEscrow.escrowId}`,
-              metadata: {
-                workId: postgresEscrow.taskId,
-                triggerType: 'escrow_released',
-                recipientRole: 'helper',
-              },
+            await notifyPayoutCompleted({
+              performerUid: performerNotifyUid,
+              amount: amountStr,
+              taskTitle: getTaskDisplayTitleFromEscrow(postgresEscrow),
+              taskId: postgresEscrow.taskId,
             });
 
             // Customer invoice ready — once per escrow after funds are released/settled.

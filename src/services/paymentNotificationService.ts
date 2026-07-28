@@ -1,3 +1,4 @@
+import axios from 'axios';
 import { InAppNotificationClient } from '../clients/InAppNotificationClient';
 import { EmailServiceClient } from '../clients/EmailServiceClient';
 import { fireWhatsAppNotify } from '../clients/WhatsAppClient';
@@ -7,13 +8,73 @@ interface BasePayload {
   userId: string;
   title: string;
   body: string;
+  eventKey: string;
   data?: Record<string, unknown>;
 }
 
-async function sendInApp(payload: BasePayload): Promise<void> {
-  logger.info('[paymentNotificationService] Sending in-app notification', {
+function notificationServiceBaseUrl(): string {
+  return (
+    process.env.NOTIFICATION_SERVICE_URL ||
+    'http://localhost:4005'
+  ).replace(/\/$/, '');
+}
+
+function serviceAuthHeaders(): Record<string, string> {
+  return {
+    'Content-Type': 'application/json',
+    'X-Service-Auth':
+      process.env.SERVICE_AUTH_TOKEN ||
+      '',
+    'X-Service-Name': process.env.SERVICE_NAME || 'payment-service',
+  };
+}
+
+async function sendPush(payload: BasePayload): Promise<void> {
+  if (!payload.userId || !payload.title || !payload.body) return;
+
+  try {
+    await axios.post(
+      `${notificationServiceBaseUrl()}/api/v1/notifications/send`,
+      {
+        recipients: [payload.userId],
+        eventKey: payload.eventKey,
+        category: 'payments',
+        title: payload.title,
+        body: payload.body,
+        data: {
+          ...(payload.data || {}),
+          eventKey: payload.eventKey,
+          category: 'payments',
+        },
+        entity: {
+          type: 'payment',
+          id: String(payload.data?.taskId || payload.data?.escrowId || payload.eventKey),
+        },
+      },
+      {
+        headers: serviceAuthHeaders(),
+        timeout: 10000,
+      },
+    );
+    logger.info('[paymentNotificationService] Push notification sent', {
+      userId: payload.userId,
+      eventKey: payload.eventKey,
+    });
+  } catch (error: any) {
+    logger.warn('[paymentNotificationService] Push notification failed', {
+      userId: payload.userId,
+      eventKey: payload.eventKey,
+      status: error?.response?.status,
+      message: error?.message,
+    });
+  }
+}
+
+async function sendInAppAndPush(payload: BasePayload): Promise<void> {
+  logger.info('[paymentNotificationService] Sending in-app + push notification', {
     userId: payload.userId,
     title: payload.title,
+    eventKey: payload.eventKey,
     hasTaskId: !!payload.data?.taskId,
   });
 
@@ -23,7 +84,11 @@ async function sendInApp(payload: BasePayload): Promise<void> {
     body: payload.body,
     category: 'payments',
     type: 'success',
-    data: payload.data,
+    data: {
+      ...(payload.data || {}),
+      eventKey: payload.eventKey,
+      category: 'payments',
+    },
   });
 
   if (!ok) {
@@ -37,6 +102,8 @@ async function sendInApp(payload: BasePayload): Promise<void> {
       title: payload.title,
     });
   }
+
+  await sendPush(payload);
 }
 
 export async function notifyPaymentReceived(params: {
@@ -52,10 +119,11 @@ export async function notifyPaymentReceived(params: {
     taskId,
     hasTaskTitle: !!taskTitle,
   });
-  await sendInApp({
+  await sendInAppAndPush({
     userId: posterUid,
     title: 'Payment received',
     body: `We received ₹${amount} for${taskTitle ? ` ${taskTitle}` : ' your task'}.`,
+    eventKey: 'PAYMENT_RECEIVED',
     data: {
       taskId,
       amount,
@@ -90,10 +158,11 @@ export async function notifyPayoutCompleted(params: {
     taskId,
     hasTaskTitle: !!taskTitle,
   });
-  await sendInApp({
+  await sendInAppAndPush({
     userId: performerUid,
     title: 'Payout credited',
     body: `₹${amount} has been sent to your account${taskTitle ? ` for ${taskTitle}` : ''}.`,
+    eventKey: 'PAYOUT_COMPLETED',
     data: {
       taskId,
       amount,
@@ -136,10 +205,11 @@ export async function notifyRefundInitiated(params: {
 
   const actionUrl = taskId ? `/tasks/${taskId}/track` : '/tasks';
 
-  await sendInApp({
+  await sendInAppAndPush({
     userId: posterUid,
     title: 'Task cancelled',
     body: `The task${taskTitle ? ` "${taskTitle}"` : ''} has been cancelled. Your amount will be refunded within 5-7 days.`,
+    eventKey: 'REFUND_INITIATED',
     data: {
       taskId,
       amount,
@@ -181,10 +251,11 @@ export async function notifyPayoutInitiated(params: {
     hasEmail: !!email,
   });
 
-  await sendInApp({
+  await sendInAppAndPush({
     userId: performerUid,
     title: 'Payout initiated',
     body: `Your payout of ₹${amount}${taskTitle ? ` for ${taskTitle}` : ''} has been initiated. It will be sent in a few minutes.`,
+    eventKey: 'PAYOUT_INITIATED',
     data: {
       taskId,
       amount,
@@ -232,10 +303,11 @@ export async function notifyRefundProcessed(params: {
     hasTaskTitle: !!taskTitle,
     hasReason: !!reason,
   });
-  await sendInApp({
+  await sendInAppAndPush({
     userId: posterUid,
     title: 'Refund processed',
     body: `We processed your refund of ₹${amount}${taskTitle ? ` for ${taskTitle}` : ''}.`,
+    eventKey: 'REFUND_PROCESSED',
     data: {
       taskId,
       amount,
@@ -260,10 +332,11 @@ export async function notifyPenaltyCreated(params: {
     taskId,
     hasTaskTitle: !!taskTitle,
   });
-  await sendInApp({
+  await sendInAppAndPush({
     userId: performerUid,
     title: 'Penalty applied',
     body: `A penalty of ₹${amount} has been applied${taskTitle ? ` for ${taskTitle}` : ''}. It will be adjusted in your next payout.`,
+    eventKey: 'PAYOUT_PENALTY',
     data: {
       taskId,
       amount,

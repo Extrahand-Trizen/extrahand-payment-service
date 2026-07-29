@@ -107,6 +107,8 @@ export const BOOK_NOW_CATEGORY_FEE_SEED_ROWS: CategoryFeeSeedRow[] = [
   bookNowRow('window-glass', 'Window & Glass Cleaning', 0.18, CLEANING_SAC),
   bookNowRow('ac-services', 'AC Services', 0.18, REPAIR_SAC),
   bookNowRow('appliance-repair', 'Appliance Repair', 0.18, APPLIANCE_SAC),
+  /** Book Now Hourly Helper — catalog slug `hourly-helper` (Task.category maps to enum `other`). */
+  bookNowRow('hourly-helper', 'Hourly Helper', 0.18, CLEANING_SAC),
 ];
 
 /**

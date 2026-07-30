@@ -1140,6 +1140,7 @@ export async function getUserTransactions(
                 category: 'earnings', // Money received
                 metadata: enrichRecurringPayoutMetadata(
                   {
+                  bookingMode: (em.bookingMode === 'book_now' ? 'book_now' : undefined) as string | undefined,
                   taskId: escrow.taskId,
                   ...(payoutDisplayTitle
                     ? {

@@ -2,6 +2,7 @@ import express from 'express';
 import { serviceAuthMiddleware } from '../middleware/serviceAuth';
 import { PaymentController } from '../controllers/PaymentController';
 import { asyncHandler } from '../middleware/errorHandler';
+import { validateCoupon, listEligibleCoupons } from '../controllers/CouponProxyController';
 
 const router = express.Router();    
 
@@ -31,6 +32,10 @@ router.post(
   '/book-now/cancel-line-item',
   asyncHandler(PaymentController.cancelBookNowLineItem),
 );
+
+// POST /api/v1/payment/coupons/validate — proxies to coupon-service
+router.post('/coupons/validate', asyncHandler(validateCoupon));
+router.post('/coupons/eligible', asyncHandler(listEligibleCoupons));
 
 export default router;
 

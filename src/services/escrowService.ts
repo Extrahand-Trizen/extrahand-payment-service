@@ -27,6 +27,8 @@ import { buildEscrowMetadataSnapshot, getTaskDisplayTitleFromEscrow } from '../u
 import { applyExtraCoinsForBooking, previewExtraCoinsRedemption } from './extraCoinsService';
 import { paymentRewardsFlags } from '../config/rewardsFlags';
 import { CoinUsageConfigProvider } from '../rewards/config/CoinUsageConfigProvider';
+import { CouponClient } from '../clients/CouponClient';
+import { recalculateBookNowTotalsAfterCouponDiscount } from './bookNowGstService';
 
 /**
  * Generate unique escrow ID
@@ -359,11 +361,107 @@ export async function createEscrow(params: {
     }
 
     const escrowId = generateEscrowId();
+
+    // Coupon applies on eligible service (pre-GST) amounts; GST is recalculated on discounted subtotals.
+    let amountAfterCoupon = new Prisma.Decimal(amount.toFixed(2));
+    let couponDiscountRupees = new Prisma.Decimal('0.00');
+    let couponRedemptionId: string | null = null;
+    let couponId: string | null = null;
+    let couponCodeApplied: string | null = null;
+    let adjustedGstRupees: number | null = null;
+    let adjustedServiceSubtotal: number | null = null;
+
+    const rawCouponCode = String(metadata?.couponCode || '').trim();
+    if (rawCouponCode) {
+      const isBookNow = metadata?.bookingMode === 'book_now';
+      const flowType = isBookNow ? 'BOOK_NOW' : 'POST_COMPARE';
+      const serviceIds = Array.isArray(metadata?.couponServiceIds)
+        ? metadata.couponServiceIds.map((s: unknown) => String(s).trim()).filter(Boolean)
+        : Array.isArray(metadata?.skuSlugs)
+          ? metadata.skuSlugs.map((s: unknown) => String(s).trim()).filter(Boolean)
+          : typeof metadata?.categorySlug === 'string' && metadata.categorySlug.trim()
+            ? [metadata.categorySlug.trim()]
+            : [];
+
+      const lineItems = Array.isArray(metadata?.couponLineItems)
+        ? metadata.couponLineItems
+            .map((row: any) => ({
+              serviceId: String(row?.serviceId || '').trim(),
+              amount: Number(row?.amount) || 0,
+            }))
+            .filter((row: { serviceId: string; amount: number }) => row.serviceId && row.amount > 0)
+        : [];
+
+      const reserve = await CouponClient.reserve({
+        couponCode: rawCouponCode,
+        userId: posterUid,
+        flowType,
+        amount: Number(amount.toFixed(2)),
+        serviceIds,
+        lineItems,
+        bookingOrderId:
+          typeof metadata.bookingOrderId === 'string' ? metadata.bookingOrderId : null,
+        taskId,
+      });
+
+      if (!reserve.success || !reserve.redemption) {
+        return {
+          success: false,
+          error: reserve.message || reserve.error || 'Invalid coupon',
+          code: reserve.code,
+        } as any;
+      }
+
+      couponRedemptionId = reserve.redemption.id;
+      couponId = reserve.redemption.couponId;
+      couponCodeApplied = reserve.redemption.couponCode;
+      couponDiscountRupees = new Prisma.Decimal(
+        Number(reserve.redemption.discountAmount || 0).toFixed(2)
+      );
+
+      const eligibleServiceIds = Array.isArray(reserve.redemption.eligibleServiceIds)
+        ? reserve.redemption.eligibleServiceIds.map((s: unknown) => String(s).trim()).filter(Boolean)
+        : [];
+
+      if (isBookNow && Array.isArray(metadata?.gstByCategory) && metadata.gstByCategory.length > 0) {
+        const gstRows = metadata.gstByCategory
+          .map((row: any) => ({
+            categoryKey: String(row?.categoryKey || '').trim(),
+            subtotal: Number(row?.subtotal) || 0,
+            gstPercentage: Number(row?.gstPercentage) || 0,
+            gstAmount: Number(row?.gstAmount) || 0,
+          }))
+          .filter((row) => row.categoryKey && row.subtotal > 0);
+
+        if (gstRows.length > 0) {
+          const recalculated = recalculateBookNowTotalsAfterCouponDiscount({
+            categories: gstRows,
+            couponDiscountRupees: Number(couponDiscountRupees.toString()),
+            eligibleServiceIds,
+          });
+          adjustedGstRupees = recalculated.gst;
+          adjustedServiceSubtotal = recalculated.subtotal;
+          amountAfterCoupon = new Prisma.Decimal(recalculated.total.toFixed(2));
+        } else {
+          amountAfterCoupon = Prisma.Decimal.max(
+            new Prisma.Decimal(amount.toFixed(2)).sub(couponDiscountRupees).toDecimalPlaces(2),
+            new Prisma.Decimal('0.00')
+          );
+        }
+      } else {
+        amountAfterCoupon = Prisma.Decimal.max(
+          new Prisma.Decimal(amount.toFixed(2)).sub(couponDiscountRupees).toDecimalPlaces(2),
+          new Prisma.Decimal('0.00')
+        );
+      }
+    }
+
     const coinCaps = await CoinUsageConfigProvider.getCapPercents();
     const posterCapPercent = paymentRewardsFlags.CUSTOMER_BOOKING_COIN_CAP_ENABLED
       ? coinCaps.posterBooking.toFixed(4)
       : '1.0000';
-    const maxCustomerCoinDiscount = new Prisma.Decimal(amount.toFixed(2))
+    // ExtraCoins cap applies to amount AFTER coupon
+    const maxCustomerCoinDiscount = amountAfterCoupon
       .mul(new Prisma.Decimal(posterCapPercent))
       .toDecimalPlaces(2);
     const requestedCoinDiscountRaw = Number(metadata?.requestedCoinDiscountRupees || 0);
@@ -399,7 +497,7 @@ export async function createEscrow(params: {
     }
 
     const finalChargeAmount = Prisma.Decimal.max(
-      new Prisma.Decimal(amount.toFixed(2)).sub(pendingCoinRupees).toDecimalPlaces(2),
+      amountAfterCoupon.sub(pendingCoinRupees).toDecimalPlaces(2),
       new Prisma.Decimal('0.00')
     );
 
@@ -420,13 +518,26 @@ export async function createEscrow(params: {
       customerCoinDiscountCoins: pendingCoinUnits.toString(),
       customerCoinDiscountCapRupees: maxCustomerCoinDiscount.toString(),
       originalAmountRupees: Number(amount.toFixed(2)),
+      couponId,
+      couponCode: couponCodeApplied,
+      couponDiscount: couponDiscountRupees.toString(),
+      couponRedemptionId,
+      amountAfterCoupon: amountAfterCoupon.toString(),
     });
 
     if (!orderResult.success || !orderResult.order) {
+      if (couponRedemptionId) {
+        await CouponClient.cancel(couponRedemptionId);
+      }
       return { success: false, error: orderResult.error || 'Failed to create Razorpay order' };
     }
 
     const razorpayOrder = orderResult.order;
+
+    const existingBreakdown =
+      metadata?.amountBreakdown && typeof metadata.amountBreakdown === 'object'
+        ? (metadata.amountBreakdown as Record<string, unknown>)
+        : {};
 
     const escrowMetadata = buildEscrowMetadataSnapshot(
       {
@@ -443,6 +554,28 @@ export async function createEscrow(params: {
         customerCoinDiscountRupees: pendingCoinRupees.toString(),
         customerCoinDiscountCoins: pendingCoinUnits.toString(),
         customerCoinDiscountCapRupees: maxCustomerCoinDiscount.toString(),
+        ...(couponRedemptionId
+          ? {
+              couponId,
+              couponCode: couponCodeApplied,
+              couponDiscount: Number(couponDiscountRupees.toString()),
+              couponDiscountRupees: couponDiscountRupees.toString(),
+              couponRedemptionId,
+              totalBeforeCoupon: Number(amount.toFixed(2)),
+              totalAfterCoupon: Number(amountAfterCoupon.toString()),
+            }
+          : {}),
+        amountBreakdown: {
+          ...existingBreakdown,
+          originalAmount: Number(amount.toFixed(2)),
+          ...(adjustedServiceSubtotal != null ? { taskAmount: adjustedServiceSubtotal } : {}),
+          ...(adjustedGstRupees != null ? { gst: adjustedGstRupees } : {}),
+          couponDiscount: Number(couponDiscountRupees.toString()),
+          extraCoinsDiscount: Number(pendingCoinRupees.toString()),
+          totalAfterCoupon: Number(amountAfterCoupon.toString()),
+          finalPayableAmount: Number(finalChargeAmount.toString()),
+          totalPaid: Number(finalChargeAmount.toString()),
+        },
         ...(String(razorpayOrder.id).startsWith(REVIEW_ORDER_ID_PREFIX)
           ? { reviewBypass: true }
           : {}),
@@ -568,6 +701,9 @@ export async function createEscrow(params: {
       };
     } catch (error: any) {
       logger.error('❌ Error creating escrow:', error);
+      if (couponRedemptionId) {
+        await CouponClient.cancel(couponRedemptionId);
+      }
       throw error;
     }
   } catch (error: any) {
@@ -980,6 +1116,17 @@ async function recoverEscrowFromRazorpayOrder(razorpayOrderId: string) {
   return recovered;
 }
 
+function readCouponRedemptionIdFromEscrow(escrow: {
+  metadata?: unknown;
+}): string | null {
+  const meta =
+    escrow.metadata && typeof escrow.metadata === 'object'
+      ? (escrow.metadata as Record<string, unknown>)
+      : {};
+  const id = String(meta.couponRedemptionId || '').trim();
+  return id || null;
+}
+
 /**
  * Update escrow status when payment is captured
  * Now uses Postgres only
@@ -1021,6 +1168,10 @@ export async function updateEscrowOnPaymentCapture(
       postgresEscrow.razorpayPaymentId === razorpayPaymentId
     ) {
       await redeemCustomerCoinsOnEscrowCapture(postgresEscrow);
+      const redemptionId = readCouponRedemptionIdFromEscrow(postgresEscrow);
+      if (redemptionId) {
+        await CouponClient.confirm(redemptionId);
+      }
       logger.info('ℹ️ Escrow payment already captured (idempotent)', {
         escrowId: postgresEscrow.escrowId,
         razorpayOrderId,
@@ -1053,6 +1204,10 @@ export async function updateEscrowOnPaymentCapture(
       updateData.status = 'cancelled';
       updateData.errorMessage = (razorpayPaymentData as any)?.error_description || 'Payment failed';
       updateData.errorCode = (razorpayPaymentData as any)?.error_code || null;
+      const couponRedemptionId = readCouponRedemptionIdFromEscrow(postgresEscrow);
+      if (couponRedemptionId) {
+        await CouponClient.cancel(couponRedemptionId);
+      }
     }
 
     const updatedEscrow = await prisma.escrow.update({
@@ -1100,6 +1255,11 @@ export async function updateEscrowOnPaymentCapture(
 
     // Create ledger entry for payment capture
     if (paymentStatus === 'captured') {
+      const couponRedemptionId = readCouponRedemptionIdFromEscrow(updatedEscrow);
+      if (couponRedemptionId) {
+        await CouponClient.confirm(couponRedemptionId);
+      }
+
       // Get current balance (using Postgres escrow ID)
       const balanceResult = await getEscrowBalance(postgresEscrow.id);
       const currentBalance = balanceResult.balance || new Prisma.Decimal('0.00');

@@ -1,4 +1,4 @@
-import { CategoryFeeMode ,Prisma} from '@prisma/client';
+import { CategoryFeeMode, Prisma } from '@prisma/client';
 import logger from '../config/logger';
 import { prisma } from '../config/prisma';
 import { getCategoryLookupKeys } from './feeConfigService';
@@ -220,4 +220,97 @@ export async function calculateBookNowOrderTotals(
   });
 
   return result;
+}
+
+export type BookNowGstCategoryRow = BookNowCategoryGstBreakdown;
+
+/**
+ * Recalculate Book Now totals after a service-level coupon discount.
+ * GST is applied on the reduced pre-GST subtotal per category.
+ */
+export function recalculateBookNowTotalsAfterCouponDiscount(params: {
+  categories: BookNowGstCategoryRow[];
+  couponDiscountRupees: number;
+  eligibleServiceIds?: string[];
+}): BookNowOrderTotals {
+  const discount = round2(Math.max(0, Number(params.couponDiscountRupees) || 0));
+  const categoriesInput = params.categories || [];
+
+  if (discount <= 0 || categoriesInput.length === 0) {
+    const subtotal = round2(categoriesInput.reduce((sum, row) => sum + row.subtotal, 0));
+    const gst = round2(categoriesInput.reduce((sum, row) => sum + row.gstAmount, 0));
+    return {
+      subtotal,
+      addonsTotal: 0,
+      platformFee: 0,
+      gst,
+      total: round2(subtotal + gst),
+      categories: categoriesInput,
+    };
+  }
+
+  const eligibleSet = new Set(
+    (params.eligibleServiceIds || [])
+      .map((id) => String(id).trim().toLowerCase())
+      .filter(Boolean),
+  );
+  const hasEligibleFilter = eligibleSet.size > 0;
+
+  const weights: { key: string; weight: number; gstPercentage: number }[] = [];
+  for (const cat of categoriesInput) {
+    const key = String(cat.categoryKey || '').trim().toLowerCase();
+    if (!key) continue;
+    const eligible = !hasEligibleFilter || eligibleSet.has(key);
+    if (eligible && cat.subtotal > 0) {
+      weights.push({
+        key: cat.categoryKey,
+        weight: cat.subtotal,
+        gstPercentage: cat.gstPercentage,
+      });
+    }
+  }
+
+  const discountByCategory = new Map<string, number>();
+  const weightSum = weights.reduce((sum, row) => sum + row.weight, 0);
+  if (weightSum > 0) {
+    let allocated = 0;
+    weights.forEach((row, index) => {
+      const isLast = index === weights.length - 1;
+      const share = isLast
+        ? round2(discount - allocated)
+        : round2(discount * (row.weight / weightSum));
+      allocated = round2(allocated + share);
+      discountByCategory.set(row.key.toLowerCase(), Math.max(0, share));
+    });
+  }
+
+  const categories: BookNowCategoryGstBreakdown[] = [];
+  let subtotal = 0;
+  let totalGst = 0;
+
+  for (const cat of categoriesInput) {
+    const key = String(cat.categoryKey || '').trim().toLowerCase();
+    const catDiscount = discountByCategory.get(key) || 0;
+    const discountedSubtotal = round2(Math.max(0, cat.subtotal - catDiscount));
+    const gstAmount = round2(discountedSubtotal * cat.gstPercentage);
+    subtotal = round2(subtotal + discountedSubtotal);
+    totalGst = round2(totalGst + gstAmount);
+    categories.push({
+      categoryKey: cat.categoryKey,
+      subtotal: discountedSubtotal,
+      gstPercentage: cat.gstPercentage,
+      gstAmount,
+    });
+  }
+
+  categories.sort((a, b) => a.categoryKey.localeCompare(b.categoryKey));
+
+  return {
+    subtotal,
+    addonsTotal: 0,
+    platformFee: 0,
+    gst: totalGst,
+    total: round2(subtotal + totalGst),
+    categories,
+  };
 }

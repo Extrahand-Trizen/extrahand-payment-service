@@ -11,6 +11,7 @@ import adminRoutes from './admin';
 import cascadeDeleteRoutes from './cascadeDelete';
 import bankAccountRoutes from './bankAccounts';
 import dashboardRoutes from './dashboard';
+import internalRoutes from './internal';
 import { validateEnv } from '../config/env';
 import { isDatabaseConnected, isPostgresConnected } from '../config/database';
 
@@ -66,6 +67,9 @@ router.use('/cascade-delete', cascadeDeleteRoutes);
 
 // Internal dashboard routes (service auth)
 router.use('/dashboard', dashboardRoutes);
+
+// Internal APIs for coupon-service (first-booking check)
+router.use('/internal', internalRoutes);
 
 export default router;
 

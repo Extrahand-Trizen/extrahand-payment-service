@@ -3,6 +3,7 @@ import logger from '../config/logger';
 import { Prisma } from '@prisma/client';
 import {
   recalculateUserEarningsProfile,
+  recalculateUserPaymentProfile,
   isProfileStale,
 } from './userPaymentProfileService';
 
@@ -42,8 +43,8 @@ function fromProfileRow(profile: {
   totalEarnings: Prisma.Decimal;
   fromPayouts: Prisma.Decimal;
   fromCompensation: Prisma.Decimal;
-  pendingPayouts: Prisma.Decimal;
-  pendingPayoutCount: number;
+  pendingPayouts?: Prisma.Decimal | null;
+  pendingPayoutCount?: number | null;
   payoutCount: number;
   compensationCount: number;
 }): EarningsPayload {
@@ -51,7 +52,7 @@ function fromProfileRow(profile: {
     totalEarnings: profile.totalEarnings.toString(),
     fromPayouts: profile.fromPayouts.toString(),
     fromCompensation: profile.fromCompensation.toString(),
-    pendingPayouts: profile.pendingPayouts.toString(),
+    pendingPayouts: (profile.pendingPayouts || new Prisma.Decimal('0')).toString(),
     pendingPayoutCount: profile.pendingPayoutCount || 0,
     totalPayouts: profile.payoutCount,
     totalCompensations: profile.compensationCount,
@@ -183,7 +184,7 @@ export async function getUserEarnings(
         profiles.length < uidList.length ||
         profiles.some((p) => isProfileStale(p.lastUpdatedAt));
 
-      if (anyStale || profiles.length === 0) {
+      if (anyStale) {
         path = profiles.length === 0 ? 'fallback_aggregate' : 'linked_stale_live';
         const earnings = await liveAggregateFallback(uidList);
         for (const uid of uidList) {
@@ -227,9 +228,8 @@ export async function getUserEarnings(
         livePending,
       );
 
-      // Heal denormalized pending if cache drifted.
       const cachedPending = profiles.reduce(
-        (sum, p) => sum.plus(p.pendingPayouts || 0),
+        (sum, p) => sum.plus((p as { pendingPayouts?: Prisma.Decimal }).pendingPayouts || 0),
         new Prisma.Decimal('0'),
       );
       if (!cachedPending.equals(livePending.pendingPayouts)) {
@@ -250,9 +250,28 @@ export async function getUserEarnings(
       return { success: true, earnings };
     }
 
-    const profile = await prisma.userPaymentProfile.findUnique({
+    let profile = await prisma.userPaymentProfile.findUnique({
       where: { userId },
     });
+
+    if (!profile || isProfileStale(profile.lastUpdatedAt)) {
+      logger.debug('UserPaymentProfile missing or stale, recalculating...', {
+        userId,
+        hasProfile: !!profile,
+        isStale: profile ? isProfileStale(profile.lastUpdatedAt) : true,
+      });
+      try {
+        await recalculateUserPaymentProfile(userId);
+        profile = await prisma.userPaymentProfile.findUnique({
+          where: { userId },
+        });
+      } catch (recalcError: any) {
+        logger.warn('UserPaymentProfile recalculation failed, using aggregate fallback', {
+          userId,
+          error: recalcError?.message,
+        });
+      }
+    }
 
     if (profile) {
       if (isProfileStale(profile.lastUpdatedAt)) {
@@ -419,7 +438,7 @@ export async function getEarningsByPeriod(
           payoutCount: payoutData.count,
           compensationCount: compensationData.count,
           labels: {
-            fromPayouts: 'Completed Tasks',
+            fromPayouts: 'Completed Works',
             fromCompensation: 'Cancellations',
           },
         };

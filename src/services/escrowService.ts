@@ -1161,11 +1161,13 @@ export async function updateEscrowOnPaymentCapture(
       return { success: false, error: 'Escrow not found' };
     }
 
+    const existingEscrow = postgresEscrow;
+
     // Idempotency: if this escrow is already captured for this payment, skip update and ledger
     if (
       paymentStatus === 'captured' &&
-      postgresEscrow.paymentStatus === 'captured' &&
-      postgresEscrow.razorpayPaymentId === razorpayPaymentId
+      existingEscrow.paymentStatus === 'captured' &&
+      existingEscrow.razorpayPaymentId === razorpayPaymentId
     ) {
       await redeemCustomerCoinsOnEscrowCapture(postgresEscrow);
       const redemptionId = readCouponRedemptionIdFromEscrow(postgresEscrow);
@@ -1210,7 +1212,7 @@ export async function updateEscrowOnPaymentCapture(
       }
     }
 
-    const updatedEscrow = await prisma.escrow.update({
+    let updatedEscrow = await prisma.escrow.update({
       where: { id: postgresEscrow.id },
       data: updateData,
     });
@@ -1390,21 +1392,62 @@ export async function updateEscrowOnPaymentCapture(
         }).catch(() => undefined);
       }
 
-      const capturedBookingOrderId = resolveEscrowBookingOrderId(postgresEscrow);
+        const capturedBookingOrderId = resolveEscrowBookingOrderId(postgresEscrow);
+      const originalTaskId = postgresEscrow.taskId;
+      const originalEscrowId = postgresEscrow.escrowId;
       if (capturedBookingOrderId) {
         const { TaskServiceClient } = await import('../clients/TaskServiceClient');
-        TaskServiceClient.notifyBookingPaymentCaptured({
-          bookingOrderId: capturedBookingOrderId,
-          escrowId: postgresEscrow.escrowId,
-          razorpayOrderId,
-          taskId: postgresEscrow.taskId,
-        }).catch((err) => {
+        try {
+          const notifyResult = await TaskServiceClient.notifyBookingPaymentCaptured({
+            bookingOrderId: capturedBookingOrderId,
+            escrowId: originalEscrowId,
+            razorpayOrderId,
+            taskId: originalTaskId,
+          });
+
+          if (
+            notifyResult.success &&
+            Array.isArray(notifyResult.tasks) &&
+            notifyResult.tasks.length > 0
+          ) {
+            const firstTask = notifyResult.tasks[0];
+            const resolvedTaskId = String(
+              (firstTask && (firstTask._id || firstTask.id || firstTask)) || ''
+            ).trim();
+
+            if (resolvedTaskId && resolvedTaskId !== originalTaskId) {
+              updatedEscrow = await prisma.escrow.update({
+                where: { id: postgresEscrow.id },
+                data: { taskId: resolvedTaskId },
+              });
+
+              if (shouldPersistTransaction) {
+                await prisma.transaction.updateMany({
+                  where: {
+                    razorpayPaymentId,
+                    taskId: originalTaskId,
+                  },
+                  data: {
+                    taskId: resolvedTaskId,
+                  },
+                });
+              }
+
+              postgresEscrow = updatedEscrow;
+              logger.info('Updated Book Now escrow to real task ID after task materialization', {
+                escrowId: updatedEscrow.escrowId,
+                oldTaskId: originalTaskId,
+                taskId: resolvedTaskId,
+              });
+            }
+          }
+        } catch (err) {
           logger.error('Book Now payment-captured callback failed', {
             bookingOrderId: capturedBookingOrderId,
-            taskId: postgresEscrow.taskId,
+            taskId: originalTaskId,
             error: err instanceof Error ? err.message : String(err),
           });
-        });
+        }
       }
 
       const escrowMetadata = (postgresEscrow.metadata || {}) as Record<string, unknown>;
@@ -1419,12 +1462,12 @@ export async function updateEscrowOnPaymentCapture(
         TaskServiceClient.notifyRecurringVisitPaymentCaptured({
           parentTaskId: recurringParentTaskId,
           visitId: recurringVisitId,
-          escrowId: postgresEscrow.escrowId,
+          escrowId: postgresEscrow!.escrowId,
         }).catch((err) => {
           logger.error('Recurring visit payment-captured callback failed', {
             parentTaskId: recurringParentTaskId,
             visitId: recurringVisitId,
-            taskId: postgresEscrow.taskId,
+            taskId: postgresEscrow!.taskId,
             error: err instanceof Error ? err.message : String(err),
           });
         });

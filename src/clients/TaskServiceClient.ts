@@ -21,13 +21,26 @@ export class TaskServiceClient {
     escrowId: string;
     razorpayOrderId: string;
     taskId: string;
-  }): Promise<void> {
+  }): Promise<{ success: boolean; tasks?: any[]; order?: any; error?: string }> {
     try {
-      await axios.post(
+      const response = await axios.post(
         `${this.baseURL()}/api/v1/bookings/internal/payment-captured`,
         params,
         { headers: this.headers(), timeout: 10000 }
       );
+
+      if (response.data?.success) {
+        return {
+          success: true,
+          tasks: response.data?.data?.tasks,
+          order: response.data?.data?.order,
+        };
+      }
+
+      return {
+        success: false,
+        error: response.data?.error || 'Failed to notify task service payment captured',
+      };
     } catch (err) {
       const axiosErr = err as AxiosError;
       logger.warn('[TaskServiceClient] notifyBookingPaymentCaptured failed', {

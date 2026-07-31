@@ -1424,7 +1424,7 @@ export async function updateEscrowOnPaymentCapture(
               const updatedLineItems = oldLineItems.map(
                 (item: unknown, idx: number) => {
                   const rowItem = item as Record<string, unknown>;
-                  const materializedTask = notifyResult.tasks[idx];
+                  const materializedTask = notifyResult.tasks?.[idx];
                   const realTaskId = materializedTask
                     ? String(
                         (materializedTask as any)._id ||

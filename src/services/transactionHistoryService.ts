@@ -1241,6 +1241,7 @@ export async function getUserTransactions(
                 partnerVisibilityHeld: partnerFacing.partnerVisibilityHeld,
                 metadata: enrichRecurringPayoutMetadata(
                   {
+                  bookingMode: (em.bookingMode === 'book_now' ? 'book_now' : undefined) as string | undefined,
                   taskId: escrow.taskId,
                   ...(payoutDisplayTitle
                     ? {

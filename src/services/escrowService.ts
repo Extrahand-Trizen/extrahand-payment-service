@@ -1416,9 +1416,38 @@ export async function updateEscrowOnPaymentCapture(
             ).trim();
 
             if (resolvedTaskId && resolvedTaskId !== originalTaskId) {
+              // Build updated line items: replace placeholder taskIds with real ones
+              const oldMeta = (postgresEscrow.metadata || {}) as Record<string, unknown>;
+              const oldLineItems = Array.isArray(oldMeta.bookNowLineItems)
+                ? [...oldMeta.bookNowLineItems]
+                : [];
+              const updatedLineItems = oldLineItems.map(
+                (item: unknown, idx: number) => {
+                  const rowItem = item as Record<string, unknown>;
+                  const materializedTask = notifyResult.tasks?.[idx];
+                  const realTaskId = materializedTask
+                    ? String(
+                        (materializedTask as any)._id ||
+                          (materializedTask as any).id ||
+                          materializedTask
+                      ).trim()
+                    : null;
+                  if (realTaskId && realTaskId !== originalTaskId) {
+                    return { ...rowItem, taskId: realTaskId };
+                  }
+                  return rowItem;
+                },
+              );
+
               updatedEscrow = await prisma.escrow.update({
                 where: { id: postgresEscrow.id },
-                data: { taskId: resolvedTaskId },
+                data: {
+                  taskId: resolvedTaskId,
+                  metadata: {
+                    ...oldMeta,
+                    bookNowLineItems: updatedLineItems,
+                  } as any,
+                },
               });
 
               if (shouldPersistTransaction) {
@@ -1438,6 +1467,7 @@ export async function updateEscrowOnPaymentCapture(
                 escrowId: updatedEscrow.escrowId,
                 oldTaskId: originalTaskId,
                 taskId: resolvedTaskId,
+                lineItemCount: updatedLineItems.length,
               });
             }
           }
@@ -1619,6 +1649,27 @@ export async function resolveEscrowRecordForTaskId(taskId: string) {
   // Callers sometimes pass bookingOrderId as taskId for Book Now.
   const byOrderId = await findEscrowByBookingOrderId(trimmed);
   if (byOrderId) return byOrderId;
+
+  // Last resort: query MongoDB BookingOrder for the bookingOrderId linked to this taskId,
+  // then look up escrow by that bookingOrderId.
+  try {
+    if (mongoose.connection.readyState === 1) {
+      const bookingOrders = mongoose.connection.collection('bookingorders');
+      const order = await bookingOrders.findOne(
+        { 'pendingLines.taskId': trimmed },
+        { projection: { orderId: 1 } },
+      );
+      if (order?.orderId) {
+        const byMongoBookingOrder = await findEscrowByBookingOrderId(String(order.orderId));
+        if (byMongoBookingOrder) return byMongoBookingOrder;
+      }
+    }
+  } catch (mongoErr) {
+    logger.warn('[resolveEscrowRecordForTaskId] Mongo fallback lookup failed', {
+      taskId: trimmed,
+      error: mongoErr instanceof Error ? mongoErr.message : String(mongoErr),
+    });
+  }
 
   return null;
 }

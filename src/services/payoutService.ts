@@ -28,6 +28,7 @@ import {
   toAdminBankAccount,
 } from './bankAccountSecrets';
 import { resolveEscrowTaskAmountForPayout } from '../utils/escrowFinanceUtils';
+import { resolveEscrowRecordForTaskId } from './escrowService';
 import { enrichRecurringPayoutMetadata } from '../utils/recurringPayoutDisplay';
 import { mapRazorpayPayoutStatusToInternal } from '../utils/payoutStatusMapping';
 import {
@@ -891,6 +892,16 @@ export async function processTaskCompletionPayout(params: {
   requiresBankAccount?: boolean;
   error?: string;
 }> {
+  logger.info('[PAYOUT_DEBUG] processTaskCompletionPayout ENTRY', {
+    taskId: params.taskId,
+    performerUid: params.performerUid,
+    amount: params.amount,
+    taskTitle: params.taskTitle,
+    enqueueOnMissingBank: params.enqueueOnMissingBank,
+    useExtraCoins: params.useExtraCoins,
+    visitId: params.visitId,
+    hasUserId: !!params.userId,
+  });
   try {
     const {
       taskId,
@@ -903,7 +914,18 @@ export async function processTaskCompletionPayout(params: {
       visitId,
     } = params;
 
+    logger.info('[PAYOUT_DEBUG] processTaskCompletionPayout called', {
+      taskId,
+      performerUid,
+      amount,
+      taskTitle,
+      enqueueOnMissingBank,
+      useExtraCoins,
+      visitId,
+    });
+
     if (!isPostgresConnected()) {
+      logger.error('[PAYOUT_DEBUG] FAILED - Postgres not connected');
       return { success: false, error: 'Postgres not connected' };
     }
 
@@ -912,6 +934,10 @@ export async function processTaskCompletionPayout(params: {
       ? `Task completion payout for task ${taskId} visit ${trimmedVisitId}`
       : `Task completion payout for task ${taskId}`;
 
+    logger.info('[PAYOUT_DEBUG] Checking for existing payout', {
+      performerUid,
+      duplicateDescription,
+    });
     const existing = await prisma.payout.findFirst({
       where: {
         performerUid,
@@ -922,6 +948,11 @@ export async function processTaskCompletionPayout(params: {
     });
 
     if (existing) {
+      logger.info('[PAYOUT_DEBUG] Found existing payout, returning it', {
+        payoutId: existing.payoutId,
+        status: existing.status,
+        amount: existing.amount.toString(),
+      });
       if (existing.status === 'completed') {
         const existingMetadata =
           existing.metadata && typeof existing.metadata === 'object' && !Array.isArray(existing.metadata)
@@ -1014,11 +1045,29 @@ export async function processTaskCompletionPayout(params: {
       };
     }
 
+    logger.info('[PAYOUT_DEBUG] No existing payout found, checking bank account', {
+      performerUid,
+    });
     const paymentProfile = await prisma.userPaymentProfile.findUnique({
       where: { userId: performerUid },
     });
 
+    if (!paymentProfile) {
+      logger.warn('[PAYOUT_DEBUG] No payment profile found for performer', { performerUid });
+    } else {
+      logger.info('[PAYOUT_DEBUG] Payment profile found', {
+        performerUid,
+        hasDefaultBankAccount: !!paymentProfile.defaultBankAccountId,
+        defaultBankAccountId: paymentProfile.defaultBankAccountId,
+      });
+    }
+
     if (!paymentProfile?.defaultBankAccountId) {
+      logger.warn('[PAYOUT_DEBUG] FAILED - No default bank account', {
+        performerUid,
+        enqueueOnMissingBank,
+        hasPaymentProfile: !!paymentProfile,
+      });
       if (enqueueOnMissingBank) {
         await enqueuePendingTaskCompletionPayout({ taskId, performerUid, amount, taskTitle });
       }
@@ -1034,6 +1083,10 @@ export async function processTaskCompletionPayout(params: {
     });
 
     if (!selectedBankAccount) {
+      logger.warn('[PAYOUT_DEBUG] FAILED - Bank account not found', {
+        bankAccountId: paymentProfile.defaultBankAccountId,
+        performerUid,
+      });
       if (enqueueOnMissingBank) {
         await enqueuePendingTaskCompletionPayout({ taskId, performerUid, amount, taskTitle });
       }
@@ -1044,8 +1097,24 @@ export async function processTaskCompletionPayout(params: {
       };
     }
 
+    logger.info('[PAYOUT_DEBUG] Bank account found', {
+      bankAccountId: selectedBankAccount.id,
+      last4: selectedBankAccount.accountNumber?.substring?.(-4) || '****',
+      hasVerificationRef: !!selectedBankAccount.verificationRef,
+    });
+
     const { fundAccountId } = parseVerificationRef(selectedBankAccount.verificationRef);
-    if (!fundAccountId && !isPayoutManualOpsMode()) {
+    const isManualOps = isPayoutManualOpsMode();
+    logger.info('[PAYOUT_DEBUG] RazorpayX fund account check', {
+      hasFundAccountId: !!fundAccountId,
+      isManualOps,
+      fundAccountId,
+    });
+    if (!fundAccountId && !isManualOps) {
+      logger.warn('[PAYOUT_DEBUG] FAILED - No fund account and not manual ops mode', {
+        performerUid,
+        bankAccountId: selectedBankAccount.id,
+      });
       if (enqueueOnMissingBank) {
         await enqueuePendingTaskCompletionPayout({ taskId, performerUid, amount, taskTitle });
       }
@@ -1058,6 +1127,12 @@ export async function processTaskCompletionPayout(params: {
 
     // Fetch escrow before fee math so recurring per-visit payouts use visit budget (taskAmount),
     // not Razorpay capture (amountInRupees) which can be lower after coin discounts.
+    // For Book Now / non-visit tasks, use the fallback chain (taskId → bookingOrderId → metadata)
+    // so escrows linked by bookingOrderId are found even when taskId differs.
+    logger.info('[PAYOUT_DEBUG] Fetching escrow for task', {
+      taskId,
+      trimmedVisitId: trimmedVisitId || 'none',
+    });
     let taskEscrow = trimmedVisitId
       ? await prisma.escrow.findFirst({
           where: {
@@ -1069,10 +1144,7 @@ export async function processTaskCompletionPayout(params: {
           },
           orderBy: { createdAt: 'desc' },
         })
-      : await prisma.escrow.findFirst({
-          where: { taskId },
-          orderBy: { createdAt: 'desc' },
-        });
+      : await resolveEscrowRecordForTaskId(taskId);
 
     if (!taskEscrow && trimmedVisitId) {
       taskEscrow = await prisma.escrow.findFirst({
@@ -1088,13 +1160,34 @@ export async function processTaskCompletionPayout(params: {
     }
 
     if (!taskEscrow) {
+      logger.error('[PAYOUT_DEBUG] FAILED - Escrow not found', {
+        taskId,
+        performerUid,
+        trimmedVisitId: trimmedVisitId || 'none',
+      });
       return {
         success: false,
         error: 'Escrow not found for this task. Payout cannot be processed.',
       };
     }
 
+    logger.info('[PAYOUT_DEBUG] Escrow found', {
+      escrowId: taskEscrow.id,
+      escrowStatus: taskEscrow.status,
+      amountInRupees: taskEscrow.amountInRupees?.toString(),
+      performerUid_inEscrow: taskEscrow.performerUid,
+      bookingMode: (taskEscrow.metadata as any)?.bookingMode,
+      bookingOrderId: taskEscrow.bookingOrderId,
+      taskId_inEscrow: taskEscrow.taskId,
+      resolvedBy: trimmedVisitId ? 'direct_taskId_visit' : 'resolveEscrowRecordForTaskId',
+    });
+
     if (String(taskEscrow.status || '').toLowerCase() !== 'held') {
+      logger.error('[PAYOUT_DEBUG] FAILED - Escrow not in held status', {
+        taskId,
+        escrowId: taskEscrow.id,
+        actualStatus: taskEscrow.status,
+      });
       return {
         success: false,
         error: 'Payout cannot be processed for the current escrow state.',
@@ -1315,6 +1408,7 @@ export async function processTaskCompletionPayout(params: {
 
     const metadataPayload = enrichRecurringPayoutMetadata(
       {
+      bookingMode: (escrowMeta.bookingMode === 'book_now' ? 'book_now' : undefined) as string | undefined,
       taskId,
       visitId: trimmedVisitId || undefined,
       taskTitle,

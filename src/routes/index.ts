@@ -14,21 +14,27 @@ import dashboardRoutes from './dashboard';
 import internalRoutes from './internal';
 import { validateEnv } from '../config/env';
 import { isDatabaseConnected, isPostgresConnected } from '../config/database';
+import { pingPostgres } from '../config/prisma';
 
 const router = express.Router();
 const env = validateEnv();
 
-// Health check
-router.get('/health', (req, res) => {
-  res.json({
-    success: true,
+// Health check — live-ping Postgres so ETIMEDOUT / Neon sleep is visible
+router.get('/health', async (req, res) => {
+  const pg = await pingPostgres(5000);
+  const healthy = pg.ok;
+  res.status(healthy ? 200 : 503).json({
+    success: healthy,
     service: 'extrahand-payment-service',
-    status: 'healthy',
+    status: healthy ? 'healthy' : 'degraded',
     timestamp: new Date().toISOString(),
     environment: env.NODE_ENV,
     razorpay: 'configured',
     mongodb: isDatabaseConnected() ? 'connected' : 'disconnected',
-    postgres: isPostgresConnected() ? 'connected' : 'disconnected',
+    postgres: pg.ok ? 'connected' : 'unreachable',
+    postgresPingMs: pg.ms,
+    postgresError: pg.error,
+    postgresBootFlag: isPostgresConnected() ? 'connected' : 'disconnected',
   });
 });
 

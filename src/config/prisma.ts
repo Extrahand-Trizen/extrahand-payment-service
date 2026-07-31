@@ -1,6 +1,6 @@
+import { Pool } from 'pg';
 import { PrismaClient } from '@prisma/client';
 import { PrismaPg } from '@prisma/adapter-pg';
-import { Pool } from 'pg';
 import logger from './logger';
 import { validateEnv } from './env';
 
@@ -21,6 +21,7 @@ function safeDbHost(connectionString: string): string {
 /**
  * Neon + PrismaPg: tune the URI for pooler reliability.
  * - Drop channel_binding=require (breaks / times out through some PgBouncer paths)
+ * - Add pgbouncer=true on *-pooler* hosts (Neon transaction pooler)
  * - Ensure connect_timeout so cold starts don't fail instantly
  */
 function normalizePostgresUri(raw: string): string {
@@ -32,6 +33,10 @@ function normalizePostgresUri(raw: string): string {
     }
     if (!url.searchParams.has('sslmode')) {
       url.searchParams.set('sslmode', 'require');
+    }
+    // Neon transaction pooler hostnames include "-pooler"
+    if (url.hostname.includes('-pooler') && !url.searchParams.has('pgbouncer')) {
+      url.searchParams.set('pgbouncer', 'true');
     }
     return url.toString();
   } catch {
@@ -108,6 +113,32 @@ export async function connectPrisma(): Promise<void> {
   } catch (error: any) {
     logger.error('❌ Failed to connect to Postgres via Prisma:', error.message);
     throw error;
+  }
+}
+
+/**
+ * Live Postgres probe for health checks (does not trust boot-time flag alone).
+ */
+export async function pingPostgres(timeoutMs = 5000): Promise<{
+  ok: boolean;
+  ms: number;
+  error?: string;
+}> {
+  const started = Date.now();
+  try {
+    await Promise.race([
+      prisma.$queryRawUnsafe('SELECT 1'),
+      new Promise((_, reject) => {
+        setTimeout(() => reject(new Error(`postgres ping timeout after ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+    return { ok: true, ms: Date.now() - started };
+  } catch (error: any) {
+    return {
+      ok: false,
+      ms: Date.now() - started,
+      error: error?.message || String(error),
+    };
   }
 }
 

@@ -8,6 +8,7 @@
 import { prisma } from '../config/prisma';
 import logger from '../config/logger';
 import { Prisma } from '@prisma/client';
+import { partnerVisibleNowWhere } from '../utils/bookNowPartnerPayoutVisibility';
 
 const PENDING_STATUSES = new Set(['pending', 'processing']);
 
@@ -217,9 +218,11 @@ export async function applyPayoutStatusToProfile(
  */
 export async function recalculateUserEarningsProfile(userId: string): Promise<void> {
   try {
+    const now = new Date();
+    const visible = partnerVisibleNowWhere(now);
     const [payoutStats, lastPayout, compensationStats, pendingStats] = await Promise.all([
       prisma.payout.aggregate({
-        where: { performerUid: userId, status: 'completed' },
+        where: { performerUid: userId, status: 'completed', AND: [visible] },
         _sum: { netAmount: true },
         _count: { id: true },
         _avg: { netAmount: true },
@@ -227,7 +230,7 @@ export async function recalculateUserEarningsProfile(userId: string): Promise<vo
         _max: { netAmount: true },
       }),
       prisma.payout.findFirst({
-        where: { performerUid: userId, status: 'completed' },
+        where: { performerUid: userId, status: 'completed', AND: [visible] },
         orderBy: { createdAt: 'desc' },
         select: { createdAt: true },
       }),
@@ -245,6 +248,7 @@ export async function recalculateUserEarningsProfile(userId: string): Promise<vo
         where: {
           performerUid: userId,
           status: { in: ['pending', 'processing'] },
+          AND: [visible],
         },
         _sum: { netAmount: true },
         _count: { id: true },
@@ -305,6 +309,8 @@ export async function recalculateUserEarningsProfile(userId: string): Promise<vo
  */
 export async function recalculateUserPaymentProfile(userId: string): Promise<void> {
   try {
+    const now = new Date();
+    const visible = partnerVisibleNowWhere(now);
     const [
       payoutStats,
       lastPayout,
@@ -316,7 +322,7 @@ export async function recalculateUserPaymentProfile(userId: string): Promise<voi
       pendingStats,
     ] = await Promise.all([
       prisma.payout.aggregate({
-        where: { performerUid: userId, status: 'completed' },
+        where: { performerUid: userId, status: 'completed', AND: [visible] },
         _sum: { netAmount: true },
         _count: { id: true },
         _avg: { netAmount: true },
@@ -324,7 +330,7 @@ export async function recalculateUserPaymentProfile(userId: string): Promise<voi
         _max: { netAmount: true },
       }),
       prisma.payout.findFirst({
-        where: { performerUid: userId, status: 'completed' },
+        where: { performerUid: userId, status: 'completed', AND: [visible] },
         orderBy: { createdAt: 'desc' },
         select: { createdAt: true },
       }),
@@ -378,6 +384,7 @@ export async function recalculateUserPaymentProfile(userId: string): Promise<voi
         where: {
           performerUid: userId,
           status: { in: ['pending', 'processing'] },
+          AND: [visible],
         },
         _sum: { netAmount: true },
         _count: { id: true },

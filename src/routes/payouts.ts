@@ -45,6 +45,15 @@ router.get('/escrow/:escrowId', asyncHandler(PayoutController.getPayoutsByEscrow
 router.get('/task/:taskId/bundle', asyncHandler(PayoutController.getTaskPayoutBundle));
 
 /**
+ * POST /api/v1/payouts/task/:taskId/hold-book-now
+ * Hold Book Now payouts when customer raises an issue
+ */
+router.post(
+  '/task/:taskId/hold-book-now',
+  asyncHandler(PayoutController.holdBookNowTaskPayouts),
+);
+
+/**
  * POST /api/v1/payouts/status/batch
  * Batch payout status lookup
  */

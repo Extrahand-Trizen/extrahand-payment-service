@@ -30,6 +30,12 @@ import {
 import { resolveEscrowTaskAmountForPayout } from '../utils/escrowFinanceUtils';
 import { enrichRecurringPayoutMetadata } from '../utils/recurringPayoutDisplay';
 import { mapRazorpayPayoutStatusToInternal } from '../utils/payoutStatusMapping';
+import {
+  applyPartnerVisibilityToPayoutPayload,
+  isBookNowFromMetadata,
+  isPartnerVisibilityHeld,
+  resolvePartnerVisibleAt,
+} from '../utils/bookNowPartnerPayoutVisibility';
 
 /**
  * Generate unique payout ID
@@ -38,12 +44,15 @@ function generatePayoutId(): string {
   return `payout_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
 }
 
-/** Skip RazorpayX API; queue payout for operations portal / manual transfer. */
+/**
+ * Skip RazorpayX API; record payout in DB for ops / manual bank transfer.
+ * Default ON — set PAYOUT_MANUAL_OPS_MODE=false only when live RazorpayX is intentionally enabled.
+ */
 function isPayoutManualOpsMode(): boolean {
   const raw = process.env.PAYOUT_MANUAL_OPS_MODE;
   if (raw === 'false' || raw === '0') return false;
   if (raw === 'true' || raw === '1') return true;
-  return process.env.NODE_ENV === 'production';
+  return true;
 }
 
 function payoutMetadataIndicatesManualOps(metadata: unknown): boolean {
@@ -932,16 +941,76 @@ export async function processTaskCompletionPayout(params: {
         }
       }
 
+      const visibility = applyPartnerVisibilityToPayoutPayload({
+        payoutId: existing.payoutId,
+        amount: existing.amount.toString(),
+        netAmount: existing.netAmount.toString(),
+        status: existing.status,
+        completedAt: existing.completedAt,
+        partnerVisibleAt: existing.partnerVisibleAt,
+        metadata: existing.metadata,
+        manualOps: payoutMetadataIndicatesManualOps(existing.metadata),
+      });
+
       return {
         success: true,
-        payout: {
-          payoutId: existing.payoutId,
-          amount: existing.amount.toString(),
-          netAmount: existing.netAmount.toString(),
-          status: existing.status,
-          completedAt: existing.completedAt,
-          manualOps: payoutMetadataIndicatesManualOps(existing.metadata),
+        payout: visibility,
+      };
+    }
+
+    // Book Now raise-issue: resume held payout with a fresh partnerVisibleAt instead of creating another.
+    const heldPayout = await prisma.payout.findFirst({
+      where: {
+        taskId,
+        performerUid,
+        type: 'task_completion',
+        status: 'held',
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (heldPayout) {
+      const resumeVisibleAt = resolvePartnerVisibleAt({ isBookNow: true });
+      const heldMeta =
+        heldPayout.metadata && typeof heldPayout.metadata === 'object' && !Array.isArray(heldPayout.metadata)
+          ? { ...(heldPayout.metadata as Record<string, unknown>) }
+          : {};
+      const resumeStatus =
+        typeof heldMeta.heldFromStatus === 'string' && heldMeta.heldFromStatus.trim()
+          ? String(heldMeta.heldFromStatus)
+          : 'processing';
+      delete heldMeta.heldReason;
+      delete heldMeta.heldAt;
+      const resumed = await prisma.payout.update({
+        where: { id: heldPayout.id },
+        data: {
+          status: resumeStatus === 'completed' ? 'processing' : resumeStatus,
+          partnerVisibleAt: resumeVisibleAt,
+          errorMessage: null,
+          metadata: {
+            ...heldMeta,
+            bookingMode: 'book_now',
+            resumedFromRaiseIssueAt: new Date().toISOString(),
+            partnerVisibleAt: resumeVisibleAt?.toISOString() ?? null,
+          } as Prisma.InputJsonValue,
         },
+      });
+      logger.info('[payoutService] Resumed Book Now payout after raise-issue re-complete', {
+        taskId,
+        payoutId: resumed.payoutId,
+        partnerVisibleAt: resumeVisibleAt?.toISOString(),
+      });
+      return {
+        success: true,
+        payout: applyPartnerVisibilityToPayoutPayload({
+          payoutId: resumed.payoutId,
+          amount: resumed.amount.toString(),
+          netAmount: resumed.netAmount.toString(),
+          status: resumed.status,
+          completedAt: resumed.completedAt,
+          partnerVisibleAt: resumed.partnerVisibleAt,
+          metadata: resumed.metadata,
+          manualOps: payoutMetadataIndicatesManualOps(resumed.metadata),
+        }),
       };
     }
 
@@ -1067,6 +1136,16 @@ export async function processTaskCompletionPayout(params: {
       !Array.isArray(taskEscrow.metadata)
         ? (taskEscrow.metadata as Record<string, unknown>)
         : {};
+
+    const isBookNowPayout =
+      isBookNowFromMetadata(escrowMeta) ||
+      Boolean(
+        taskEscrow &&
+          (typeof (taskEscrow as { bookingOrderId?: string | null }).bookingOrderId === 'string'
+            ? String((taskEscrow as { bookingOrderId?: string | null }).bookingOrderId).trim()
+            : ''),
+      );
+    const partnerVisibleAt = resolvePartnerVisibleAt({ isBookNow: isBookNowPayout });
 
     const escrowTaskCategory = resolveEscrowCategoryFeeConfigKey({
       taskCategory: taskEscrow?.taskCategory,
@@ -1240,6 +1319,15 @@ export async function processTaskCompletionPayout(params: {
       visitId: trimmedVisitId || undefined,
       taskTitle,
       posterUid: taskEscrow?.posterUid,
+      ...(isBookNowPayout
+        ? {
+            bookingMode: 'book_now',
+            ...(typeof escrowMeta.bookingOrderId === 'string'
+              ? { bookingOrderId: escrowMeta.bookingOrderId }
+              : {}),
+          }
+        : {}),
+      partnerVisibleAt: partnerVisibleAt?.toISOString() ?? null,
       grossAmount: grossAmount.toString(),
       taskAmount: grossAmount.toString(),
       platformFee: platformCommission.toString(),
@@ -1329,6 +1417,7 @@ export async function processTaskCompletionPayout(params: {
             type: 'task_completion',
             description: `${duplicateDescription} (fully adjusted against pending cancellation penalties)`,
             completedAt: new Date(),
+            partnerVisibleAt: partnerVisibleAt ?? undefined,
             metadata: {
               ...metadataPayload,
               penaltiesAppliedAt: new Date().toISOString(),
@@ -1386,6 +1475,7 @@ export async function processTaskCompletionPayout(params: {
             source: 'task_completion',
             type: 'task_completion',
             description: duplicateDescription,
+            partnerVisibleAt: partnerVisibleAt ?? undefined,
             metadata: manualMetadata as Prisma.InputJsonValue,
           },
         });
@@ -1455,6 +1545,7 @@ export async function processTaskCompletionPayout(params: {
               type: 'task_completion',
               description: duplicateDescription,
               completedAt: completedAt || undefined,
+              partnerVisibleAt: partnerVisibleAt ?? undefined,
               errorMessage:
                 status === 'failed' || status === 'reversed'
                   ? payoutResponse.failureReason || 'Payout failed'
@@ -1484,6 +1575,7 @@ export async function processTaskCompletionPayout(params: {
             type: 'task_completion',
             description: duplicateDescription,
             completedAt: completedAt || undefined,
+            partnerVisibleAt: partnerVisibleAt ?? undefined,
             errorMessage:
               status === 'failed' || status === 'reversed'
                 ? payoutResponse.failureReason || 'Payout failed'
@@ -1511,7 +1603,9 @@ export async function processTaskCompletionPayout(params: {
     }
 
     // Notify on create for both auto-completed and manual-ops (processing) so helper apps can refresh.
-    if (status === 'completed' || status === 'processing') {
+    // Book Now: skip immediate "Payout Initiated" — task-service sends a softer completion-window message.
+    const visibilityHeld = isPartnerVisibilityHeld(partnerVisibleAt);
+    if ((status === 'completed' || status === 'processing') && !visibilityHeld) {
       const performerContact = await getProfileContact(performerUid);
       notifyPayoutInitiated({
         performerUid,
@@ -1527,13 +1621,14 @@ export async function processTaskCompletionPayout(params: {
 
     return {
       success: true,
-      payout: {
+      payout: applyPartnerVisibilityToPayoutPayload({
         payoutId,
         taskId,
         taskTitle,
         amount: grossAmount.toString(),
         netAmount: netAmount.toString(),
         status,
+        partnerVisibleAt: partnerVisibleAt ? partnerVisibleAt.toISOString() : null,
         manualOps: recordedManualOps,
         penaltyDeducted: totalPenaltyDeducted.toString(),
         extraCoinsBonus: redeemedRupees.toString(),
@@ -1553,7 +1648,7 @@ export async function processTaskCompletionPayout(params: {
           extraCoinsBonus: redeemedRupees.toString(),
           finalPayout: netAmount.toString(),
         },
-      },
+      }),
     };
   } catch (error: any) {
     logger.error('Error processing task completion payout', error);
@@ -1768,7 +1863,7 @@ export async function getPayoutStatus(payoutId: string): Promise<{
 
     return {
       success: true,
-      payout: {
+      payout: applyPartnerVisibilityToPayoutPayload({
         payoutId: updatedPayout.payoutId,
         amount: updatedPayout.amount.toString(),
         netAmount: updatedPayout.netAmount.toString(),
@@ -1796,8 +1891,10 @@ export async function getPayoutStatus(payoutId: string): Promise<{
         description: updatedPayout.description,
         createdAt: updatedPayout.createdAt,
         completedAt: updatedPayout.completedAt,
+        partnerVisibleAt: updatedPayout.partnerVisibleAt,
         bankTransferStatus,
-      },
+        metadata: updatedPayout.metadata,
+      }),
     };
   } catch (error: any) {
     logger.error('❌ Error getting payout status:', error);
@@ -1837,27 +1934,30 @@ export async function getPayoutsByEscrowId(escrowId: string): Promise<{
 
     return {
       success: true,
-      payouts: payouts.map(payout => ({
-        payoutId: payout.payoutId,
-        amount: payout.amount.toString(),
-        netAmount: payout.netAmount.toString(),
-        fees: {
-          platformCommission: payout.platformCommission.toString(),
-          gstOnCommission: payout.gstOnCommission.toString(),
-          tds: payout.tds?.toString(),
-          total: payout.platformCommission
-            .plus(payout.gstOnCommission)
-            .plus(payout.tds || 0)
-            .toString(),
-        },
-        status: payout.status,
-        type: payout.type,
-        description: payout.description,
-        createdAt: payout.createdAt,
-        completedAt: payout.completedAt,
-        manualOps: payoutMetadataIndicatesManualOps(payout.metadata),
-        metadata: payout.metadata,
-      })),
+      payouts: payouts.map((payout) =>
+        applyPartnerVisibilityToPayoutPayload({
+          payoutId: payout.payoutId,
+          amount: payout.amount.toString(),
+          netAmount: payout.netAmount.toString(),
+          fees: {
+            platformCommission: payout.platformCommission.toString(),
+            gstOnCommission: payout.gstOnCommission.toString(),
+            tds: payout.tds?.toString(),
+            total: payout.platformCommission
+              .plus(payout.gstOnCommission)
+              .plus(payout.tds || 0)
+              .toString(),
+          },
+          status: payout.status,
+          type: payout.type,
+          description: payout.description,
+          createdAt: payout.createdAt,
+          completedAt: payout.completedAt,
+          partnerVisibleAt: payout.partnerVisibleAt,
+          manualOps: payoutMetadataIndicatesManualOps(payout.metadata),
+          metadata: payout.metadata,
+        }),
+      ),
     };
   } catch (error: any) {
     logger.error('❌ Error getting payouts by escrow ID:', error);
@@ -1998,6 +2098,91 @@ export async function listManualOpsPayoutQueue(params?: {
     return {
       success: false,
       error: error.message || 'Failed to list manual ops payout queue',
+    };
+  }
+}
+
+/**
+ * Hold Book Now task-completion payouts when customer raises an issue within the window.
+ * Partner list hides `held` rows until re-complete resumes them with a new partnerVisibleAt.
+ */
+export async function holdBookNowTaskPayouts(params: {
+  taskId: string;
+  reason?: string;
+}): Promise<{ success: boolean; heldCount?: number; error?: string }> {
+  try {
+    if (!isPostgresConnected()) {
+      return { success: false, error: 'Postgres not connected' };
+    }
+
+    const taskId = String(params.taskId || '').trim();
+    if (!taskId) {
+      return { success: false, error: 'taskId is required' };
+    }
+
+    const candidates = await prisma.payout.findMany({
+      where: {
+        taskId,
+        type: 'task_completion',
+        status: { in: ['pending', 'processing', 'completed'] },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    const escrow = await prisma.escrow.findFirst({
+      where: { taskId },
+      orderBy: { createdAt: 'desc' },
+    });
+    const escrowIsBookNow =
+      Boolean(escrow?.bookingOrderId && String(escrow.bookingOrderId).trim()) ||
+      isBookNowFromMetadata(escrow?.metadata);
+
+    const bookNowRows = candidates.filter(
+      (row) => escrowIsBookNow || isBookNowFromMetadata(row.metadata),
+    );
+    if (bookNowRows.length === 0) {
+      return { success: true, heldCount: 0 };
+    }
+
+    const heldAt = new Date().toISOString();
+    let heldCount = 0;
+    for (const row of bookNowRows) {
+      // Do not hold rows already paid out to bank in a terminal completed sense with transfer done —
+      // still hold partner visibility for raise-issue (ops can reverse separately). Prefer hold all open ones.
+      const meta =
+        row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata)
+          ? { ...(row.metadata as Record<string, unknown>) }
+          : {};
+      await prisma.payout.update({
+        where: { id: row.id },
+        data: {
+          status: 'held',
+          errorMessage: params.reason || 'Held — customer raised issue on Book Now completion',
+          metadata: {
+            ...meta,
+            bookingMode: 'book_now',
+            heldReason: 'book_now_raise_issue',
+            heldFromStatus: row.status,
+            heldAt,
+            partnerVisibleAt: null,
+          } as Prisma.InputJsonValue,
+          partnerVisibleAt: null,
+        },
+      });
+      heldCount += 1;
+    }
+
+    logger.info('[payoutService] Held Book Now payouts after raise-issue', {
+      taskId,
+      heldCount,
+    });
+
+    return { success: true, heldCount };
+  } catch (error: any) {
+    logger.error('Error holding Book Now task payouts', error);
+    return {
+      success: false,
+      error: error.message || 'Failed to hold Book Now payouts',
     };
   }
 }

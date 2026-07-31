@@ -67,7 +67,7 @@ const envSchema = z.object({
   /**
    * When true, task-completion payouts are recorded as processing in DB without calling RazorpayX.
    * Operations team completes transfers manually until live payout API is enabled.
-   * Defaults to true in production when unset.
+   * Defaults to true when unset — set false only to enable live RazorpayX.
    */
   PAYOUT_MANUAL_OPS_MODE: z
     .string()
@@ -75,7 +75,33 @@ const envSchema = z.object({
     .transform((v) => {
       if (v === 'false' || v === '0') return false;
       if (v === 'true' || v === '1') return true;
-      return process.env.NODE_ENV === 'production';
+      return true;
+    }),
+
+  /**
+   * Book Now: minutes after payout create before partner sees it in Transactions/Payouts.
+   * Default 60 — aligns with customer raise-issue window. Set 0 for immediate unlock.
+   */
+  BOOK_NOW_PAYOUT_PARTNER_VISIBLE_AFTER_MINUTES: z
+    .string()
+    .optional()
+    .transform((v) => {
+      if (v == null || String(v).trim() === '') return undefined;
+      const n = Number(v);
+      return Number.isFinite(n) && n >= 0 ? n : undefined;
+    }),
+
+  /**
+   * @deprecated Prefer BOOK_NOW_PAYOUT_PARTNER_VISIBLE_AFTER_MINUTES.
+   * Still accepted: converted to minutes (× 60) when MINUTES is unset.
+   */
+  BOOK_NOW_PAYOUT_PARTNER_VISIBLE_AFTER_HOURS: z
+    .string()
+    .optional()
+    .transform((v) => {
+      if (v == null || String(v).trim() === '') return undefined;
+      const n = Number(v);
+      return Number.isFinite(n) && n >= 0 ? n : undefined;
     }),
 });
 

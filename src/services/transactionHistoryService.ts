@@ -8,9 +8,102 @@ import {
   resolveRecurringPayoutDisplay,
 } from '../utils/recurringPayoutDisplay';
 import { isBookNowEscrowRecord } from './escrowService';
+import {
+  applyPartnerVisibilityToPayoutPayload,
+  isBookNowFromMetadata,
+  isPartnerVisibilityHeld,
+} from '../utils/bookNowPartnerPayoutVisibility';
+import { BOOK_NOW_PARTNER_PAYOUT_COPY } from '../constants/bookNowPartnerPayoutCopy';
+
+/** Ensure partner apps can role-filter Book Now rows (bookingMode often only on escrow/payout meta). */
+function bookNowTransactionMetadataExtras(
+  partnerVisibleAt: Date | string | null | undefined,
+  ...sources: Array<Record<string, unknown> | null | undefined>
+): Record<string, unknown> {
+  for (const src of sources) {
+    if (!src || !isBookNowFromMetadata(src)) continue;
+    const extras: Record<string, unknown> = { bookingMode: 'book_now' };
+    if (typeof src.bookingSource === 'string' && src.bookingSource.trim()) {
+      extras.bookingSource = src.bookingSource;
+    }
+    if (typeof src.bookingOrderId === 'string' && src.bookingOrderId.trim()) {
+      extras.bookingOrderId = src.bookingOrderId;
+    }
+    return extras;
+  }
+  if (partnerVisibleAt) {
+    return { bookingMode: 'book_now' };
+  }
+  return {};
+}
 
 const SUCCESSFUL_ESCROW_PAYMENT_STATUSES = new Set(['held', 'released', 'refunded']);
 const SUCCESSFUL_PAYOUT_STATUSES = new Set(['completed', 'released']);
+
+/** Raise-issue / ops hold — not shown on partner Payments until resumed. */
+function isRaiseIssueHeldPayoutStatus(status: string | null | undefined): boolean {
+  return String(status || '').trim().toLowerCase() === 'held';
+}
+
+/**
+ * Map a payout DB row into partner-facing transaction fields (status/description/metadata).
+ * Returns null when the payout should be omitted from partner lists
+ * (raise-issue hold, or Book Now completion window before partnerVisibleAt).
+ */
+function mapPartnerFacingPayoutTransactionFields(payout: {
+  status: string;
+  partnerVisibleAt?: Date | null;
+  metadata?: unknown;
+  description?: string | null;
+}): {
+  status: string;
+  partnerVisibleAt: string | null;
+  partnerVisibilityHeld: boolean;
+  descriptionOverride?: string;
+  metadataExtras: Record<string, unknown>;
+} | null {
+  if (isRaiseIssueHeldPayoutStatus(payout.status)) {
+    return null;
+  }
+
+  // Book Now: hide from Transactions / Payouts / Earnings until partnerVisibleAt.
+  if (isPartnerVisibilityHeld(payout.partnerVisibleAt ?? null)) {
+    return null;
+  }
+
+  const visibility = applyPartnerVisibilityToPayoutPayload({
+    status: payout.status,
+    partnerVisibleAt: payout.partnerVisibleAt ?? null,
+    metadata: payout.metadata,
+  });
+
+  const held = visibility.partnerVisibilityHeld === true;
+  const meta =
+    visibility.metadata && typeof visibility.metadata === 'object' && !Array.isArray(visibility.metadata)
+      ? (visibility.metadata as Record<string, unknown>)
+      : {};
+
+  return {
+    status: String(visibility.status || payout.status),
+    partnerVisibleAt: visibility.partnerVisibleAt,
+    partnerVisibilityHeld: held,
+    descriptionOverride: held
+      ? BOOK_NOW_PARTNER_PAYOUT_COPY.payoutPendingDescription
+      : undefined,
+    metadataExtras: {
+      partnerVisibleAt: visibility.partnerVisibleAt,
+      partnerVisibilityHeld: held,
+      ...(held
+        ? {
+            partnerVisibilityMessage:
+              typeof meta.partnerVisibilityMessage === 'string'
+                ? meta.partnerVisibilityMessage
+                : BOOK_NOW_PARTNER_PAYOUT_COPY.partnerVisibilityMessage,
+          }
+        : {}),
+    },
+  };
+}
 
 export interface Transaction {
   id: string;
@@ -26,6 +119,9 @@ export interface Transaction {
   metadata?: Record<string, any>;
   // User-friendly categorization
   category?: 'earnings' | 'payments'; // earnings = money received, payments = money spent
+  /** Book Now partner delayed visibility (ISO) — null/omitted = immediately visible */
+  partnerVisibleAt?: string | null;
+  partnerVisibilityHeld?: boolean;
 }
 
 type PosterPaymentLineItem = {
@@ -785,53 +881,44 @@ export async function getUserTransactions(
       }
     }
 
-    // Preload standalone payouts (escrowId = null) from PROD DB
-    const standalonePayoutsProd =
+    // Preload performer payouts from PROD DB.
+    // Include escrow-linked rows too: escrow pagination (poster+performer) can drop recent
+    // performer payouts when the user has many poster escrows. Escrow-path rows win on
+    // richer metadata; this list fills gaps + true standalone (escrowId = null) payouts.
+    const performerPayoutWhere: Prisma.PayoutWhereInput = {
+      performerUid: { in: uidList },
+      ...(statusFilter ? { status: statusFilter } : {}),
+      ...(startDate || endDate
+        ? {
+            createdAt: {
+              ...(startDate ? { gte: startDate } : {}),
+              ...(endDate ? { lte: endDate } : {}),
+            },
+          }
+        : {}),
+    };
+    const performerPayoutsProd =
       !typeFilter || typeFilter === 'payout'
         ? await prisma.payout.findMany({
-            where: {
-              performerUid: { in: uidList },
-              escrowId: null,
-              ...(statusFilter ? { status: statusFilter } : {}),
-              ...(startDate || endDate
-                ? {
-                    createdAt: {
-                      ...(startDate ? { gte: startDate } : {}),
-                      ...(endDate ? { lte: endDate } : {}),
-                    },
-                  }
-                : {}),
-            },
+            where: performerPayoutWhere,
             orderBy: { createdAt: 'desc' },
             take: fetchLimit,
           })
         : [];
 
-    // Merge standalone payouts from DEV DB
-    let standalonePayouts = standalonePayoutsProd;
+    // Merge performer payouts from DEV DB
+    let performerPayouts = performerPayoutsProd;
     if (prismaDev && (!typeFilter || typeFilter === 'payout')) {
       try {
-        const standalonePayoutsDev = await prismaDev.payout.findMany({
-          where: {
-            performerUid: { in: uidList },
-            escrowId: null,
-            ...(statusFilter ? { status: statusFilter } : {}),
-            ...(startDate || endDate
-              ? {
-                  createdAt: {
-                    ...(startDate ? { gte: startDate } : {}),
-                    ...(endDate ? { lte: endDate } : {}),
-                  },
-                }
-              : {}),
-          },
+        const performerPayoutsDev = await prismaDev.payout.findMany({
+          where: performerPayoutWhere,
           orderBy: { createdAt: 'desc' },
           take: fetchLimit,
         });
-        if (standalonePayoutsDev.length > 0) {
-          const prodPayoutIds = new Set(standalonePayoutsProd.map((p) => p.payoutId));
-          const devOnlyPayouts = standalonePayoutsDev.filter((p) => !prodPayoutIds.has(p.payoutId));
-          standalonePayouts = [...standalonePayoutsProd, ...devOnlyPayouts].sort(
+        if (performerPayoutsDev.length > 0) {
+          const prodPayoutIds = new Set(performerPayoutsProd.map((p) => p.payoutId));
+          const devOnlyPayouts = performerPayoutsDev.filter((p) => !prodPayoutIds.has(p.payoutId));
+          performerPayouts = [...performerPayoutsProd, ...devOnlyPayouts].sort(
             (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
           );
           logger.info(`[TransactionHistory] Merged ${devOnlyPayouts.length} extra payouts from DEV DB`);
@@ -840,6 +927,9 @@ export async function getUserTransactions(
         logger.warn('[TransactionHistory] DEV DB payout fetch failed (non-fatal):', devErr?.message);
       }
     }
+
+    /** Payout IDs already emitted via escrow include — skip duplicates below. */
+    const emittedPayoutIds = new Set<string>();
 
     // Convert escrows to transactions
     // IMPORTANT: Always add all transactions with their correct category, then filter after
@@ -1108,8 +1198,16 @@ export async function getUserTransactions(
       // Payouts from this escrow (money earned) — only real payout records are shown.
       escrow.payouts.forEach((payout) => {
         if ((!typeFilter || typeFilter === 'payout') && uidList.includes(payout.performerUid)) {
-          // Always add payout transactions when user is the performer (they earned)
-          
+          if (emittedPayoutIds.has(payout.payoutId)) return;
+          const partnerFacing = mapPartnerFacingPayoutTransactionFields({
+            status: payout.status,
+            partnerVisibleAt: (payout as { partnerVisibleAt?: Date | null }).partnerVisibleAt,
+            metadata: (payout as { metadata?: unknown }).metadata,
+            description: payout.description,
+          });
+          if (!partnerFacing) return;
+          emittedPayoutIds.add(payout.payoutId);
+
           // Extract penalty information from payout metadata
           const payoutRawMeta = (payout as { metadata?: unknown }).metadata;
           const payoutMetadata =
@@ -1124,6 +1222,9 @@ export async function getUserTransactions(
           
           const payoutDate = (payout.completedAt ?? payout.createdAt).toISOString();
           const partySnapshotPayout = partySnapshotFromEscrowMeta(em);
+          const baseDescription = payoutDisplayTitle
+            ? formatRecurringPayoutDescription('Money received', payoutDisplayTitle)
+            : `Money received from task ${escrow.taskId}`;
           transactions.push(
             withTransactionTimestamps(
               {
@@ -1131,13 +1232,13 @@ export async function getUserTransactions(
                 transactionId: payout.payoutId,
                 type: 'payout',
                 amount: payout.netAmount.toString(),
-                status: payout.status,
-                description: payoutDisplayTitle
-                  ? formatRecurringPayoutDescription('Money received', payoutDisplayTitle)
-                  : `Money received from task ${escrow.taskId}`,
+                status: partnerFacing.status,
+                description: partnerFacing.descriptionOverride || baseDescription,
                 date: payoutDate,
                 relatedEntityId: payout.escrowId || undefined,
                 category: 'earnings', // Money received
+                partnerVisibleAt: partnerFacing.partnerVisibleAt,
+                partnerVisibilityHeld: partnerFacing.partnerVisibilityHeld,
                 metadata: enrichRecurringPayoutMetadata(
                   {
                   taskId: escrow.taskId,
@@ -1178,6 +1279,12 @@ export async function getUserTransactions(
                   performerUid: escrow.performerUid,
                   role: 'performer',
                   ...partySnapshotPayout,
+                  ...bookNowTransactionMetadataExtras(
+                    (payout as { partnerVisibleAt?: Date | null }).partnerVisibleAt,
+                    payoutMetadata,
+                    em,
+                  ),
+                  ...partnerFacing.metadataExtras,
                 },
                   em,
                   payoutMetadata,
@@ -1337,10 +1444,21 @@ export async function getUserTransactions(
       }
     }
 
-    // Include payouts that are not linked to an escrow (RazorpayX-only flow)
+    // Include performer payouts not already emitted via escrow include
+    // (standalone escrowId=null + escrow-linked missed by escrow pagination).
     if (!typeFilter || typeFilter === 'payout') {
       try {
-        standalonePayouts.forEach((payout) => {
+        performerPayouts.forEach((payout) => {
+          if (emittedPayoutIds.has(payout.payoutId)) return;
+          const partnerFacing = mapPartnerFacingPayoutTransactionFields({
+            status: payout.status,
+            partnerVisibleAt: (payout as { partnerVisibleAt?: Date | null }).partnerVisibleAt,
+            metadata: (payout as { metadata?: unknown }).metadata,
+            description: payout.description,
+          });
+          if (!partnerFacing) return;
+          emittedPayoutIds.add(payout.payoutId);
+
           const payoutStandaloneMeta = (payout as { metadata?: unknown }).metadata;
           const pm =
             payoutStandaloneMeta &&
@@ -1382,26 +1500,34 @@ export async function getUserTransactions(
                 netAmount: payout.netAmount.toString(),
               },
               ...pm,
+              ...bookNowTransactionMetadataExtras(
+                (payout as { partnerVisibleAt?: Date | null }).partnerVisibleAt,
+                pm,
+              ),
+              ...partnerFacing.metadataExtras,
             },
             pm,
           );
+          const baseDescription = payoutDisplayTitle
+            ? formatRecurringPayoutDescription('Money received', payoutDisplayTitle)
+            : payout.description || 'Task payout credited';
           transactions.push({
             id: payout.id,
             transactionId: payout.payoutId,
             type: 'payout',
             amount: payout.netAmount.toString(),
-            status: payout.status,
-            description: payoutDisplayTitle
-              ? formatRecurringPayoutDescription('Money received', payoutDisplayTitle)
-              : payout.description || 'Task payout credited',
+            status: partnerFacing.status,
+            description: partnerFacing.descriptionOverride || baseDescription,
             date: payout.createdAt.toISOString(),
             relatedEntityId: payout.payoutId,
             category: 'earnings',
+            partnerVisibleAt: partnerFacing.partnerVisibleAt,
+            partnerVisibilityHeld: partnerFacing.partnerVisibilityHeld,
             metadata: payoutMetadata,
           });
         });
       } catch (payoutErr: any) {
-        logger.warn('[TransactionHistory] Skipping standalone payout rows', {
+        logger.warn('[TransactionHistory] Skipping performer payout gap-fill rows', {
           message: payoutErr?.message,
         });
       }
@@ -1505,6 +1631,11 @@ export async function getTransactionSummary(
     const payoutWhere: Prisma.PayoutWhereInput = {
       performerUid: { in: uidList },
       status: { in: Array.from(SUCCESSFUL_PAYOUT_STATUSES) },
+      AND: [
+        {
+          OR: [{ partnerVisibleAt: null }, { partnerVisibleAt: { lte: new Date() } }],
+        },
+      ],
       ...(startDate || endDate
         ? {
             createdAt: {

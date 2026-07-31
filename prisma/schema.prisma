@@ -189,6 +189,11 @@ model Payout {
   createdAt          DateTime  @default(now())
   updatedAt          DateTime  @updatedAt
   completedAt        DateTime?
+  /**
+   * Book Now only: when the partner may see this payout in Transactions/Payouts.
+   * null = immediately visible (marketplace / legacy).
+   */
+  partnerVisibleAt   DateTime?
 
   // Relations
   escrow Escrow? @relation(fields: [escrowId], references: [id], onDelete: SetNull)
@@ -201,6 +206,7 @@ model Payout {
   @@index([performerUid, createdAt(sort: Desc)])
   @@index([performerUid, status, createdAt(sort: Desc)])
   @@index([performerUid, type, status])
+  @@index([performerUid, partnerVisibleAt])
   @@index([escrowId, createdAt(sort: Desc)])
   @@index([status])
   @@index([createdAt])

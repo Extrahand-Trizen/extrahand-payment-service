@@ -40,6 +40,8 @@ export const createOrder = async (amount: number, currency: string = 'INR', meta
         attempts: 0,
         created_at: Math.floor(Date.now() / 1000),
         reviewBypass: true,
+        // Publishable key for the account that "owns" this order (checkout must match).
+        keyId: RAZORPAY_CONFIG.keyId,
       };
       return { success: true, order };
     }
@@ -53,7 +55,12 @@ export const createOrder = async (amount: number, currency: string = 'INR', meta
 
     const order = await razorpay.orders.create(options);
     logger.info('Order created successfully', { orderId: order.id, amount });
-    return { success: true, order };
+    return {
+      success: true,
+      // Attach publishable key from the same process that created the order so the
+      // client never opens checkout with a key from a different payment instance.
+      order: { ...order, keyId: RAZORPAY_CONFIG.keyId },
+    };
   } catch (error: any) {
     logger.error('Error creating order:', error);
     return { success: false, error: error.message };

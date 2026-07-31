@@ -5,6 +5,7 @@ import {
   getPayoutsByEscrowId,
   processTaskCompletionPayout,
   listManualOpsPayoutQueue,
+  holdBookNowTaskPayouts as holdBookNowTaskPayoutsService,
 } from '../services/payoutService';
 import {
   getTaskPayoutBundle,
@@ -192,6 +193,32 @@ export class PayoutController {
       success: true,
       payouts: result.payouts ?? [],
       total: result.total ?? 0,
+    });
+  }
+
+  /**
+   * POST /api/v1/payouts/task/:taskId/hold-book-now
+   * Hold Book Now payouts when customer raises an issue (task-service).
+   */
+  static async holdBookNowTaskPayouts(req: Request, res: Response): Promise<void> {
+    const { taskId } = req.params;
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason : undefined;
+
+    if (!taskId?.trim()) {
+      throw new BadRequestError('taskId is required');
+    }
+
+    const result = await holdBookNowTaskPayoutsService({
+      taskId: taskId.trim(),
+      reason,
+    });
+    if (!result.success) {
+      throw new BadRequestError(result.error || 'Failed to hold Book Now payouts');
+    }
+
+    res.json({
+      success: true,
+      heldCount: result.heldCount ?? 0,
     });
   }
 

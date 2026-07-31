@@ -6,6 +6,7 @@ import {
   recalculateUserPaymentProfile,
   isProfileStale,
 } from './userPaymentProfileService';
+import { partnerVisibleNowWhere } from '../utils/bookNowPartnerPayoutVisibility';
 
 const EARNINGS_LABELS = {
   fromPayouts: 'From Completed Tasks',
@@ -73,10 +74,12 @@ function scheduleEarningsRecalc(userId: string, reason: string): void {
 async function livePendingAggregate(
   uidList: string[],
 ): Promise<{ pendingPayouts: Prisma.Decimal; pendingPayoutCount: number }> {
+  const now = new Date();
   const pendingAgg = await prisma.payout.aggregate({
     where: {
       performerUid: { in: uidList },
       status: { in: ['pending', 'processing'] },
+      AND: [partnerVisibleNowWhere(now)],
     },
     _sum: { netAmount: true },
     _count: { _all: true },
@@ -88,9 +91,15 @@ async function livePendingAggregate(
 }
 
 async function liveAggregateFallback(uidList: string[]): Promise<EarningsPayload> {
+  const now = new Date();
+  const visible = partnerVisibleNowWhere(now);
   const [payoutsAgg, compensationsAgg, pendingAgg] = await Promise.all([
     prisma.payout.aggregate({
-      where: { performerUid: { in: uidList }, status: 'completed' },
+      where: {
+        performerUid: { in: uidList },
+        status: 'completed',
+        AND: [visible],
+      },
       _sum: { netAmount: true },
       _count: { _all: true },
     }),

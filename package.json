@@ -25,7 +25,7 @@
     "sync:category-fees-dev-to-prod": "ts-node --require dotenv/config scripts/sync-category-fees-dev-to-prod.ts"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20.19.0"
   },
   "dependencies": {
     "@prisma/adapter-pg": "7.8.0",

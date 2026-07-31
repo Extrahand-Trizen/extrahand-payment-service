@@ -1,5 +1,5 @@
 # Multi-stage Dockerfile for extrahand-payment-service
-# Prisma 7.x requires Node 20.19+, 22.12+, or 24+
+# Prisma 7.x + Node engines require Node 20.19+, 22.12+, or 24+
 # Stage 1: Dependencies
 FROM node:20-alpine AS dependencies
 
@@ -7,8 +7,9 @@ RUN apk add --no-cache openssl
 
 WORKDIR /app
 
+# Require lockfile — fail the build if package-lock.json is missing/out of sync.
 COPY package.json package-lock.json ./
-RUN npm ci
+RUN npm ci --no-audit --no-fund
 
 # Stage 2: Build
 FROM node:20-alpine AS build
@@ -36,7 +37,7 @@ ENV NODE_ENV=production
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev && npm cache clean --force
+RUN npm ci --omit=dev --no-audit --no-fund && npm cache clean --force
 
 COPY prisma ./prisma
 # Generated client lands in @prisma/client (and .prisma) — copy both from build.

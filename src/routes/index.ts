@@ -34,6 +34,7 @@ router.get('/health', async (req, res) => {
     postgres: pg.ok ? 'connected' : 'unreachable',
     postgresPingMs: pg.ms,
     postgresError: pg.error,
+    postgresErrorCode: pg.code,
     postgresBootFlag: isPostgresConnected() ? 'connected' : 'disconnected',
   });
 });

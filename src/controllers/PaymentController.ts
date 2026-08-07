@@ -246,6 +246,8 @@ export class PaymentController {
       taskTitle,
       catalogId,
       partnerReachedLocation,
+      settlement,
+      precomputedSettlement,
     } = req.body;
 
     logger.info('[PaymentController.cancelPayment] Request received', {
@@ -259,6 +261,7 @@ export class PaymentController {
       feeBaseAmount,
       hasReason: Boolean(reason),
       userId,
+      hasSettlement: Boolean(settlement || precomputedSettlement),
     });
 
     const taskStart = taskStartDate ? new Date(taskStartDate) : undefined;
@@ -267,60 +270,68 @@ export class PaymentController {
       feeBaseAmount != null && feeBaseAmount !== '' ? Number(feeBaseAmount) : NaN;
     const feeBaseToPass = Number.isFinite(feeBaseParsed) ? feeBaseParsed : undefined;
 
+    const rawSettlement = settlement || precomputedSettlement;
+    let settlementToPass:
+      | {
+          refundAmountPaise: number;
+          workerCompensationPaise: number;
+          platformRetainedAmountPaise: number;
+        }
+      | undefined;
+    if (rawSettlement && typeof rawSettlement === 'object') {
+      const refundAmountPaise = Math.trunc(Number(rawSettlement.refundAmountPaise));
+      const workerCompensationPaise = Math.trunc(Number(rawSettlement.workerCompensationPaise));
+      const platformRetainedAmountPaise = Math.trunc(
+        Number(rawSettlement.platformRetainedAmountPaise),
+      );
+      if (
+        Number.isFinite(refundAmountPaise) &&
+        Number.isFinite(workerCompensationPaise) &&
+        Number.isFinite(platformRetainedAmountPaise)
+      ) {
+        settlementToPass = {
+          refundAmountPaise: Math.max(0, refundAmountPaise),
+          workerCompensationPaise: Math.max(0, workerCompensationPaise),
+          platformRetainedAmountPaise: Math.max(0, platformRetainedAmountPaise),
+        };
+      }
+    }
+
+    const common = {
+      reason,
+      userId,
+      cancelledBy,
+      taskStartDate: taskStart,
+      assignedAt: assignedAtDate,
+      feeBaseAmount: feeBaseToPass,
+      taskTitle: typeof taskTitle === 'string' ? taskTitle : undefined,
+      catalogId: typeof catalogId === 'string' ? catalogId : undefined,
+      partnerReachedLocation: Boolean(partnerReachedLocation),
+      precomputedSettlement: settlementToPass,
+    };
+
     let result;
 
     if (razorpayOrderId) {
       result = await cancelPaymentOrder({
         razorpayOrderId,
-        reason,
-        userId,
-        cancelledBy,
-        taskStartDate: taskStart,
-        assignedAt: assignedAtDate,
-        feeBaseAmount: feeBaseToPass,
-        taskTitle: typeof taskTitle === 'string' ? taskTitle : undefined,
-        catalogId: typeof catalogId === 'string' ? catalogId : undefined,
-        partnerReachedLocation: Boolean(partnerReachedLocation),
+        ...common,
       });
     } else if (bookingOrderId) {
       // Book Now: escrow.taskId is often `booknow-pending-{orderId}`; prefer booking order.
       result = await cancelEscrowByBookingOrderId({
         bookingOrderId: String(bookingOrderId),
-        reason,
-        userId,
-        cancelledBy,
-        taskStartDate: taskStart,
-        assignedAt: assignedAtDate,
-        feeBaseAmount: feeBaseToPass,
-        taskTitle: typeof taskTitle === 'string' ? taskTitle : undefined,
-        catalogId: typeof catalogId === 'string' ? catalogId : undefined,
-        partnerReachedLocation: Boolean(partnerReachedLocation),
+        ...common,
       });
     } else if (escrowId) {
       result = await cancelEscrow({
         escrowId,
-        reason,
-        userId,
-        cancelledBy,
-        taskStartDate: taskStart,
-        assignedAt: assignedAtDate,
-        feeBaseAmount: feeBaseToPass,
-        taskTitle: typeof taskTitle === 'string' ? taskTitle : undefined,
-        catalogId: typeof catalogId === 'string' ? catalogId : undefined,
-        partnerReachedLocation: Boolean(partnerReachedLocation),
+        ...common,
       });
     } else if (taskId) {
       result = await cancelEscrowByTaskId({
         taskId,
-        reason,
-        userId,
-        cancelledBy,
-        taskStartDate: taskStart,
-        assignedAt: assignedAtDate,
-        feeBaseAmount: feeBaseToPass,
-        taskTitle: typeof taskTitle === 'string' ? taskTitle : undefined,
-        catalogId: typeof catalogId === 'string' ? catalogId : undefined,
-        partnerReachedLocation: Boolean(partnerReachedLocation),
+        ...common,
       });
     } else {
       throw new BadRequestError(

@@ -13,6 +13,7 @@ import { prisma } from '../config/prisma';
 import { Prisma } from '@prisma/client';
 import { sanitizeRazorpayData } from '../utils/paymentSanitizer';
 import { processRefund } from './refundService';
+import type { CancellationSettlementPaise } from './refundService';
 import { createPerformerCancellationPenalty } from './performerPenaltyService';
 
 /**
@@ -35,6 +36,8 @@ export async function cancelPayment(params: {
   taskTitle?: string;
   catalogId?: string | null;
   partnerReachedLocation?: boolean;
+  /** Hourly Helper: execute settlement from task-service (no fee recalculation). */
+  precomputedSettlement?: CancellationSettlementPaise;
 }): Promise<{ success: boolean; cancelled?: boolean; refundRequired?: boolean; refund?: any; error?: string }> {
   try {
     const {
@@ -48,6 +51,7 @@ export async function cancelPayment(params: {
       taskTitle,
       catalogId,
       partnerReachedLocation,
+      precomputedSettlement,
     } = params;
     const cancelledAtTs = new Date();
 
@@ -118,6 +122,7 @@ export async function cancelPayment(params: {
           feeBaseAmount,
           catalogId,
           partnerReachedLocation,
+          precomputedSettlement,
         });
 
         if (refundResult.success) {
@@ -125,7 +130,8 @@ export async function cancelPayment(params: {
             razorpayOrderId,
             refundId: refundResult.refund?.refundId,
           });
-          if (refundCancelledBy === 'performer') {
+          // Hourly settlement already includes worker compensation — do not add marketplace performer penalty.
+          if (refundCancelledBy === 'performer' && !precomputedSettlement) {
             const latest = await prisma.escrow.findUnique({ where: { id: postgresEscrow.id } });
             if (latest?.status === 'refunded') {
               const feeBase =
@@ -347,6 +353,7 @@ export async function cancelEscrow(params: {
   taskTitle?: string;
   catalogId?: string | null;
   partnerReachedLocation?: boolean;
+  precomputedSettlement?: CancellationSettlementPaise;
 }): Promise<{ success: boolean; cancelled?: boolean; refundRequired?: boolean; error?: string }> {
   try {
     const {
@@ -360,6 +367,7 @@ export async function cancelEscrow(params: {
       taskTitle,
       catalogId,
       partnerReachedLocation,
+      precomputedSettlement,
     } = params;
 
     // Get escrow from Postgres
@@ -387,6 +395,7 @@ export async function cancelEscrow(params: {
       taskTitle,
       catalogId,
       partnerReachedLocation,
+      precomputedSettlement,
     });
   } catch (error: any) {
     logger.error('❌ Error cancelling escrow:', error);
@@ -408,6 +417,7 @@ export async function cancelEscrowByBookingOrderId(params: {
   taskTitle?: string;
   catalogId?: string | null;
   partnerReachedLocation?: boolean;
+  precomputedSettlement?: CancellationSettlementPaise;
 }): Promise<{ success: boolean; cancelled?: boolean; refundRequired?: boolean; refund?: any; error?: string }> {
   try {
     const {
@@ -421,6 +431,7 @@ export async function cancelEscrowByBookingOrderId(params: {
       taskTitle,
       catalogId,
       partnerReachedLocation,
+      precomputedSettlement,
     } = params;
 
     if (!isPostgresConnected()) {
@@ -444,6 +455,7 @@ export async function cancelEscrowByBookingOrderId(params: {
       taskTitle,
       catalogId,
       partnerReachedLocation,
+      precomputedSettlement,
     });
   } catch (error: any) {
     logger.error('❌ Error cancelling escrow by booking order ID:', error);
@@ -469,6 +481,7 @@ export async function cancelEscrowByTaskId(params: {
   taskTitle?: string;
   catalogId?: string | null;
   partnerReachedLocation?: boolean;
+  precomputedSettlement?: CancellationSettlementPaise;
 }): Promise<{ success: boolean; cancelled?: boolean; refundRequired?: boolean; refund?: any; error?: string }> {
   try {
     const {
@@ -482,6 +495,7 @@ export async function cancelEscrowByTaskId(params: {
       taskTitle,
       catalogId,
       partnerReachedLocation,
+      precomputedSettlement,
     } = params;
 
     if (!isPostgresConnected()) {
@@ -506,6 +520,7 @@ export async function cancelEscrowByTaskId(params: {
       taskTitle,
       catalogId,
       partnerReachedLocation,
+      precomputedSettlement,
     });
   } catch (error: any) {
     logger.error('❌ Error cancelling escrow by task ID:', error);

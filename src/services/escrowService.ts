@@ -454,6 +454,23 @@ export async function createEscrow(params: {
           new Prisma.Decimal('0.00')
         );
       }
+
+      // Safety: reserved coupon must reduce the Razorpay charge. If GST-key matching
+      // failed to apply the discount, fall back to a plain subtraction.
+      const originalAmount = new Prisma.Decimal(amount.toFixed(2));
+      if (couponDiscountRupees.gt(0) && amountAfterCoupon.gte(originalAmount)) {
+        logger.warn('[escrowService] coupon did not reduce payable; applying fallback', {
+          taskId,
+          couponCode: couponCodeApplied,
+          couponDiscountRupees: couponDiscountRupees.toString(),
+          originalAmount: originalAmount.toString(),
+          eligibleServiceIds,
+        });
+        amountAfterCoupon = Prisma.Decimal.max(
+          originalAmount.sub(couponDiscountRupees).toDecimalPlaces(2),
+          new Prisma.Decimal('0.00')
+        );
+      }
     }
 
     const coinCaps = await CoinUsageConfigProvider.getCapPercents();

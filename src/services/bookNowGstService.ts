@@ -256,18 +256,27 @@ export function recalculateBookNowTotalsAfterCouponDiscount(params: {
   );
   const hasEligibleFilter = eligibleSet.size > 0;
 
-  const weights: { key: string; weight: number; gstPercentage: number }[] = [];
-  for (const cat of categoriesInput) {
-    const key = String(cat.categoryKey || '').trim().toLowerCase();
-    if (!key) continue;
-    const eligible = !hasEligibleFilter || eligibleSet.has(key);
-    if (eligible && cat.subtotal > 0) {
+  const collectWeights = (requireEligibleMatch: boolean) => {
+    const weights: { key: string; weight: number; gstPercentage: number }[] = [];
+    for (const cat of categoriesInput) {
+      const key = String(cat.categoryKey || '').trim().toLowerCase();
+      if (!key || !(cat.subtotal > 0)) continue;
+      const eligible = !requireEligibleMatch || !hasEligibleFilter || eligibleSet.has(key);
+      if (!eligible) continue;
       weights.push({
         key: cat.categoryKey,
         weight: cat.subtotal,
         gstPercentage: cat.gstPercentage,
       });
     }
+    return weights;
+  };
+
+  // If eligible IDs don't match category keys (slug vs catalog drift), fall back to all
+  // categories so the coupon still reduces the Razorpay payable amount.
+  let weights = collectWeights(true);
+  if (weights.length === 0 && discount > 0) {
+    weights = collectWeights(false);
   }
 
   const discountByCategory = new Map<string, number>();

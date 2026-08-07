@@ -55,11 +55,15 @@ export const createOrder = async (amount: number, currency: string = 'INR', meta
 
     const order = await razorpay.orders.create(options);
     logger.info('Order created successfully', { orderId: order.id, amount });
+    // Plain JSON + keyId: Razorpay SDK objects can lose custom fields across axios hops
+    // (task-service Book Now path). Checkout must use this same publishable key.
+    const plainOrder =
+      order && typeof order === 'object'
+        ? (JSON.parse(JSON.stringify(order)) as Record<string, unknown>)
+        : {};
     return {
       success: true,
-      // Attach publishable key from the same process that created the order so the
-      // client never opens checkout with a key from a different payment instance.
-      order: { ...order, keyId: RAZORPAY_CONFIG.keyId },
+      order: { ...plainOrder, keyId: RAZORPAY_CONFIG.keyId },
     };
   } catch (error: any) {
     logger.error('Error creating order:', error);
@@ -167,7 +171,14 @@ export const getOrderDetails = async (orderId: string) => {
     }
 
     const order = await razorpay.orders.fetch(orderId);
-    return { success: true, order };
+    const plainOrder =
+      order && typeof order === 'object'
+        ? (JSON.parse(JSON.stringify(order)) as Record<string, unknown>)
+        : {};
+    return {
+      success: true,
+      order: { ...plainOrder, keyId: RAZORPAY_CONFIG.keyId },
+    };
   } catch (error: any) {
     logger.error('Error fetching order:', error);
     

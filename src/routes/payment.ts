@@ -33,6 +33,13 @@ router.post(
   asyncHandler(PaymentController.cancelBookNowLineItem),
 );
 
+// POST /api/v1/payment/book-now/partner-penalty
+// Penalty-only for a partner-cancelled Book Now task (no customer refund).
+router.post(
+  '/book-now/partner-penalty',
+  asyncHandler(PaymentController.createPerformerPenalty),
+);
+
 // POST /api/v1/payment/coupons/validate — proxies to coupon-service
 router.post('/coupons/validate', asyncHandler(validateCoupon));
 router.post('/coupons/eligible', asyncHandler(listEligibleCoupons));

@@ -19,6 +19,7 @@ import { prisma } from '../config/prisma';
 import { RAZORPAY_CONFIG } from '../config/razorpay';
 import { isReviewBypassOrderId } from '../utils/reviewBypass';
 import { processBookNowLineItemRefund } from '../services/refundService';
+import { createPerformerCancellationPenalty } from '../services/performerPenaltyService';
 
 export class PaymentController {
   /**
@@ -413,6 +414,52 @@ export class PaymentController {
     }
 
     res.json({ success: true, refund: result.refund });
+  }
+
+  /**
+   * POST /api/v1/payment/book-now/partner-penalty
+   * Penalty-only for a partner-cancelled Book Now task. Applies the performer
+   * cancellation policy (platform fee + GST more than 24h out, 10% within 24h)
+   * and deducts from the partner's future payout — no customer refund.
+   */
+  static async createPerformerPenalty(req: Request, res: Response): Promise<void> {
+    const {
+      performerUid,
+      taskId,
+      taskStartDate,
+      feeBaseAmount,
+      reason,
+      taskTitle,
+      escrowId,
+    } = req.body;
+
+    if (!performerUid || !taskId || !taskStartDate || feeBaseAmount == null) {
+      throw new BadRequestError(
+        'performerUid, taskId, taskStartDate, and feeBaseAmount are required',
+      );
+    }
+
+    const feeBase = Number(feeBaseAmount);
+    if (!Number.isFinite(feeBase) || feeBase < 0) {
+      throw new BadRequestError('feeBaseAmount must be a non-negative number');
+    }
+
+    const result = await createPerformerCancellationPenalty({
+      performerUid: String(performerUid),
+      taskId: String(taskId),
+      escrowId: escrowId ? String(escrowId) : null,
+      taskStartDate: new Date(taskStartDate),
+      cancelledAt: new Date(),
+      feeBaseAmount: feeBase,
+      reason: typeof reason === 'string' ? reason : undefined,
+      taskTitle: typeof taskTitle === 'string' ? taskTitle : undefined,
+    });
+
+    if (!result.success) {
+      throw new BadRequestError(result.error || 'Failed to create performer penalty');
+    }
+
+    res.json({ success: true, skipped: Boolean(result.skipped), penalty: result.penalty });
   }
 
   /**

@@ -66,7 +66,7 @@ export class PaymentController {
         await prisma.paymentOrderIdempotency.create({
           data: {
             idempotencyKey,
-            razorpayOrderId: result.order.id,
+            razorpayOrderId: result.order.id ,
             orderPayload: result.order as any,
           },
         });

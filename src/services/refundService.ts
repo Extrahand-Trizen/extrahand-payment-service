@@ -66,6 +66,8 @@ export async function processRefund(params: {
   /** Book Now catalog id (e.g. ac-services) — enables flat cancellation fees */
   catalogId?: string | null;
   partnerReachedLocation?: boolean;
+  /** false => full refund of capturable amount (no Book Now flat fee). */
+  partnerAssigned?: boolean;
   /**
    * Hourly Helper: settlement from task-service evaluator.
    * When set, skips all fee policy calculation.
@@ -90,6 +92,7 @@ export async function processRefund(params: {
       feeBaseAmount,
       catalogId,
       partnerReachedLocation,
+      partnerAssigned,
       precomputedSettlement,
     } = params;
 
@@ -252,12 +255,25 @@ export async function processRefund(params: {
           postgresEscrow.taskId,
           catalogId,
         );
+        // Explicit flag from task-service wins; else escrow performerUid is source of truth.
+        const escrowPerformer = String(postgresEscrow.performerUid || '').trim();
+        const inferredAssigned =
+          escrowPerformer.length > 0 && escrowPerformer !== 'pending_assignment';
+        const effectivePartnerAssigned =
+          partnerAssigned !== undefined ? partnerAssigned : inferredAssigned;
+        logger.info('Book Now cancellation assignment gate', {
+          razorpayOrderId,
+          partnerAssigned: effectivePartnerAssigned,
+          source:
+            partnerAssigned !== undefined ? 'request' : 'escrow_performerUid',
+        });
         const bookNowFee = await calculateBookNowCancellationFee({
           catalogId: resolvedCatalogId,
           amount: refundableCapturedRupees,
           taskStartDate,
           cancelledAt,
           partnerReachedLocation,
+          partnerAssigned: effectivePartnerAssigned,
         });
         cancellationFeeResult = bookNowFee;
       } else {
@@ -861,6 +877,7 @@ export async function processBookNowLineItemRefund(params: {
   isLastActiveItem: boolean;
   catalogId?: string | null;
   partnerReachedLocation?: boolean;
+  partnerAssigned?: boolean;
 }): Promise<{ success: boolean; refund?: any; error?: string }> {
   const {
     bookingOrderId,
@@ -874,6 +891,7 @@ export async function processBookNowLineItemRefund(params: {
     isLastActiveItem,
     catalogId,
     partnerReachedLocation,
+    partnerAssigned,
   } = params;
 
   try {
@@ -932,12 +950,24 @@ export async function processBookNowLineItemRefund(params: {
     });
 
     const resolvedCatalogId = resolveBookNowCatalogId(meta, taskId, catalogId);
+    const escrowPerformer = String(postgresEscrow.performerUid || '').trim();
+    const inferredAssigned =
+      escrowPerformer.length > 0 && escrowPerformer !== 'pending_assignment';
+    const effectivePartnerAssigned =
+      partnerAssigned !== undefined ? partnerAssigned : inferredAssigned;
+    logger.info('Book Now line cancellation assignment gate', {
+      bookingOrderId,
+      taskId,
+      partnerAssigned: effectivePartnerAssigned,
+      source: partnerAssigned !== undefined ? 'request' : 'escrow_performerUid',
+    });
     const feeResult = await calculateBookNowCancellationFee({
       catalogId: resolvedCatalogId,
       amount: feeBaseRupees,
       taskStartDate,
       cancelledAt,
       partnerReachedLocation,
+      partnerAssigned: effectivePartnerAssigned,
     });
 
     let refundPaise = Math.round(parseFloat(feeResult.refundAmount.toString()) * 100);

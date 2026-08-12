@@ -36,6 +36,8 @@ export async function cancelPayment(params: {
   taskTitle?: string;
   catalogId?: string | null;
   partnerReachedLocation?: boolean;
+  /** Book Now / Hourly: false => full refund (no cancellation fee). */
+  partnerAssigned?: boolean;
   /** Hourly Helper: execute settlement from task-service (no fee recalculation). */
   precomputedSettlement?: CancellationSettlementPaise;
 }): Promise<{ success: boolean; cancelled?: boolean; refundRequired?: boolean; refund?: any; error?: string }> {
@@ -51,6 +53,7 @@ export async function cancelPayment(params: {
       taskTitle,
       catalogId,
       partnerReachedLocation,
+      partnerAssigned,
       precomputedSettlement,
     } = params;
     const cancelledAtTs = new Date();
@@ -122,6 +125,7 @@ export async function cancelPayment(params: {
           feeBaseAmount,
           catalogId,
           partnerReachedLocation,
+          partnerAssigned,
           precomputedSettlement,
         });
 
@@ -353,6 +357,7 @@ export async function cancelEscrow(params: {
   taskTitle?: string;
   catalogId?: string | null;
   partnerReachedLocation?: boolean;
+  partnerAssigned?: boolean;
   precomputedSettlement?: CancellationSettlementPaise;
 }): Promise<{ success: boolean; cancelled?: boolean; refundRequired?: boolean; error?: string }> {
   try {
@@ -367,6 +372,7 @@ export async function cancelEscrow(params: {
       taskTitle,
       catalogId,
       partnerReachedLocation,
+      partnerAssigned,
       precomputedSettlement,
     } = params;
 
@@ -395,6 +401,7 @@ export async function cancelEscrow(params: {
       taskTitle,
       catalogId,
       partnerReachedLocation,
+      partnerAssigned,
       precomputedSettlement,
     });
   } catch (error: any) {
@@ -417,6 +424,7 @@ export async function cancelEscrowByBookingOrderId(params: {
   taskTitle?: string;
   catalogId?: string | null;
   partnerReachedLocation?: boolean;
+  partnerAssigned?: boolean;
   precomputedSettlement?: CancellationSettlementPaise;
 }): Promise<{ success: boolean; cancelled?: boolean; refundRequired?: boolean; refund?: any; error?: string }> {
   try {
@@ -431,6 +439,7 @@ export async function cancelEscrowByBookingOrderId(params: {
       taskTitle,
       catalogId,
       partnerReachedLocation,
+      partnerAssigned,
       precomputedSettlement,
     } = params;
 
@@ -455,6 +464,7 @@ export async function cancelEscrowByBookingOrderId(params: {
       taskTitle,
       catalogId,
       partnerReachedLocation,
+      partnerAssigned,
       precomputedSettlement,
     });
   } catch (error: any) {
@@ -481,6 +491,7 @@ export async function cancelEscrowByTaskId(params: {
   taskTitle?: string;
   catalogId?: string | null;
   partnerReachedLocation?: boolean;
+  partnerAssigned?: boolean;
   precomputedSettlement?: CancellationSettlementPaise;
 }): Promise<{ success: boolean; cancelled?: boolean; refundRequired?: boolean; refund?: any; error?: string }> {
   try {
@@ -495,6 +506,7 @@ export async function cancelEscrowByTaskId(params: {
       taskTitle,
       catalogId,
       partnerReachedLocation,
+      partnerAssigned,
       precomputedSettlement,
     } = params;
 
@@ -520,6 +532,7 @@ export async function cancelEscrowByTaskId(params: {
       taskTitle,
       catalogId,
       partnerReachedLocation,
+      partnerAssigned,
       precomputedSettlement,
     });
   } catch (error: any) {

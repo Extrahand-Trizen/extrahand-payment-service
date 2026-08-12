@@ -247,6 +247,7 @@ export class PaymentController {
       taskTitle,
       catalogId,
       partnerReachedLocation,
+      partnerAssigned,
       settlement,
       precomputedSettlement,
     } = req.body;
@@ -260,6 +261,7 @@ export class PaymentController {
       taskStartDate,
       assignedAt,
       feeBaseAmount,
+      partnerAssigned,
       hasReason: Boolean(reason),
       userId,
       hasSettlement: Boolean(settlement || precomputedSettlement),
@@ -298,6 +300,9 @@ export class PaymentController {
       }
     }
 
+    const partnerAssignedToPass =
+      typeof partnerAssigned === 'boolean' ? partnerAssigned : undefined;
+
     const common = {
       reason,
       userId,
@@ -308,6 +313,7 @@ export class PaymentController {
       taskTitle: typeof taskTitle === 'string' ? taskTitle : undefined,
       catalogId: typeof catalogId === 'string' ? catalogId : undefined,
       partnerReachedLocation: Boolean(partnerReachedLocation),
+      partnerAssigned: partnerAssignedToPass,
       precomputedSettlement: settlementToPass,
     };
 
@@ -393,6 +399,7 @@ export class PaymentController {
       isLastActiveItem,
       catalogId,
       partnerReachedLocation,
+      partnerAssigned,
     } = req.body;
 
     if (!bookingOrderId || !taskId || lineAmountRupees == null || !taskStartDate) {
@@ -418,6 +425,7 @@ export class PaymentController {
       isLastActiveItem: Boolean(isLastActiveItem),
       catalogId: typeof catalogId === 'string' ? catalogId : undefined,
       partnerReachedLocation: Boolean(partnerReachedLocation),
+      partnerAssigned: typeof partnerAssigned === 'boolean' ? partnerAssigned : undefined,
     });
 
     if (!result.success) {

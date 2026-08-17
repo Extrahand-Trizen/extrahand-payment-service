@@ -57,6 +57,18 @@ async function resolvePaymentIdForRefund(
 }
 
 
+/** Precomputed by task-service hourly evaluator — payment must not recalculate fees. */
+export type CancellationSettlementPaise = {
+  refundAmountPaise: number;
+  workerCompensationPaise: number;
+  platformRetainedAmountPaise: number;
+};
+
+function paiseToRupeeDecimal(paise: number): Prisma.Decimal {
+  const safe = Number.isFinite(paise) ? Math.max(0, Math.trunc(paise)) : 0;
+  return new Prisma.Decimal((safe / 100).toFixed(2));
+}
+
 async function getProfileContact(uid: string): Promise<{ email?: string; name?: string } | null> {
   if (!uid || mongoose.connection.readyState !== 1) return null;
 
@@ -93,6 +105,13 @@ export async function processRefund(params: {
   /** Book Now catalog id (e.g. ac-services) — enables flat cancellation fees */
   catalogId?: string | null;
   partnerReachedLocation?: boolean;
+  /** false => full refund of capturable amount (no Book Now flat fee). */
+  partnerAssigned?: boolean;
+  /**
+   * Hourly Helper: settlement from task-service evaluator.
+   * When set, skips all fee policy calculation.
+   */
+  precomputedSettlement?: CancellationSettlementPaise;
 }): Promise<{
   success: boolean;
   refund?: any;
@@ -113,6 +132,8 @@ export async function processRefund(params: {
       feeBaseAmount,
       catalogId,
       partnerReachedLocation,
+      partnerAssigned,
+      precomputedSettlement,
     } = params;
 
     let razorpayOrderId = _razorpayOrderId ? String(_razorpayOrderId).trim() : '';
@@ -345,7 +366,24 @@ export async function processRefund(params: {
     let toPlatform: Prisma.Decimal;
     let cancellationFeePercentage: number = 0;
 
-    if (amount) {
+    if (precomputedSettlement) {
+      refundAmount = paiseToRupeeDecimal(precomputedSettlement.refundAmountPaise);
+      toOtherParty = paiseToRupeeDecimal(precomputedSettlement.workerCompensationPaise);
+      toPlatform = paiseToRupeeDecimal(precomputedSettlement.platformRetainedAmountPaise);
+      cancellationFee = toOtherParty.add(toPlatform).toDecimalPlaces(2);
+      const paidPaise =
+        precomputedSettlement.refundAmountPaise +
+        precomputedSettlement.workerCompensationPaise +
+        precomputedSettlement.platformRetainedAmountPaise;
+      cancellationFeePercentage =
+        paidPaise > 0 ? cancellationFee.toNumber() / (paidPaise / 100) : 0;
+      logger.info('Hourly precomputed settlement applied (no fee recalculation)', {
+        razorpayPaymentId,
+        refundAmountPaise: precomputedSettlement.refundAmountPaise,
+        workerCompensationPaise: precomputedSettlement.workerCompensationPaise,
+        platformRetainedAmountPaise: precomputedSettlement.platformRetainedAmountPaise,
+      });
+    } else if (amount) {
       // Partial refund - no cancellation fee
       refundAmount = new Prisma.Decimal(amount.toString());
       cancellationFee = new Prisma.Decimal('0.00');
@@ -380,12 +418,25 @@ export async function processRefund(params: {
           catalogId,
         );
 
+        // Explicit flag from task-service wins; else escrow performerUid is source of truth.
+        const escrowPerformer = String(postgresEscrow.performerUid || '').trim();
+        const inferredAssigned =
+          escrowPerformer.length > 0 && escrowPerformer !== 'pending_assignment';
+        const effectivePartnerAssigned =
+          partnerAssigned !== undefined ? partnerAssigned : inferredAssigned;
+        logger.info('Book Now cancellation assignment gate', {
+          razorpayOrderId,
+          partnerAssigned: effectivePartnerAssigned,
+          source:
+            partnerAssigned !== undefined ? 'request' : 'escrow_performerUid',
+        });
         const bookNowFee = await calculateBookNowCancellationFee({
           catalogId: resolvedCatalogId,
           amount: refundableCapturedRupees,
           taskStartDate,
           cancelledAt,
           partnerReachedLocation,
+          partnerAssigned: effectivePartnerAssigned,
         });
         cancellationFeeResult = bookNowFee;
       } else {
@@ -408,7 +459,13 @@ export async function processRefund(params: {
     }
 
     let refundAmountInPaise = Math.round(parseFloat(refundAmount.toString()) * 100);
-    if (refundAmountInPaise <= 0) {
+    // Hourly: full fee retained (e.g. 1h no-show) — no Razorpay refund, still settle ledger.
+    const feeOnlySettlement =
+      Boolean(precomputedSettlement) &&
+      refundAmountInPaise <= 0 &&
+      cancellationFee.greaterThan(0);
+
+    if (refundAmountInPaise <= 0 && !feeOnlySettlement) {
       return {
         success: false,
         error: 'Calculated refund after cancellation fees is zero; nothing to return via Razorpay',
@@ -429,39 +486,61 @@ export async function processRefund(params: {
       refundAmountInPaise = maxRefundablePaise;
     }
 
-    logger.info('[RefundService.processRefund] Calling Razorpay refund API', {
-      razorpayOrderId,
-      razorpayPaymentId,
-      refundAmountInPaise,
-      refundAmountRupees: (refundAmountInPaise / 100).toFixed(2),
-      maxRefundablePaise,
-      cancelledBy,
-    });
-
-    const razorpayRefundResult = await createRefundAmountPaise(razorpayPaymentId, refundAmountInPaise);
-
-    if (!razorpayRefundResult.success || !razorpayRefundResult.refund) {
-      logger.error('❌ Failed to create Razorpay refund:', {
+    let razorpayRefund: any = null;
+    if (!feeOnlySettlement) {
+      logger.info('[RefundService.processRefund] Calling Razorpay refund API', {
         razorpayOrderId,
         razorpayPaymentId,
         refundAmountInPaise,
-        error: razorpayRefundResult.error,
+        refundAmountRupees: (refundAmountInPaise / 100).toFixed(2),
+        maxRefundablePaise,
+        cancelledBy,
       });
-      return { success: false, error: razorpayRefundResult.error || 'Failed to create Razorpay refund' };
+
+      const razorpayRefundResult = await createRefundAmountPaise(
+        razorpayPaymentId,
+        refundAmountInPaise,
+      );
+
+      if (!razorpayRefundResult.success || !razorpayRefundResult.refund) {
+        logger.error('❌ Failed to create Razorpay refund:', {
+          razorpayOrderId,
+          razorpayPaymentId,
+          refundAmountInPaise,
+          error: razorpayRefundResult.error,
+        });
+        return {
+          success: false,
+          error: razorpayRefundResult.error || 'Failed to create Razorpay refund',
+        };
+      }
+
+      razorpayRefund = razorpayRefundResult.refund;
+      logger.info('[RefundService.processRefund] Razorpay refund API success', {
+        razorpayOrderId,
+        razorpayPaymentId,
+        razorpayRefundId: razorpayRefund.id,
+        razorpayRefundStatus: razorpayRefund.status,
+        razorpayRefundAmountPaise: razorpayRefund.amount,
+        razorpayRefundSpeed: razorpayRefund.speed_processed || razorpayRefund.speed_requested,
+      });
+    } else {
+      logger.info('[RefundService.processRefund] Fee-only settlement (no Razorpay refund)', {
+        razorpayOrderId,
+        razorpayPaymentId,
+        cancellationFee: cancellationFee.toString(),
+      });
+      razorpayRefund = {
+        id: `fee_only_${generateRefundId()}`,
+        status: 'processed',
+        amount: 0,
+      };
     }
 
-    const razorpayRefund = razorpayRefundResult.refund;
-    logger.info('[RefundService.processRefund] Razorpay refund API success', {
-      razorpayOrderId,
-      razorpayPaymentId,
-      razorpayRefundId: razorpayRefund.id,
-      razorpayRefundStatus: razorpayRefund.status,
-      razorpayRefundAmountPaise: razorpayRefund.amount,
-      razorpayRefundSpeed: razorpayRefund.speed_processed || razorpayRefund.speed_requested,
-    });
-
     // Sanitize Razorpay refund data
-    const sanitizedRefundData = sanitizeRazorpayRefundData(razorpayRefund);
+    const sanitizedRefundData = feeOnlySettlement
+      ? { feeOnly: true, amount: 0 }
+      : sanitizeRazorpayRefundData(razorpayRefund);
 
     // Generate refund ID
     const refundId = generateRefundId();
@@ -661,14 +740,14 @@ export async function processRefund(params: {
         // For poster: refund (money returned)
         // For performer: compensation (if toOtherParty exists)
         const { updateUserPaymentProfile } = await import('./userPaymentProfileService');
-        
-        // Poster gets refund
-        if (escrow.posterUid) {
-          updateUserPaymentProfile(escrow.posterUid, {
+
+        // Poster gets refund (skip zero / fee-only settlements)
+        if (postgresEscrow?.posterUid && refundAmount.greaterThan(0)) {
+          updateUserPaymentProfile(postgresEscrow.posterUid, {
             type: 'refund',
             amount: refundAmount,
             refundId,
-            escrowId: isRealEscrow ? escrow.id : undefined,
+            escrowId: postgresEscrow.id,
           }).catch((error) => {
             logger.warn('Failed to update UserPaymentProfile for refund (non-critical):', error);
           });
@@ -982,6 +1061,7 @@ export async function processBookNowLineItemRefund(params: {
   isLastActiveItem: boolean;
   catalogId?: string | null;
   partnerReachedLocation?: boolean;
+  partnerAssigned?: boolean;
 }): Promise<{ success: boolean; refund?: any; error?: string }> {
   const {
     bookingOrderId,
@@ -995,6 +1075,7 @@ export async function processBookNowLineItemRefund(params: {
     isLastActiveItem,
     catalogId,
     partnerReachedLocation,
+    partnerAssigned,
   } = params;
 
   try {
@@ -1053,12 +1134,24 @@ export async function processBookNowLineItemRefund(params: {
     });
 
     const resolvedCatalogId = resolveBookNowCatalogId(meta, taskId, catalogId);
+    const escrowPerformer = String(postgresEscrow.performerUid || '').trim();
+    const inferredAssigned =
+      escrowPerformer.length > 0 && escrowPerformer !== 'pending_assignment';
+    const effectivePartnerAssigned =
+      partnerAssigned !== undefined ? partnerAssigned : inferredAssigned;
+    logger.info('Book Now line cancellation assignment gate', {
+      bookingOrderId,
+      taskId,
+      partnerAssigned: effectivePartnerAssigned,
+      source: partnerAssigned !== undefined ? 'request' : 'escrow_performerUid',
+    });
     const feeResult = await calculateBookNowCancellationFee({
       catalogId: resolvedCatalogId,
       amount: feeBaseRupees,
       taskStartDate,
       cancelledAt,
       partnerReachedLocation,
+      partnerAssigned: effectivePartnerAssigned,
     });
 
     let refundPaise = Math.round(parseFloat(feeResult.refundAmount.toString()) * 100);

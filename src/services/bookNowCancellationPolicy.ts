@@ -77,15 +77,43 @@ function flatFeeForTier(
 
 export async function calculateBookNowCancellationFee(params: {
   catalogId?: string | null;
-  /** Captured / refundable amount in rupees for this line */
+  /** Captured / refundable amount in rupees for this line (includes GST when full order). */
   amount: number | Prisma.Decimal;
   taskStartDate: Date;
   cancelledAt: Date;
   partnerReachedLocation?: boolean;
+  /**
+   * Whether a Partner/Helper is actually assigned to the task.
+   * When false, customer pays ₹0 fee and receives 100% of `amount` back.
+   * When omitted, falls back to existing time-based tiers (legacy callers).
+   */
+  partnerAssigned?: boolean;
 }): Promise<CancellationFeeResult & { policyKey: string; tier: BookNowCancellationTier }> {
   const feeStructure = await getFeeStructure();
   const originalAmount = new Prisma.Decimal(params.amount.toString());
   const group = resolveBookNowPolicyGroup(params.catalogId);
+
+  // No partner assigned → full refund of amount paid (incl. GST portion in amount); no time fees.
+  if (params.partnerAssigned === false) {
+    const zero = new Prisma.Decimal('0.00');
+    return {
+      cancellationFee: zero,
+      cancellationFeePercentage: 0,
+      refundAmount: originalAmount.toDecimalPlaces(2),
+      toOtherParty: zero,
+      toPlatform: zero,
+      policyKey: 'book_now_no_partner_assigned',
+      tier: 'free',
+      feeBreakdown: {
+        originalAmount,
+        cancellationFee: zero,
+        refundAmount: originalAmount.toDecimalPlaces(2),
+        toOtherParty: zero,
+        toPlatform: zero,
+      },
+    };
+  }
+
   const tier = resolveBookNowCancellationTier({
     taskStartDate: params.taskStartDate,
     cancelledAt: params.cancelledAt,

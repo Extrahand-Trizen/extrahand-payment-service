@@ -11,7 +11,32 @@ import {
   REVIEW_ORDER_ID_PREFIX,
 } from '../utils/reviewBypass';
 
-export const createOrder = async (amount: number, currency: string = 'INR', metadata: Record<string, any> = {}) => {
+/** Order payload returned to clients (includes publishable keyId for checkout). */
+export type CreateOrderPayload = {
+  id: string;
+  entity: string;
+  amount: number;
+  amount_paid: number;
+  amount_due: number;
+  currency: string;
+  receipt: string;
+  status: string;
+  attempts: number;
+  created_at: number;
+  reviewBypass?: boolean;
+  keyId: string;
+  [key: string]: unknown;
+};
+
+export type CreateOrderResult =
+  | { success: true; order: CreateOrderPayload }
+  | { success: false; error: string; order?: undefined };
+
+export const createOrder = async (
+  amount: number,
+  currency: string = 'INR',
+  metadata: Record<string, any> = {}
+): Promise<CreateOrderResult> => {
   try {
     const posterUid =
       typeof metadata.posterUid === 'string' ? metadata.posterUid.trim() : '';
@@ -28,7 +53,7 @@ export const createOrder = async (amount: number, currency: string = 'INR', meta
         posterUid,
         amountPaise: amount,
       });
-      const order = {
+      const order: CreateOrderPayload = {
         id,
         entity: 'order',
         amount,
@@ -55,11 +80,21 @@ export const createOrder = async (amount: number, currency: string = 'INR', meta
 
     const order = await razorpay.orders.create(options);
     logger.info('Order created successfully', { orderId: order.id, amount });
+    // Plain JSON + keyId: Razorpay SDK objects can lose custom fields across axios hops
+    // (task-service Book Now path). Checkout must use this same publishable key.
+    const plainOrder =
+      order && typeof order === 'object'
+        ? (JSON.parse(JSON.stringify(order)) as Record<string, unknown>)
+        : {};
+    const orderId =
+      typeof plainOrder.id === 'string' ? plainOrder.id : String(order.id);
     return {
       success: true,
-      // Attach publishable key from the same process that created the order so the
-      // client never opens checkout with a key from a different payment instance.
-      order: { ...order, keyId: RAZORPAY_CONFIG.keyId },
+      order: {
+        ...plainOrder,
+        id: orderId,
+        keyId: RAZORPAY_CONFIG.keyId,
+      } as CreateOrderPayload,
     };
   } catch (error: any) {
     logger.error('Error creating order:', error);
@@ -167,7 +202,14 @@ export const getOrderDetails = async (orderId: string) => {
     }
 
     const order = await razorpay.orders.fetch(orderId);
-    return { success: true, order };
+    const plainOrder =
+      order && typeof order === 'object'
+        ? (JSON.parse(JSON.stringify(order)) as Record<string, unknown>)
+        : {};
+    return {
+      success: true,
+      order: { ...plainOrder, keyId: RAZORPAY_CONFIG.keyId },
+    };
   } catch (error: any) {
     logger.error('Error fetching order:', error);
     
@@ -232,4 +274,3 @@ export const createRefundAmountPaise = async (paymentId: string, amountInPaise: 
     return { success: false as const, error: error.message };
   }
 };
-

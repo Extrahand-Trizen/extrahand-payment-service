@@ -255,11 +255,11 @@ export async function recalculateUserEarningsProfile(userId: string): Promise<vo
       }),
     ]);
 
-    const fromPayouts = payoutStats._sum.netAmount || new Prisma.Decimal('0');
-    const fromCompensation = compensationStats._sum.toOtherParty || new Prisma.Decimal('0');
+    const fromPayouts = payoutStats._sum?.netAmount || new Prisma.Decimal('0');
+    const fromCompensation = compensationStats._sum?.toOtherParty || new Prisma.Decimal('0');
     const totalEarnings = fromPayouts.plus(fromCompensation);
-    const pendingPayouts = pendingStats._sum.netAmount || new Prisma.Decimal('0');
-    const pendingPayoutCount = pendingStats._count.id || 0;
+    const pendingPayouts = pendingStats._sum?.netAmount || new Prisma.Decimal('0');
+    const pendingPayoutCount = pendingStats._count?.id || 0;
 
     await prisma.userPaymentProfile.upsert({
       where: { userId },

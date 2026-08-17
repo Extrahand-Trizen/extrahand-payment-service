@@ -82,11 +82,11 @@ async function livePendingAggregate(
       AND: [partnerVisibleNowWhere(now)],
     },
     _sum: { netAmount: true },
-    _count: { _all: true },
+    _count: { netAmount: true },
   });
   return {
-    pendingPayouts: pendingAgg._sum.netAmount || new Prisma.Decimal('0'),
-    pendingPayoutCount: pendingAgg._count._all || 0,
+    pendingPayouts: pendingAgg._sum?.netAmount || new Prisma.Decimal('0'),
+    pendingPayoutCount: pendingAgg._count?.netAmount || 0,
   };
 }
 
@@ -101,7 +101,7 @@ async function liveAggregateFallback(uidList: string[]): Promise<EarningsPayload
         AND: [visible],
       },
       _sum: { netAmount: true },
-      _count: { _all: true },
+      _count: { netAmount: true },
     }),
     prisma.refund.aggregate({
       where: {
@@ -116,8 +116,8 @@ async function liveAggregateFallback(uidList: string[]): Promise<EarningsPayload
     livePendingAggregate(uidList),
   ]);
 
-  const fromPayouts = payoutsAgg._sum.netAmount || new Prisma.Decimal('0');
-  const fromCompensation = compensationsAgg._sum.toOtherParty || new Prisma.Decimal('0');
+  const fromPayouts = payoutsAgg._sum?.netAmount || new Prisma.Decimal('0');
+  const fromCompensation = compensationsAgg._sum?.toOtherParty || new Prisma.Decimal('0');
 
   return {
     totalEarnings: fromPayouts.plus(fromCompensation).toString(),
@@ -125,8 +125,8 @@ async function liveAggregateFallback(uidList: string[]): Promise<EarningsPayload
     fromCompensation: fromCompensation.toString(),
     pendingPayouts: pendingAgg.pendingPayouts.toString(),
     pendingPayoutCount: pendingAgg.pendingPayoutCount,
-    totalPayouts: payoutsAgg._count._all || 0,
-    totalCompensations: compensationsAgg._count._all || 0,
+    totalPayouts: payoutsAgg._count?.netAmount || 0,
+    totalCompensations: compensationsAgg._count?._all || 0,
     labels: { ...EARNINGS_LABELS },
   };
 }

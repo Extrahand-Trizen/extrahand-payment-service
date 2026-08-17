@@ -8,16 +8,54 @@ import {
   calculateBookNowCancellationFee,
   describeBookNowCancellationPolicy,
 } from './bookNowCancellationPolicy';
-import { prisma } from '../config/prisma';
+import { prisma, prismaDev } from '../config/prisma';
 import { Prisma } from '@prisma/client';
 import mongoose from 'mongoose';
 import { createRefundAmountPaise, getPaymentDetails } from './paymentService';
 import { sanitizeRazorpayRefundData } from '../utils/paymentSanitizer';
 import { notifyRefundInitiated } from './paymentNotificationService';
+import { razorpay } from '../config/razorpay';
 
 function generateRefundId(): string {
   return `refund_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
 }
+
+async function resolvePaymentIdForRefund(
+  orderId?: string | null,
+  paymentId?: string | null,
+): Promise<string | null> {
+  if (paymentId && paymentId.trim()) {
+    return paymentId.trim();
+  }
+  if (!orderId || !orderId.trim()) {
+    return null;
+  }
+  try {
+    const cleanOrderId = orderId.trim();
+    logger.info('Fetching captured payment for Razorpay order:', { orderId: cleanOrderId });
+    const payments = await razorpay.orders.fetchPayments(cleanOrderId);
+    const items = (payments as { items?: any[] })?.items || [];
+    const captured = items.find((p) => p.status === 'captured' && p.id);
+    if (captured?.id) {
+      return String(captured.id);
+    }
+    const authorized = items.find((p) => p.status === 'authorized' && p.id);
+    if (authorized?.id) {
+      return String(authorized.id);
+    }
+    const anyPayment = items.find((p) => Boolean(p?.id));
+    if (anyPayment?.id) {
+      return String(anyPayment.id);
+    }
+  } catch (err: any) {
+    logger.warn('Failed to fetch payments for order from Razorpay API:', {
+      orderId,
+      error: err?.message || String(err),
+    });
+  }
+  return null;
+}
+
 
 async function getProfileContact(uid: string): Promise<{ email?: string; name?: string } | null> {
   if (!uid || mongoose.connection.readyState !== 1) return null;
@@ -43,6 +81,7 @@ async function getProfileContact(uid: string): Promise<{ email?: string; name?: 
 export async function processRefund(params: {
   razorpayOrderId: string;
   razorpayPaymentId: string;
+  taskId?: string;
   reason?: string;
   cancelledBy: 'poster' | 'performer';
   taskStartDate: Date;
@@ -61,8 +100,9 @@ export async function processRefund(params: {
 }> {
   try {
     const {
-      razorpayOrderId,
-      razorpayPaymentId,
+      razorpayOrderId: _razorpayOrderId,
+      razorpayPaymentId: _razorpayPaymentId,
+      taskId,
       reason,
       cancelledBy,
       taskStartDate,
@@ -75,9 +115,14 @@ export async function processRefund(params: {
       partnerReachedLocation,
     } = params;
 
+    let razorpayOrderId = _razorpayOrderId ? String(_razorpayOrderId).trim() : '';
+    let razorpayPaymentId = _razorpayPaymentId ? String(_razorpayPaymentId).trim() : '';
+    const cleanTaskId = taskId ? String(taskId).trim() : undefined;
+
     logger.info('💰 Processing refund', {
       razorpayOrderId,
       razorpayPaymentId,
+      taskId: cleanTaskId,
       reason,
       cancelledBy,
     });
@@ -86,17 +131,134 @@ export async function processRefund(params: {
       return { success: false, error: 'Postgres not connected' };
     }
 
-    const postgresEscrow = await prisma.escrow.findUnique({ where: { razorpayOrderId } });
-    if (!postgresEscrow) {
-      logger.warn('⚠️ Escrow not found for order:', razorpayOrderId);
-      return { success: false, error: 'Escrow not found' };
+    let postgresEscrow: any = null;
+    let txRecord: any = null;
+    let targetDb = prisma;
+
+    // 1. Try finding Escrow by razorpayOrderId
+    if (razorpayOrderId) {
+      postgresEscrow = await prisma.escrow.findUnique({ where: { razorpayOrderId } });
+      if (!postgresEscrow && prismaDev) {
+        try {
+          postgresEscrow = await prismaDev.escrow.findUnique({ where: { razorpayOrderId } });
+          if (postgresEscrow) targetDb = prismaDev;
+        } catch (err: any) {
+          logger.warn('Failed fallback escrow lookup on prismaDev by order ID:', { message: err?.message });
+        }
+      }
     }
 
-    if (postgresEscrow.status === 'refunded') {
+    // 2. Fallback: lookup Escrow by taskId if razorpayOrderId didn't find it
+    if (!postgresEscrow && cleanTaskId) {
+      try {
+        postgresEscrow = await prisma.escrow.findFirst({ where: { taskId: cleanTaskId }, orderBy: { createdAt: 'desc' } });
+      } catch { /* ignore */ }
+      if (!postgresEscrow && prismaDev) {
+        try {
+          postgresEscrow = await prismaDev.escrow.findFirst({ where: { taskId: cleanTaskId }, orderBy: { createdAt: 'desc' } });
+          if (postgresEscrow) targetDb = prismaDev;
+        } catch { /* ignore */ }
+      }
+    }
+
+    // 3. Lookup Transaction record by taskId or razorpayOrderId
+    if (cleanTaskId) {
+      try {
+        txRecord = await prisma.transaction.findFirst({ where: { taskId: cleanTaskId }, orderBy: { createdAt: 'desc' } });
+      } catch { /* ignore */ }
+      if (!txRecord && prismaDev) {
+        try {
+          txRecord = await prismaDev.transaction.findFirst({ where: { taskId: cleanTaskId }, orderBy: { createdAt: 'desc' } });
+        } catch { /* ignore */ }
+      }
+    }
+    if (!txRecord && razorpayOrderId) {
+      try {
+        txRecord = await prisma.transaction.findUnique({ where: { razorpayOrderId } });
+      } catch { /* ignore */ }
+      if (!txRecord && prismaDev) {
+        try {
+          txRecord = await prismaDev.transaction.findUnique({ where: { razorpayOrderId } });
+        } catch { /* ignore */ }
+      }
+    }
+
+    // 4. If postgresEscrow wasn't found yet, but txRecord has razorpayOrderId, try finding Escrow with that
+    if (!postgresEscrow && txRecord?.razorpayOrderId) {
+      try {
+        postgresEscrow = await prisma.escrow.findUnique({ where: { razorpayOrderId: txRecord.razorpayOrderId } });
+      } catch { /* ignore */ }
+      if (!postgresEscrow && prismaDev) {
+        try {
+          postgresEscrow = await prismaDev.escrow.findUnique({ where: { razorpayOrderId: txRecord.razorpayOrderId } });
+          if (postgresEscrow) targetDb = prismaDev;
+        } catch { /* ignore */ }
+      }
+    }
+
+    // 5. Populate razorpayOrderId and razorpayPaymentId from Escrow or Transaction if empty
+    if (!razorpayOrderId) {
+      razorpayOrderId = postgresEscrow?.razorpayOrderId || txRecord?.razorpayOrderId || '';
+    }
+    if (!razorpayPaymentId) {
+      razorpayPaymentId = postgresEscrow?.razorpayPaymentId || txRecord?.razorpayPaymentId || '';
+    }
+
+    // 6. If razorpayPaymentId is STILL empty, fetch it from Razorpay order payments API!
+    if (!razorpayPaymentId && razorpayOrderId) {
+      const fetchedPaymentId = await resolvePaymentIdForRefund(razorpayOrderId, null);
+      if (fetchedPaymentId) {
+        razorpayPaymentId = fetchedPaymentId;
+        logger.info('Resolved payment ID from Razorpay order payments:', { razorpayOrderId, razorpayPaymentId });
+      }
+    }
+
+    const isRealEscrow = Boolean(postgresEscrow);
+
+    // 7. If Escrow row was not found, but we have Transaction record, create a synthetic escrow object
+    if (!postgresEscrow) {
+      if (txRecord) {
+        logger.warn('⚠️ No Escrow found; using Transaction record for refund', { taskId: cleanTaskId, razorpayOrderId, razorpayPaymentId });
+        postgresEscrow = {
+          id: txRecord.id,
+          escrowId: txRecord.id,
+          razorpayOrderId: razorpayOrderId || txRecord.razorpayOrderId,
+          razorpayPaymentId: razorpayPaymentId || txRecord.razorpayPaymentId,
+          taskId: txRecord.taskId || cleanTaskId || '',
+          posterUid: txRecord.userId,
+          performerUid: null,
+          status: 'held',
+          paymentStatus: txRecord.status,
+          amount: txRecord.amount,
+          amountInRupees: txRecord.amount,
+          taskAmount: txRecord.amount,
+          currency: txRecord.currency || 'INR',
+          appliedGstPercent: null,
+          appliedPlatformFeePercent: null,
+          appliedRazorpayGstPercent: null,
+          metadata: txRecord.metadata,
+          createdAt: txRecord.createdAt,
+          updatedAt: txRecord.updatedAt,
+        } as any;
+      } else {
+        logger.warn('⚠️ Escrow and Transaction not found for order/task:', { razorpayOrderId, taskId: cleanTaskId });
+        return { success: false, error: 'Escrow or transaction details not found' };
+      }
+    }
+
+    if (!razorpayPaymentId) {
+      logger.error('❌ Could not resolve payment ID for refund:', { razorpayOrderId, taskId: cleanTaskId });
+      return { success: false, error: 'Could not resolve Razorpay Payment ID for this task' };
+    }
+
+    // postgresEscrow is guaranteed non-null from this point
+    const escrow = postgresEscrow!;
+
+    if (escrow.status === 'refunded') {
       return { success: false, error: 'Escrow already refunded' };
     }
 
-    if (postgresEscrow.status === 'released') {
+    if (escrow.status === 'released') {
       return {
         success: false,
         error: 'Refund cannot be processed after payout release.',
@@ -104,13 +266,13 @@ export async function processRefund(params: {
     }
 
     // Idempotency check: Check if a refund is already in progress or completed for this payment
-    const existingRefund = await prisma.refund.findFirst({
+    const existingRefund = await targetDb.refund.findFirst({
       where: {
-        escrowId: postgresEscrow.id,
         paymentId: razorpayPaymentId,
         status: { in: ['processing', 'completed'] },
       },
     });
+
 
     if (existingRefund) {
       logger.info('ℹ️ Refund already exists (idempotency)', {
@@ -134,7 +296,7 @@ export async function processRefund(params: {
       return { success: false, error: 'Refund already in progress' };
     }
 
-    const escrowAmountRupees = postgresEscrow.amountInRupees;
+    const escrowAmountRupees = escrow.amountInRupees;
 
     const paymentFetch = await getPaymentDetails(razorpayPaymentId);
     if (!paymentFetch.success || !paymentFetch.payment) {
@@ -161,8 +323,8 @@ export async function processRefund(params: {
       return value.greaterThan(one) ? value.div(new Prisma.Decimal('100')) : value;
     };
     const inferredTaskAmountFromEscrow = (() => {
-      const platformPct = normalizePercent(postgresEscrow.appliedPlatformFeePercent as Prisma.Decimal | null);
-      const gstPct = normalizePercent(postgresEscrow.appliedGstPercent as Prisma.Decimal | null) || new Prisma.Decimal('0');
+      const platformPct = normalizePercent(escrow.appliedPlatformFeePercent as Prisma.Decimal | null);
+      const gstPct = normalizePercent(escrow.appliedGstPercent as Prisma.Decimal | null) || new Prisma.Decimal('0');
       if (!platformPct) return null;
       const multiplier = new Prisma.Decimal('1').plus(platformPct.mul(new Prisma.Decimal('1').plus(gstPct)));
       if (multiplier.lessThanOrEqualTo(0)) return null;
@@ -171,8 +333,8 @@ export async function processRefund(params: {
     const refundTaskBase =
       feeBaseAmount != null
         ? new Prisma.Decimal(feeBaseAmount.toString())
-        : postgresEscrow.taskAmount
-        ? new Prisma.Decimal(postgresEscrow.taskAmount.toString())
+        : escrow.taskAmount
+        ? new Prisma.Decimal(escrow.taskAmount.toString())
         : inferredTaskAmountFromEscrow || capturedRupees;
 
     // Calculate cancellation fee and refund amount (use live capture, not only escrow row)
@@ -205,8 +367,8 @@ export async function processRefund(params: {
       });
     } else {
       const { isBookNowEscrowRecord } = await import('./escrowService');
-      const escrowMeta = (postgresEscrow.metadata as Record<string, unknown> | null) || {};
-      const isBookNow = isBookNowEscrowRecord(postgresEscrow);
+      const escrowMeta = (escrow.metadata as Record<string, unknown> | null) || {};
+      const isBookNow = isBookNowEscrowRecord(escrow);
       const refundableCapturedRupees = new Prisma.Decimal(
         (maxRefundablePaise / 100).toFixed(2),
       );
@@ -214,9 +376,10 @@ export async function processRefund(params: {
       if (isBookNow) {
         const resolvedCatalogId = resolveBookNowCatalogId(
           escrowMeta,
-          postgresEscrow.taskId,
+          escrow.taskId,
           catalogId,
         );
+
         const bookNowFee = await calculateBookNowCancellationFee({
           catalogId: resolvedCatalogId,
           amount: refundableCapturedRupees,
@@ -309,21 +472,25 @@ export async function processRefund(params: {
     try {
       if (isPostgresConnected()) {
         // Wrap all database operations in a transaction for atomicity
-        await prisma.$transaction(async (tx) => {
-          // Get current escrow balance with row-level locking to prevent race conditions
-          const latestEntry = await tx.ledger.findFirst({
-            where: { escrowId: postgresEscrow.id },
-            orderBy: { createdAt: 'desc' },
-          });
-          const currentBalance = latestEntry?.balanceAfter || new Prisma.Decimal('0.00');
+        await targetDb.$transaction(async (tx) => {
+          let currentBalance = new Prisma.Decimal('0.00');
+
+          if (isRealEscrow) {
+            // Get current escrow balance with row-level locking to prevent race conditions
+            const latestEntry = await tx.ledger.findFirst({
+              where: { escrowId: escrow.id },
+              orderBy: { createdAt: 'desc' },
+            });
+            currentBalance = latestEntry?.balanceAfter || new Prisma.Decimal('0.00');
+          }
 
           // Create refund record in Postgres
-          // Note: amount is not stored - get it from escrow.amountInRupees when needed
           postgresRefund = await tx.refund.create({
             data: {
               refundId,
-              escrowId: postgresEscrow.id,
-              taskId: postgresEscrow.taskId,
+              escrowId: isRealEscrow ? escrow.id : null,
+              transactionId: txRecord?.id || null,
+              taskId: escrow.taskId,
               paymentId: razorpayPaymentId,
               razorpayRefundId: razorpayRefund.id,
               cancellationFee: cancellationFee.greaterThan(0) ? cancellationFee : null,
@@ -338,127 +505,144 @@ export async function processRefund(params: {
 
           const ledgerRefundId = postgresRefund.id;
 
-          // Update escrow status to 'refunded'
-          await tx.escrow.update({
-            where: { id: postgresEscrow.id },
-            data: {
-              status: 'refunded',
-              refundedAt: new Date(),
-            },
-          });
+          if (isRealEscrow) {
+            // Update escrow status to 'refunded'
+            await tx.escrow.update({
+              where: { id: escrow.id },
+              data: {
+                status: 'refunded',
+                refundedAt: new Date(),
+                razorpayPaymentId: razorpayPaymentId,
+              },
+            });
+          }
 
-          // Prepare all ledger entries for batch creation
-          const ledgerEntries: Array<{
-            transactionId: string;
-            escrowId: string;
-            refundId: string;
-            type: string;
-            amount: Prisma.Decimal;
-            balanceBefore: Prisma.Decimal;
-            balanceAfter: Prisma.Decimal;
-            description: string;
-            metadata: any;
-          }> = [];
+          if (txRecord?.id) {
+            try {
+              await tx.transaction.update({
+                where: { id: txRecord.id },
+                data: {
+                  status: 'refunded',
+                  razorpayPaymentId: razorpayPaymentId,
+                },
+              });
+            } catch { /* ignore */ }
+          }
 
-          // Helper to generate transaction ID
-          const generateTxId = () => `ledger_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+          // Prepare all ledger entries for batch creation if real escrow
+          if (isRealEscrow) {
+            const ledgerEntries: Array<{
+              transactionId: string;
+              escrowId: string;
+              refundId: string;
+              type: string;
+              amount: Prisma.Decimal;
+              balanceBefore: Prisma.Decimal;
+              balanceAfter: Prisma.Decimal;
+              description: string;
+              metadata: any;
+            }> = [];
 
-          // 1. Refund entry
-          let runningBalance = currentBalance;
-          runningBalance = runningBalance.sub(refundAmount);
-          ledgerEntries.push({
-            transactionId: generateTxId(),
-            escrowId: postgresEscrow.id,
-            refundId: ledgerRefundId,
-            type: 'refund',
-            amount: refundAmount.neg(),
-            balanceBefore: currentBalance,
-            balanceAfter: runningBalance,
-            description: `Refund processed: ${reason || 'No reason provided'}`,
-            metadata: {
-              refundId,
-              razorpayRefundId: razorpayRefund.id,
-              originalAmount: capturedRupees.toString(),
-              escrowAmountInRupees: escrowAmountRupees.toString(),
-              refundAmount: refundAmount.toString(),
-              cancellationFee: cancellationFee.toString(),
-              toOtherParty: toOtherParty.toString(),
-              toPlatform: toPlatform.toString(),
-              cancelledBy,
-              reason,
-            },
-          });
+            // Helper to generate transaction ID
+            const generateTxId = () => `ledger_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
 
-          // 2-4. Cancellation fee entries (if applicable)
-          if (cancellationFee.greaterThan(0)) {
-            // Cancellation fee
-            const balanceBeforeFee = runningBalance;
-            runningBalance = runningBalance.sub(cancellationFee);
+            // 1. Refund entry
+            let runningBalance = currentBalance;
+            runningBalance = runningBalance.sub(refundAmount);
             ledgerEntries.push({
               transactionId: generateTxId(),
-              escrowId: postgresEscrow.id,
+              escrowId: escrow.id,
               refundId: ledgerRefundId,
-              type: 'cancellation_fee',
-              amount: cancellationFee.neg(),
-              balanceBefore: balanceBeforeFee,
+              type: 'refund',
+              amount: refundAmount.neg(),
+              balanceBefore: currentBalance,
               balanceAfter: runningBalance,
-              description: `Cancellation fee: ${cancellationFeePercentage * 100}%`,
+              description: `Refund processed: ${reason || 'No reason provided'}`,
               metadata: {
                 refundId,
+                razorpayRefundId: razorpayRefund.id,
+                originalAmount: capturedRupees.toString(),
+                escrowAmountInRupees: escrowAmountRupees.toString(),
+                refundAmount: refundAmount.toString(),
                 cancellationFee: cancellationFee.toString(),
-                cancellationFeePercentage: cancellationFeePercentage,
+                toOtherParty: toOtherParty.toString(),
+                toPlatform: toPlatform.toString(),
                 cancelledBy,
+                reason,
               },
             });
 
-            // Compensation to other party
-            if (toOtherParty.greaterThan(0)) {
-              const balanceBeforeComp = runningBalance;
-              runningBalance = runningBalance.sub(toOtherParty);
+            // 2-4. Cancellation fee entries (if applicable)
+            if (cancellationFee.greaterThan(0)) {
+              // Cancellation fee
+              const balanceBeforeFee = runningBalance;
+              runningBalance = runningBalance.sub(cancellationFee);
               ledgerEntries.push({
                 transactionId: generateTxId(),
-                escrowId: postgresEscrow.id,
+                escrowId: escrow.id,
                 refundId: ledgerRefundId,
-                type: 'compensation',
-                amount: toOtherParty.neg(),
-                balanceBefore: balanceBeforeComp,
+                type: 'cancellation_fee',
+                amount: cancellationFee.neg(),
+                balanceBefore: balanceBeforeFee,
                 balanceAfter: runningBalance,
-                description: `Compensation to ${cancelledBy === 'poster' ? 'performer' : 'poster'}`,
+                description: `Cancellation fee: ${cancellationFeePercentage * 100}%`,
                 metadata: {
                   refundId,
-                  toOtherParty: toOtherParty.toString(),
+                  cancellationFee: cancellationFee.toString(),
+                  cancellationFeePercentage: cancellationFeePercentage,
                   cancelledBy,
                 },
               });
+
+              // Compensation to other party
+              if (toOtherParty.greaterThan(0)) {
+                const balanceBeforeComp = runningBalance;
+                runningBalance = runningBalance.sub(toOtherParty);
+                ledgerEntries.push({
+                  transactionId: generateTxId(),
+                  escrowId: escrow.id,
+                  refundId: ledgerRefundId,
+                  type: 'compensation',
+                  amount: toOtherParty.neg(),
+                  balanceBefore: balanceBeforeComp,
+                  balanceAfter: runningBalance,
+                  description: `Compensation to ${cancelledBy === 'poster' ? 'performer' : 'poster'}`,
+                  metadata: {
+                    refundId,
+                    toOtherParty: toOtherParty.toString(),
+                    cancelledBy,
+                  },
+                });
+              }
+
+              // Platform fee
+              if (toPlatform.greaterThan(0)) {
+                const balanceBeforePlatform = runningBalance;
+                runningBalance = runningBalance.sub(toPlatform);
+                ledgerEntries.push({
+                  transactionId: generateTxId(),
+                  escrowId: escrow.id,
+                  refundId: ledgerRefundId,
+                  type: 'platform_fee',
+                  amount: toPlatform.neg(),
+                  balanceBefore: balanceBeforePlatform,
+                  balanceAfter: runningBalance,
+                  description: 'Platform cancellation fee',
+                  metadata: {
+                    refundId,
+                    toPlatform: toPlatform.toString(),
+                    cancelledBy,
+                  },
+                });
+              }
             }
 
-            // Platform fee
-            if (toPlatform.greaterThan(0)) {
-              const balanceBeforePlatform = runningBalance;
-              runningBalance = runningBalance.sub(toPlatform);
-              ledgerEntries.push({
-                transactionId: generateTxId(),
-                escrowId: postgresEscrow.id,
-                refundId: ledgerRefundId,
-                type: 'platform_fee',
-                amount: toPlatform.neg(),
-                balanceBefore: balanceBeforePlatform,
-                balanceAfter: runningBalance,
-                description: 'Platform cancellation fee',
-                metadata: {
-                  refundId,
-                  toPlatform: toPlatform.toString(),
-                  cancelledBy,
-                },
+            // Create all ledger entries in a single batch operation
+            if (ledgerEntries.length > 0) {
+              await tx.ledger.createMany({
+                data: ledgerEntries,
               });
             }
-          }
-
-          // Create all ledger entries in a single batch operation
-          if (ledgerEntries.length > 0) {
-            await tx.ledger.createMany({
-              data: ledgerEntries,
-            });
           }
 
           // Update refund status to 'completed'
@@ -479,22 +663,24 @@ export async function processRefund(params: {
         const { updateUserPaymentProfile } = await import('./userPaymentProfileService');
         
         // Poster gets refund
-        updateUserPaymentProfile(postgresEscrow.posterUid, {
-          type: 'refund',
-          amount: refundAmount,
-          refundId,
-          escrowId: postgresEscrow.id,
-        }).catch((error) => {
-          logger.warn('Failed to update UserPaymentProfile for refund (non-critical):', error);
-        });
+        if (escrow.posterUid) {
+          updateUserPaymentProfile(escrow.posterUid, {
+            type: 'refund',
+            amount: refundAmount,
+            refundId,
+            escrowId: isRealEscrow ? escrow.id : undefined,
+          }).catch((error) => {
+            logger.warn('Failed to update UserPaymentProfile for refund (non-critical):', error);
+          });
+        }
 
         // Performer gets compensation (if applicable)
-        if (toOtherParty.greaterThan(0) && postgresEscrow.performerUid) {
-          updateUserPaymentProfile(postgresEscrow.performerUid, {
+        if (toOtherParty.greaterThan(0) && escrow.performerUid) {
+          updateUserPaymentProfile(escrow.performerUid, {
             type: 'compensation',
             amount: toOtherParty,
             refundId,
-            escrowId: postgresEscrow.id,
+            escrowId: isRealEscrow ? escrow.id : undefined,
           }).catch((error) => {
             logger.warn('Failed to update UserPaymentProfile for compensation (non-critical):', error);
           });
@@ -512,18 +698,18 @@ export async function processRefund(params: {
 
       // Send refund initiated emails and notifications
       logger.info('Email trigger: refund_initiated', {
-        posterUid: postgresEscrow.posterUid,
+        posterUid: escrow.posterUid,
         refundAmount: refundAmount.toString(),
         cancellationFee: cancellationFee.toString(),
-        taskId: postgresEscrow.taskId,
+        taskId: escrow.taskId,
         reason,
       });
 
-      const taskTitle = (postgresEscrow.metadata as any)?.taskTitle || null;
-      const posterContact = await getProfileContact(postgresEscrow.posterUid);
+      const taskTitle = (escrow.metadata as any)?.taskTitle || null;
+      const posterContact = await getProfileContact(escrow.posterUid);
       logger.info('[RefundService.processRefund] Dispatching poster refund notification', {
-        posterUid: postgresEscrow.posterUid,
-        taskId: postgresEscrow.taskId,
+        posterUid: escrow.posterUid,
+        taskId: escrow.taskId,
         taskTitle,
         refundAmount: refundAmount.toString(),
         hasPosterEmail: Boolean(posterContact?.email),
@@ -532,17 +718,17 @@ export async function processRefund(params: {
       });
 
       notifyRefundInitiated({
-        posterUid: postgresEscrow.posterUid,
+        posterUid: escrow.posterUid,
         amount: refundAmount.toString(),
-        taskId: postgresEscrow.taskId,
+        taskId: escrow.taskId,
         taskTitle,
         reason,
         email: posterContact?.email || null,
         userName: posterContact?.name || null,
       }).catch((error) => {
         logger.warn('[RefundService.processRefund] Failed to send refund initiated notification', {
-          posterUid: postgresEscrow.posterUid,
-          taskId: postgresEscrow.taskId,
+          posterUid: escrow.posterUid,
+          taskId: escrow.taskId,
           error: error instanceof Error ? error.message : String(error),
         });
       });

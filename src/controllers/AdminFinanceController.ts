@@ -231,7 +231,20 @@ export class AdminFinanceController {
 
     // Use COUNT(*) OVER() window function — single round-trip, no separate COUNT query
     const query = buildEscrowQuery(where, limit, offset);
-    const raw: any[] = await targetPrisma.$queryRawUnsafe(query.sql, ...query.params);
+    let raw: any[] = await targetPrisma.$queryRawUnsafe(query.sql, ...query.params);
+
+    // If no transactions found in primary DB when searching specifically, fallback check in secondary DB (prismaDev)
+    if (raw.length === 0 && search && !useDevDb && prismaDev) {
+      try {
+        const devRaw: any[] = await prismaDev.$queryRawUnsafe(query.sql, ...query.params);
+        if (devRaw.length > 0) {
+          raw = devRaw;
+        }
+      } catch (err: any) {
+        logger.warn('Failed fallback search on secondary DB:', { message: err?.message });
+      }
+    }
+
     total = raw.length > 0 ? Number(raw[0]._total_count) : 0;
     // $queryRawUnsafe does not auto-parse JSONB — do it manually
     allRows = raw.map((r: any) => ({
@@ -247,6 +260,71 @@ export class AdminFinanceController {
     }
     // total is already correct from COUNT(*) OVER() — do NOT overwrite with allRows.length.
     // SQL already applied LIMIT/OFFSET so allRows is the correct page slice.
+
+    // Fallback: if Escrow table found nothing for a specific taskId search, also check the Transaction table.
+    // Book Now payments may only exist in Transaction (not Escrow) in some configurations.
+    if (allRows.length === 0 && search) {
+      try {
+        const txRows = await targetPrisma.transaction.findMany({
+          where: { taskId: search },
+          orderBy: { createdAt: 'desc' },
+          take: limit,
+        });
+        if (txRows.length === 0 && prismaDev && !useDevDb) {
+          try {
+            const devTxRows = await prismaDev.transaction.findMany({
+              where: { taskId: search },
+              orderBy: { createdAt: 'desc' },
+              take: limit,
+            });
+            if (devTxRows.length > 0) {
+              // Map Transaction rows into Escrow-like shape
+              allRows = devTxRows.map((tx: any) => ({
+                id: tx.id,
+                escrowId: tx.id,
+                razorpayOrderId: tx.razorpayOrderId,
+                razorpayPaymentId: tx.razorpayPaymentId,
+                taskId: tx.taskId,
+                posterUid: tx.userId,
+                performerUid: 'pending_assignment',
+                status: tx.status,
+                paymentStatus: tx.status,
+                amountInRupees: tx.amount,
+                taskAmount: tx.amount,
+                metadata: typeof tx.metadata === 'string' ? JSON.parse(tx.metadata) : (tx.metadata ?? null),
+                createdAt: tx.createdAt,
+                updatedAt: tx.updatedAt,
+                _total_count: devTxRows.length,
+              }));
+              total = devTxRows.length;
+            }
+          } catch (err: any) {
+            logger.warn('Fallback Transaction dev DB lookup failed:', { message: err?.message });
+          }
+        } else if (txRows.length > 0) {
+          allRows = txRows.map((tx: any) => ({
+            id: tx.id,
+            escrowId: tx.id,
+            razorpayOrderId: tx.razorpayOrderId,
+            razorpayPaymentId: tx.razorpayPaymentId,
+            taskId: tx.taskId,
+            posterUid: tx.userId,
+            performerUid: 'pending_assignment',
+            status: tx.status,
+            paymentStatus: tx.status,
+            amountInRupees: tx.amount,
+            taskAmount: tx.amount,
+            metadata: typeof tx.metadata === 'string' ? JSON.parse(tx.metadata) : (tx.metadata ?? null),
+            createdAt: tx.createdAt,
+            updatedAt: tx.updatedAt,
+            _total_count: txRows.length,
+          }));
+          total = txRows.length;
+        }
+      } catch (err: any) {
+        logger.warn('Fallback Transaction table lookup failed:', { message: err?.message });
+      }
+    }
 
     // Batch fetch payouts for these escrows (instead of per-row include subquery)
     let payoutByEscrowId = new Map<string, any>();
@@ -853,6 +931,10 @@ export class AdminFinanceController {
     const offset = parseOffset(req.query.offset);
     const search = typeof q === 'string' && q.trim() ? q.trim() : undefined;
 
+    const environment = typeof req.query.environment === 'string' ? req.query.environment : 'production';
+    const useDevDb = environment === 'development' && prismaDev != null;
+    const targetPrisma = useDevDb ? prismaDev! : prisma;
+
     const where: Prisma.RefundWhereInput = {};
     if (status && typeof status === 'string') {
       where.status = status;
@@ -868,35 +950,40 @@ export class AdminFinanceController {
       where.OR = [
         { refundId: { contains: search, mode: 'insensitive' } },
         { paymentId: { contains: search, mode: 'insensitive' } },
+        { taskId: { contains: search, mode: 'insensitive' } },
         { escrow: { taskId: { contains: search, mode: 'insensitive' } } },
+        { escrow: { posterUid: { contains: search, mode: 'insensitive' } } },
       ];
     }
+
+    const fetchLimit = search ? limit : (prismaDev && !useDevDb ? 2000 : limit);
+    const fetchSkip = search ? offset : (prismaDev && !useDevDb ? 0 : offset);
 
     let mainRefundTotal = 0;
     let refundRows: any[] = [];
 
     [mainRefundTotal, refundRows] = await Promise.all([
-      prisma.refund.count({ where }),
-      prisma.refund.findMany({
+      targetPrisma.refund.count({ where }),
+      targetPrisma.refund.findMany({
         where,
         orderBy: { createdAt: 'desc' },
-        take: prismaDev ? 2000 : limit,
-        skip: prismaDev ? 0 : offset,
+        take: fetchLimit,
+        skip: fetchSkip,
         include: { escrow: true },
       }),
     ]);
 
     let refundTotal = mainRefundTotal;
 
-    if (prismaDev) {
+    if (prismaDev && !useDevDb && (!search || refundRows.length === 0)) {
       try {
         const [devRefundTotal, devRefundRows] = await Promise.all([
           prismaDev.refund.count({ where }),
           prismaDev.refund.findMany({
             where,
             orderBy: { createdAt: 'desc' },
-            take: 2000,
-            skip: 0,
+            take: fetchLimit,
+            skip: fetchSkip,
             include: { escrow: true },
           }),
         ]);
@@ -904,35 +991,134 @@ export class AdminFinanceController {
         const uniqueDev = devRefundRows.filter((r: any) => !seen.has(r.refundId));
         refundRows = [...refundRows, ...uniqueDev];
         refundRows.sort((a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        refundTotal = refundRows.length;
       } catch (err: any) {
         logger.warn('Failed to query secondary DB for refunds:', { message: err?.message });
       }
     }
 
+    // Batch lookup Transaction and Escrow rows for refunds missing customer info
+    const taskIdsToLookup = [
+      ...new Set(
+        refundRows
+          .filter((r: any) => (!r.escrow?.posterUid) && r.taskId)
+          .map((r: any) => String(r.taskId).trim())
+      ),
+    ];
+    const txIdsToLookup = [
+      ...new Set(
+        refundRows
+          .filter((r: any) => (!r.escrow?.posterUid) && r.transactionId)
+          .map((r: any) => String(r.transactionId).trim())
+      ),
+    ];
+    const paymentIdsToLookup = [
+      ...new Set(
+        refundRows
+          .filter((r: any) => (!r.escrow?.posterUid) && r.paymentId)
+          .map((r: any) => String(r.paymentId).trim())
+      ),
+    ];
+
+    const txByTaskId = new Map<string, any>();
+    const txById = new Map<string, any>();
+    const txByPaymentId = new Map<string, any>();
+    const escrowByTaskId = new Map<string, any>();
+
+    if (taskIdsToLookup.length > 0 || txIdsToLookup.length > 0 || paymentIdsToLookup.length > 0) {
+      try {
+        const txConditions: any[] = [];
+        if (taskIdsToLookup.length > 0) txConditions.push({ taskId: { in: taskIdsToLookup } });
+        if (txIdsToLookup.length > 0) txConditions.push({ id: { in: txIdsToLookup } });
+        if (paymentIdsToLookup.length > 0) txConditions.push({ razorpayPaymentId: { in: paymentIdsToLookup } });
+
+        const [txList, escrowList] = await Promise.all([
+          txConditions.length > 0
+            ? targetPrisma.transaction.findMany({ where: { OR: txConditions } })
+            : Promise.resolve([]),
+          taskIdsToLookup.length > 0
+            ? targetPrisma.escrow.findMany({ where: { taskId: { in: taskIdsToLookup } } })
+            : Promise.resolve([]),
+        ]);
+
+        txList.forEach((tx: any) => {
+          if (tx.taskId && !txByTaskId.has(tx.taskId)) txByTaskId.set(tx.taskId, tx);
+          if (tx.id && !txById.has(tx.id)) txById.set(tx.id, tx);
+          if (tx.razorpayPaymentId && !txByPaymentId.has(tx.razorpayPaymentId)) txByPaymentId.set(tx.razorpayPaymentId, tx);
+        });
+
+        escrowList.forEach((es: any) => {
+          if (es.taskId && !escrowByTaskId.has(es.taskId)) escrowByTaskId.set(es.taskId, es);
+        });
+
+        if (prismaDev && !useDevDb) {
+          const stillMissingTaskIds = taskIdsToLookup.filter((tid: string) => !txByTaskId.has(tid) && !escrowByTaskId.has(tid));
+          if (stillMissingTaskIds.length > 0) {
+            try {
+              const [devTxList, devEscrowList] = await Promise.all([
+                prismaDev.transaction.findMany({ where: { taskId: { in: stillMissingTaskIds } } }),
+                prismaDev.escrow.findMany({ where: { taskId: { in: stillMissingTaskIds } } }),
+              ]);
+              devTxList.forEach((tx: any) => {
+                if (tx.taskId && !txByTaskId.has(tx.taskId)) txByTaskId.set(tx.taskId, tx);
+                if (tx.id && !txById.has(tx.id)) txById.set(tx.id, tx);
+              });
+              devEscrowList.forEach((es: any) => {
+                if (es.taskId && !escrowByTaskId.has(es.taskId)) escrowByTaskId.set(es.taskId, es);
+              });
+            } catch { /* ignore */ }
+          }
+        }
+      } catch (err: any) {
+        logger.warn('Failed to batch lookup transactions/escrows for refunds:', { message: err?.message });
+      }
+    }
+
     // Apply transactionType filter in JS (avoids Prisma JSONB NOT null-propagation bug)
     if (transactionType === 'real') {
-      refundRows = refundRows.filter((r: any) => !isTeamTest(r.escrow?.metadata));
+      refundRows = refundRows.filter((r: any) => {
+        const linkedTx = (r.taskId && txByTaskId.get(r.taskId)) || (r.transactionId && txById.get(r.transactionId));
+        const meta = r.escrow?.metadata || linkedTx?.metadata;
+        return !isTeamTest(meta);
+      });
     } else if (transactionType === 'team') {
-      refundRows = refundRows.filter((r: any) => isTeamTest(r.escrow?.metadata));
+      refundRows = refundRows.filter((r: any) => {
+        const linkedTx = (r.taskId && txByTaskId.get(r.taskId)) || (r.transactionId && txById.get(r.transactionId));
+        const meta = r.escrow?.metadata || linkedTx?.metadata;
+        return isTeamTest(meta);
+      });
     }
+
     refundTotal = refundRows.length;
-    refundRows = refundRows.slice(offset, offset + limit);
+    if (prismaDev && !useDevDb) {
+      refundRows = refundRows.slice(offset, offset + limit);
+    }
 
     const data = refundRows.map((row: any) => {
-      // Read teamTest from the linked Escrow metadata (mirrors pay-ins/transactions approach)
-      const escrowMeta =
-        row.escrow?.metadata && typeof row.escrow.metadata === 'object'
-          ? (row.escrow.metadata as Record<string, unknown>)
-          : {};
+      const linkedTx =
+        (row.taskId && txByTaskId.get(row.taskId)) ||
+        (row.transactionId && txById.get(row.transactionId)) ||
+        (row.paymentId && txByPaymentId.get(row.paymentId));
+      const linkedEscrow = row.escrow || (row.taskId && escrowByTaskId.get(row.taskId));
+      const resolvedCustomerUid = linkedEscrow?.posterUid || linkedTx?.userId || null;
+      const resolvedPerformerUid = linkedEscrow?.performerUid || null;
+      const metadata =
+        (linkedEscrow?.metadata && typeof linkedEscrow.metadata === 'object' ? linkedEscrow.metadata : {}) ||
+        (linkedTx?.metadata && typeof linkedTx.metadata === 'object' ? linkedTx.metadata : {});
+
       return {
+        id: row.id || row.refundId,
         refundId: row.refundId,
-        taskId: row.taskId,
-        CustomerUid: row.escrow?.posterUid,
-        performerUid: row.escrow?.performerUid,
+        paymentId: row.paymentId,
+        taskId: row.taskId || linkedEscrow?.taskId || linkedTx?.taskId || null,
+        transactionId: row.transactionId || linkedTx?.id || null,
+        escrowId: row.escrowId || linkedEscrow?.id || null,
+        CustomerUid: resolvedCustomerUid,
+        performerUid: resolvedPerformerUid,
         refundAmount: toStringValue(row.refundAmount),
         status: row.status,
         createdAt: row.createdAt,
-        teamTest: escrowMeta.teamTest === true,
+        teamTest: metadata.teamTest === true,
       };
     });
 

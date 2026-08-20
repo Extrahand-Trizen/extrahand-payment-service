@@ -11,6 +11,7 @@ export class RefundController {
     const {
       razorpayOrderId,
       razorpayPaymentId,
+      taskId,
       reason,
       cancelledBy,
       taskStartDate,
@@ -21,9 +22,9 @@ export class RefundController {
       feeBaseAmount,
     } = req.body;
 
-    // Validate required fields
-    if (!razorpayOrderId || !razorpayPaymentId) {
-      throw new BadRequestError('razorpayOrderId and razorpayPaymentId are required');
+    // Validate required fields — allow taskId alone as fallback
+    if (!razorpayOrderId && !taskId) {
+      throw new BadRequestError('razorpayOrderId or taskId is required');
     }
 
     if (!cancelledBy || !['poster', 'performer'].includes(cancelledBy)) {
@@ -46,8 +47,9 @@ export class RefundController {
       feeBaseAmount != null && feeBaseAmount !== '' ? Number(feeBaseAmount) : NaN;
 
     const result = await processRefund({
-      razorpayOrderId,
-      razorpayPaymentId,
+      razorpayOrderId: razorpayOrderId || '',
+      razorpayPaymentId: razorpayPaymentId || '',
+      taskId,
       reason,
       cancelledBy,
       taskStartDate: taskStart,

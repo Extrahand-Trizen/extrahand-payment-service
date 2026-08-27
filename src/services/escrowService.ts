@@ -1671,6 +1671,20 @@ export async function resolveEscrowRecordForTaskId(taskId: string) {
   // then look up escrow by that bookingOrderId.
   try {
     if (mongoose.connection.readyState === 1) {
+      const bookingItems = mongoose.connection.collection('bookingitems');
+      const itemQuery: Record<string, unknown>[] = [{ taskId: trimmed }];
+      if (mongoose.Types.ObjectId.isValid(trimmed)) {
+        itemQuery.push({ taskId: new mongoose.Types.ObjectId(trimmed) });
+      }
+      const item = await bookingItems.findOne(
+        { $or: itemQuery },
+        { projection: { orderId: 1 } },
+      );
+      if (item?.orderId) {
+        const byBookingItemOrder = await findEscrowByBookingOrderId(String(item.orderId));
+        if (byBookingItemOrder) return byBookingItemOrder;
+      }
+
       const bookingOrders = mongoose.connection.collection('bookingorders');
       const order = await bookingOrders.findOne(
         { 'pendingLines.taskId': trimmed },

@@ -61,7 +61,7 @@ export class RefundController {
     });
 
     if (!result.success) {
-      throw new Error(result.error || 'Failed to process refund');
+      throw new BadRequestError(result.error || 'Failed to process refund');
     }
 
     res.json({

@@ -255,9 +255,24 @@ export const createRefund = async (paymentId: string, amountInRupees?: number) =
     return { success: true, refund };
   } catch (error: any) {
     logger.error('Error creating refund:', error);
-    return { success: false, error: error.message };
+    return { success: false, error: getRefundErrorMessage(error) };
   }
 };
+
+function getRefundErrorMessage(error: any): string {
+  const razorpayError = error?.error || error?.response?.data?.error || error?.response?.data;
+  const message = [
+    razorpayError?.description,
+    razorpayError?.message,
+    error?.message,
+  ].find((value): value is string => typeof value === 'string' && Boolean(value.trim()));
+
+  if (message && /insufficient\s+(?:funds|balance)|not enough\s+funds/i.test(message)) {
+    return 'Insufficient balance in Razorpay account';
+  }
+
+  return message || 'Failed to create Razorpay refund';
+}
 
 /** Internal: refund an exact amount in paise (partial or full capture). */
 export const createRefundAmountPaise = async (paymentId: string, amountInPaise: number) => {
@@ -271,6 +286,6 @@ export const createRefundAmountPaise = async (paymentId: string, amountInPaise: 
     return { success: true as const, refund };
   } catch (error: any) {
     logger.error('Error creating refund:', error);
-    return { success: false as const, error: error.message };
+    return { success: false as const, error: getRefundErrorMessage(error) };
   }
 };

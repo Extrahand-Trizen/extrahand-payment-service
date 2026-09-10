@@ -886,6 +886,8 @@ export async function processTaskCompletionPayout(params: {
   requestedCoinRedeemRupees?: number;
   /** Recurring visit id when paying out a per-visit child task. */
   visitId?: string;
+  source?: string;
+  isQuickCommerce?: boolean;
 }): Promise<{
   success: boolean;
   payout?: any;
@@ -900,6 +902,8 @@ export async function processTaskCompletionPayout(params: {
     enqueueOnMissingBank: params.enqueueOnMissingBank,
     useExtraCoins: params.useExtraCoins,
     visitId: params.visitId,
+    source: params.source,
+    isQuickCommerce: params.isQuickCommerce,
     hasUserId: !!params.userId,
   });
   try {
@@ -912,6 +916,8 @@ export async function processTaskCompletionPayout(params: {
       useExtraCoins = false,
       requestedCoinRedeemRupees,
       visitId,
+      source,
+      isQuickCommerce,
     } = params;
 
     logger.info('[PAYOUT_DEBUG] processTaskCompletionPayout called', {
@@ -1159,123 +1165,144 @@ export async function processTaskCompletionPayout(params: {
       });
     }
 
-    if (!taskEscrow) {
-      logger.error('[PAYOUT_DEBUG] FAILED - Escrow not found', {
-        taskId,
-        performerUid,
-        trimmedVisitId: trimmedVisitId || 'none',
-      });
-      return {
-        success: false,
-        error: 'Escrow not found for this task. Payout cannot be processed.',
-      };
-    }
-
-    logger.info('[PAYOUT_DEBUG] Escrow found', {
-      escrowId: taskEscrow.id,
-      escrowStatus: taskEscrow.status,
-      amountInRupees: taskEscrow.amountInRupees?.toString(),
-      performerUid_inEscrow: taskEscrow.performerUid,
-      bookingMode: (taskEscrow.metadata as any)?.bookingMode,
-      bookingOrderId: taskEscrow.bookingOrderId,
-      taskId_inEscrow: taskEscrow.taskId,
-      resolvedBy: trimmedVisitId ? 'direct_taskId_visit' : 'resolveEscrowRecordForTaskId',
-    });
-
-    if (String(taskEscrow.status || '').toLowerCase() !== 'held') {
-      logger.error('[PAYOUT_DEBUG] FAILED - Escrow not in held status', {
-        taskId,
-        escrowId: taskEscrow.id,
-        actualStatus: taskEscrow.status,
-      });
-      return {
-        success: false,
-        error: 'Payout cannot be processed for the current escrow state.',
-      };
-    }
-
-    let grossAmount = resolveEscrowTaskAmountForPayout(taskEscrow, amount).toDecimalPlaces(2);
-    const clientAmount = new Prisma.Decimal(String(amount || '0')).toDecimalPlaces(2);
-    if (trimmedVisitId && clientAmount.gt(0) && clientAmount.gt(grossAmount)) {
-      logger.warn('[payoutService] Recurring visit payout base raised from client visit budget', {
-        taskId,
-        visitId: trimmedVisitId,
-        escrowResolvedAmount: grossAmount.toString(),
-        clientAmount: clientAmount.toString(),
-        escrowId: taskEscrow?.escrowId,
-      });
-      grossAmount = clientAmount;
-    }
-    if (grossAmount.lte(0)) {
-      return { success: false, error: 'Invalid payout amount for this task' };
-    }
-
-    if (
-      taskEscrow &&
-      new Prisma.Decimal(amount.toString()).toDecimalPlaces(2).lessThan(grossAmount)
-    ) {
-      logger.info('[payoutService] Using escrow task amount for payout (client amount was lower)', {
-        taskId,
-        visitId: trimmedVisitId || undefined,
-        clientAmount: amount,
-        escrowTaskAmount: grossAmount.toString(),
-        escrowId: taskEscrow.escrowId,
-      });
-    }
-
-    const escrowMeta =
-      taskEscrow?.metadata &&
-      typeof taskEscrow.metadata === 'object' &&
-      !Array.isArray(taskEscrow.metadata)
-        ? (taskEscrow.metadata as Record<string, unknown>)
-        : {};
-
-    const isBookNowPayout =
-      isBookNowFromMetadata(escrowMeta) ||
-      Boolean(
-        taskEscrow &&
-          (typeof (taskEscrow as { bookingOrderId?: string | null }).bookingOrderId === 'string'
-            ? String((taskEscrow as { bookingOrderId?: string | null }).bookingOrderId).trim()
-            : ''),
-      );
-    const partnerVisibleAt = resolvePartnerVisibleAt({ isBookNow: isBookNowPayout });
-
-    const escrowTaskCategory = resolveEscrowCategoryFeeConfigKey({
-      taskCategory: taskEscrow?.taskCategory,
-      categorySlug:
-        typeof escrowMeta.categorySlug === 'string' ? escrowMeta.categorySlug : undefined,
-      catalogId: typeof escrowMeta.catalogId === 'string' ? escrowMeta.catalogId : undefined,
-      metadata: escrowMeta,
-    });
-
-    const resolvedFees = await resolveBiddingPayoutFeePercents({
-      taskCategory: taskEscrow?.taskCategory,
-      categorySlug:
-        typeof escrowMeta.categorySlug === 'string' ? escrowMeta.categorySlug : undefined,
-      catalogId: typeof escrowMeta.catalogId === 'string' ? escrowMeta.catalogId : undefined,
-      metadata: escrowMeta,
-    });
-    const feeStructure = {
+    let grossAmount: Prisma.Decimal;
+    let escrowMeta: Record<string, unknown> = {};
+    let isBookNowPayout = isQuickCommerce === true || source === 'quick_commerce';
+    let partnerVisibleAt: Date | null = null;
+    let platformCommission = new Prisma.Decimal('0.00');
+    let gstOnCommission = new Prisma.Decimal('0.00');
+    let platformFeeTotal = new Prisma.Decimal('0.00');
+    let feeStructure = {
       platformFee: {
-        percentage: resolvedFees.platformFeePercentage,
-        gstPercentage: resolvedFees.gstPercentage,
+        percentage: 0,
+        gstPercentage: 0,
       },
     };
 
-    logger.debug('[payoutService] Resolved bidding payout fee structure', {
-      taskId,
-      escrowId: taskEscrow?.escrowId,
-      categoryFeeKey: escrowTaskCategory ?? 'default',
-      platformFeePercentage: feeStructure.platformFee.percentage,
-      gstPercentage: feeStructure.platformFee.gstPercentage,
-    });
-    const platformCommission = grossAmount
-      .mul(feeStructure.platformFee.percentage)
-      .toDecimalPlaces(2);
-    const gstOnCommission = platformCommission
-      .mul(feeStructure.platformFee.gstPercentage)
-      .toDecimalPlaces(2);
-    const platformFeeTotal = platformCommission.add(gstOnCommission).toDecimalPlaces(2);
+    if (taskEscrow) {
+      logger.info('[PAYOUT_DEBUG] Escrow found', {
+        escrowId: taskEscrow.id,
+        escrowStatus: taskEscrow.status,
+        amountInRupees: taskEscrow.amountInRupees?.toString(),
+        performerUid_inEscrow: taskEscrow.performerUid,
+        bookingMode: (taskEscrow.metadata as any)?.bookingMode,
+        bookingOrderId: taskEscrow.bookingOrderId,
+        taskId_inEscrow: taskEscrow.taskId,
+        resolvedBy: trimmedVisitId ? 'direct_taskId_visit' : 'resolveEscrowRecordForTaskId',
+      });
+
+      if (String(taskEscrow.status || '').toLowerCase() !== 'held') {
+        logger.error('[PAYOUT_DEBUG] FAILED - Escrow not in held status', {
+          taskId,
+          escrowId: taskEscrow.id,
+          actualStatus: taskEscrow.status,
+        });
+        return {
+          success: false,
+          error: 'Payout cannot be processed for the current escrow state.',
+        };
+      }
+
+      grossAmount = resolveEscrowTaskAmountForPayout(taskEscrow, amount).toDecimalPlaces(2);
+      const clientAmount = new Prisma.Decimal(String(amount || '0')).toDecimalPlaces(2);
+      if (trimmedVisitId && clientAmount.gt(0) && clientAmount.gt(grossAmount)) {
+        logger.warn('[payoutService] Recurring visit payout base raised from client visit budget', {
+          taskId,
+          visitId: trimmedVisitId,
+          escrowResolvedAmount: grossAmount.toString(),
+          clientAmount: clientAmount.toString(),
+          escrowId: taskEscrow?.escrowId,
+        });
+        grossAmount = clientAmount;
+      }
+      if (grossAmount.lte(0)) {
+        return { success: false, error: 'Invalid payout amount for this task' };
+      }
+
+      if (
+        taskEscrow &&
+        new Prisma.Decimal(amount.toString()).toDecimalPlaces(2).lessThan(grossAmount)
+      ) {
+        logger.info('[payoutService] Using escrow task amount for payout (client amount was lower)', {
+          taskId,
+          visitId: trimmedVisitId || undefined,
+          clientAmount: amount,
+          escrowTaskAmount: grossAmount.toString(),
+          escrowId: taskEscrow.escrowId,
+        });
+      }
+
+      escrowMeta =
+        taskEscrow?.metadata &&
+        typeof taskEscrow.metadata === 'object' &&
+        !Array.isArray(taskEscrow.metadata)
+          ? (taskEscrow.metadata as Record<string, unknown>)
+          : {};
+
+      isBookNowPayout =
+        isBookNowFromMetadata(escrowMeta) ||
+        Boolean(
+          taskEscrow &&
+            (typeof (taskEscrow as { bookingOrderId?: string | null }).bookingOrderId === 'string'
+              ? String((taskEscrow as { bookingOrderId?: string | null }).bookingOrderId).trim()
+              : ''),
+        );
+      partnerVisibleAt = resolvePartnerVisibleAt({ isBookNow: isBookNowPayout });
+
+      const escrowTaskCategory = resolveEscrowCategoryFeeConfigKey({
+        taskCategory: taskEscrow?.taskCategory,
+        categorySlug:
+          typeof escrowMeta.categorySlug === 'string' ? escrowMeta.categorySlug : undefined,
+        catalogId: typeof escrowMeta.catalogId === 'string' ? escrowMeta.catalogId : undefined,
+        metadata: escrowMeta,
+      });
+
+      const resolvedFees = await resolveBiddingPayoutFeePercents({
+        taskCategory: taskEscrow?.taskCategory,
+        categorySlug:
+          typeof escrowMeta.categorySlug === 'string' ? escrowMeta.categorySlug : undefined,
+        catalogId: typeof escrowMeta.catalogId === 'string' ? escrowMeta.catalogId : undefined,
+        metadata: escrowMeta,
+      });
+      feeStructure = {
+        platformFee: {
+          percentage: resolvedFees.platformFeePercentage,
+          gstPercentage: resolvedFees.gstPercentage,
+        },
+      };
+
+      logger.debug('[payoutService] Resolved bidding payout fee structure', {
+        taskId,
+        escrowId: taskEscrow?.escrowId,
+        categoryFeeKey: escrowTaskCategory ?? 'default',
+        platformFeePercentage: feeStructure.platformFee.percentage,
+        gstPercentage: feeStructure.platformFee.gstPercentage,
+      });
+      platformCommission = grossAmount
+        .mul(feeStructure.platformFee.percentage)
+        .toDecimalPlaces(2);
+      gstOnCommission = platformCommission
+        .mul(feeStructure.platformFee.gstPercentage)
+        .toDecimalPlaces(2);
+      platformFeeTotal = platformCommission.add(gstOnCommission).toDecimalPlaces(2);
+    } else {
+      // Direct payout / Quick Commerce: no escrow record in payment-service
+      grossAmount = new Prisma.Decimal(String(amount || '0')).toDecimalPlaces(2);
+      if (grossAmount.lte(0)) {
+        return { success: false, error: 'Invalid payout amount for this task' };
+      }
+      isBookNowPayout = false;
+      partnerVisibleAt = null; // Immediately visible on partner's earnings page
+      platformCommission = new Prisma.Decimal('0.00');
+      gstOnCommission = new Prisma.Decimal('0.00');
+      platformFeeTotal = new Prisma.Decimal('0.00');
+      logger.info('[PAYOUT_DEBUG] Processing direct payout without escrow', {
+        taskId,
+        performerUid,
+        grossAmount: grossAmount.toString(),
+        source: source || 'direct',
+      });
+    }
     const coinCaps = await CoinUsageConfigProvider.getCapPercents();
     const taskerCapPercent = paymentRewardsFlags.TASKER_PLATFORM_FEE_COIN_CAP_ENABLED
       ? coinCaps.taskerPlatformFee.toFixed(4)
@@ -1489,17 +1516,19 @@ export async function processTaskCompletionPayout(params: {
       status = 'completed';
 
       await prisma.$transaction(async (tx) => {
-        const claimed = await tx.escrow.updateMany({
-          where: { id: taskEscrow!.id, status: 'held' },
-          data: { status: 'released', releasedAt: new Date() },
-        });
-        if (claimed.count === 0) {
-          throw new Error('Payout cannot be processed for the current escrow state.');
+        if (taskEscrow) {
+          const claimed = await tx.escrow.updateMany({
+            where: { id: taskEscrow.id, status: 'held' },
+            data: { status: 'released', releasedAt: new Date() },
+          });
+          if (claimed.count === 0) {
+            throw new Error('Payout cannot be processed for the current escrow state.');
+          }
         }
         await tx.payout.create({
           data: {
             payoutId,
-            escrowId: taskEscrow!.id,
+            escrowId: taskEscrow?.id ?? null,
             performerUid,
             amount: grossAmount,
             netAmount,
@@ -1546,12 +1575,14 @@ export async function processTaskCompletionPayout(params: {
       };
 
       await prisma.$transaction(async (tx) => {
-        const claimed = await tx.escrow.updateMany({
-          where: { id: taskEscrow!.id, status: 'held' },
-          data: { status: 'released', releasedAt: new Date() },
-        });
-        if (claimed.count === 0) {
-          throw new Error('Payout cannot be processed for the current escrow state.');
+        if (taskEscrow) {
+          const claimed = await tx.escrow.updateMany({
+            where: { id: taskEscrow.id, status: 'held' },
+            data: { status: 'released', releasedAt: new Date() },
+          });
+          if (claimed.count === 0) {
+            throw new Error('Payout cannot be processed for the current escrow state.');
+          }
         }
         await tx.payout.create({
           data: {
@@ -1566,7 +1597,7 @@ export async function processTaskCompletionPayout(params: {
             tds,
             bankTransferId: null,
             status,
-            source: 'task_completion',
+            source: source || (isQuickCommerce ? 'quick_commerce' : 'task_completion'),
             type: 'task_completion',
             description: duplicateDescription,
             partnerVisibleAt: partnerVisibleAt ?? undefined,
@@ -1594,15 +1625,17 @@ export async function processTaskCompletionPayout(params: {
         };
       }
 
-      const claimedEscrow = await prisma.escrow.updateMany({
-        where: { id: taskEscrow!.id, status: 'held' },
-        data: { status: 'released', releasedAt: new Date() },
-      });
-      if (claimedEscrow.count === 0) {
-        return {
-          success: false,
-          error: 'Payout cannot be processed for the current escrow state.',
-        };
+      if (taskEscrow) {
+        const claimedEscrow = await prisma.escrow.updateMany({
+          where: { id: taskEscrow.id, status: 'held' },
+          data: { status: 'released', releasedAt: new Date() },
+        });
+        if (claimedEscrow.count === 0) {
+          return {
+            success: false,
+            error: 'Payout cannot be processed for the current escrow state.',
+          };
+        }
       }
 
       logger.debug('[payoutService] Creating RazorpayX payout with penalty deduction applied', {
@@ -1619,7 +1652,7 @@ export async function processTaskCompletionPayout(params: {
 
       status = mapRazorpayPayoutStatusToInternal(payoutResponse.status);
       const completedAt = status === 'completed' ? new Date() : null;
-      const postgresEscrowId = taskEscrow!.id;
+      const postgresEscrowId = taskEscrow?.id ?? null;
 
       if (status === 'completed' && penaltyPlan.lines.length > 0) {
         await prisma.$transaction(async (tx) => {

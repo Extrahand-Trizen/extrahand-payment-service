@@ -77,6 +77,8 @@ export class PayoutController {
       useExtraCoins,
       requestedCoinRedeemRupees,
       visitId,
+      source,
+      isQuickCommerce,
     } = req.body;
 
     if (!taskId || !performerUid || !amount) {
@@ -99,6 +101,8 @@ export class PayoutController {
       requestedCoinRedeemRupees:
         requestedCoinRedeemRupees != null ? Number(requestedCoinRedeemRupees) : undefined,
       visitId: typeof visitId === 'string' ? visitId : undefined,
+      source: typeof source === 'string' ? source : undefined,
+      isQuickCommerce: isQuickCommerce === true,
     });
 
     if (!result.success) {

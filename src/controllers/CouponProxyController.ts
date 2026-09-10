@@ -58,13 +58,17 @@ export async function validateCoupon(req: Request, res: Response): Promise<void>
   const couponCode = String(req.body?.couponCode || '').trim();
   const flowTypeRaw = String(req.body?.flowType || '').toUpperCase();
   const flowType =
-    flowTypeRaw === 'BOOK_NOW' || flowTypeRaw === 'POST_COMPARE'
+    flowTypeRaw === 'BOOK_NOW' ||
+    flowTypeRaw === 'POST_COMPARE' ||
+    flowTypeRaw === 'QUICK_COMMERCE'
       ? flowTypeRaw
       : null;
   const amount = Number(req.body?.amount);
 
   if (!couponCode) throw new BadRequestError('couponCode is required');
-  if (!flowType) throw new BadRequestError('flowType must be BOOK_NOW or POST_COMPARE');
+  if (!flowType) {
+    throw new BadRequestError('flowType must be BOOK_NOW, POST_COMPARE, or QUICK_COMMERCE');
+  }
   if (!(amount > 0)) throw new BadRequestError('amount must be a positive number');
 
   const result = await CouponClient.validate({
@@ -118,12 +122,16 @@ export async function listEligibleCoupons(req: Request, res: Response): Promise<
 
   const flowTypeRaw = String(req.body?.flowType || '').toUpperCase();
   const flowType =
-    flowTypeRaw === 'BOOK_NOW' || flowTypeRaw === 'POST_COMPARE'
+    flowTypeRaw === 'BOOK_NOW' ||
+    flowTypeRaw === 'POST_COMPARE' ||
+    flowTypeRaw === 'QUICK_COMMERCE'
       ? flowTypeRaw
       : null;
   const amount = Number(req.body?.amount);
 
-  if (!flowType) throw new BadRequestError('flowType must be BOOK_NOW or POST_COMPARE');
+  if (!flowType) {
+    throw new BadRequestError('flowType must be BOOK_NOW, POST_COMPARE, or QUICK_COMMERCE');
+  }
   if (!(amount > 0)) throw new BadRequestError('amount must be a positive number');
 
   const result = await CouponClient.listEligible({

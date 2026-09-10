@@ -5,6 +5,7 @@ import {
   getOrderDetails,
   getPaymentDetails,
   createRefund,
+  createRefundAmountPaise,
 } from '../services/paymentService';
 import { updateEscrowOnPaymentCapture } from '../services/escrowService';
 import {
@@ -165,6 +166,44 @@ export class PaymentController {
   }
 
   /**
+   * POST /api/v1/payment/verify-signature
+   * Service-authenticated verification for payments that do not use task escrow
+   * (for example Quick Commerce orders).
+   */
+  static async verifySignatureOnly(req: Request, res: Response): Promise<void> {
+    const {
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+    } = req.body;
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      throw new BadRequestError('Missing required parameters');
+    }
+
+    const result = verifyPaymentSignature(
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+    );
+    if (!result.success) {
+      throw new BadRequestError(
+        result.message || result.error || 'Payment verification failed',
+      );
+    }
+
+    const paymentResult = await getPaymentDetails(razorpay_payment_id);
+    if (!paymentResult.success) {
+      throw new BadRequestError(paymentResult.error || 'Payment not found');
+    }
+    const paymentOrderId = String(paymentResult.payment?.order_id || '');
+    if (paymentOrderId && paymentOrderId !== razorpay_order_id) {
+      throw new BadRequestError('Payment does not belong to this order');
+    }
+
+    res.json({ success: true, message: result.message });
+  }
+
+  /**
    * GET /api/v1/payment/order-status/:orderId
    */
   static async getOrderStatus(req: Request, res: Response): Promise<void> {
@@ -211,13 +250,22 @@ export class PaymentController {
    * POST /api/v1/payment/refund
    */
   static async createRefund(req: Request, res: Response): Promise<void> {
-    const { paymentId, amount } = req.body;
+    const {
+      paymentId: rawPaymentId,
+      razorpay_payment_id,
+      amount,
+      amountPaise,
+    } = req.body;
+    const paymentId = rawPaymentId || razorpay_payment_id;
 
     if (!paymentId) {
       throw new BadRequestError('Payment ID is required');
     }
 
-    const result = await createRefund(paymentId, amount);
+    const result =
+      amountPaise != null
+        ? await createRefundAmountPaise(paymentId, Number(amountPaise))
+        : await createRefund(paymentId, amount);
 
     if (!result.success) {
       throw new Error(result.error || 'Failed to create refund');
@@ -226,6 +274,7 @@ export class PaymentController {
     res.json({
       success: true,
       refund: result.refund,
+      refundId: result.refund?.id,
     });
   }
 

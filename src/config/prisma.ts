@@ -1,3 +1,4 @@
+import dns from 'node:dns';
 import { Pool } from 'pg';
 import { PrismaClient } from '@prisma/client';
 import { PrismaPg } from '@prisma/adapter-pg';
@@ -9,6 +10,8 @@ const env = validateEnv();
 // Prisma Client singleton instance
 let prismaInstance: PrismaClient | null = null;
 let pgPool: Pool | null = null;
+/** Neon hostname kept for TLS SNI when we connect via resolved IP */
+let neonSslServername: string | undefined;
 
 function safeDbHost(connectionString: string): string {
   try {
@@ -49,6 +52,7 @@ export function formatPgError(error: unknown): {
  * - Add pgbouncer=true on *-pooler* hosts (Neon transaction pooler)
  * - uselibpqcompat=true so sslmode=require is NOT treated as verify-full (pg 8.16+)
  * - Ensure connect_timeout so cold starts don't fail instantly
+ * - Neon endpoint= option when connecting by IP (SNI bypass / broken local DNS)
  */
 function normalizePostgresUri(raw: string): string {
   try {
@@ -76,6 +80,92 @@ function normalizePostgresUri(raw: string): string {
 }
 
 /**
+ * `pg` uses getaddrinfo (OS DNS). dns.setServers() does NOT affect it.
+ * Some local networks refuse Neon hostnames → ENOTFOUND even though TCP to Neon IPs works.
+ * Resolve via public DNS, then connect by IP + Neon endpoint id + TLS servername.
+ */
+async function resolveNeonUriForBrokenLocalDns(raw: string): Promise<{
+  connectionString: string;
+  sslServername?: string;
+}> {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return { connectionString: raw };
+  }
+
+  if (!url.hostname.includes('neon.tech')) {
+    return { connectionString: raw };
+  }
+
+  const hostname = url.hostname;
+  const endpointId = hostname.split('.')[0];
+  const resolver = new dns.promises.Resolver();
+  resolver.setServers(['8.8.8.8', '1.1.1.1', '8.8.4.4']);
+
+  try {
+    const ips = await resolver.resolve4(hostname);
+    const ip = ips[0];
+    if (!ip) {
+      return { connectionString: raw };
+    }
+
+    url.hostname = ip;
+    // Required when host is an IP (Neon routes by endpoint id)
+    url.searchParams.set('options', `endpoint=${endpointId}`);
+
+    logger.info(`Neon DNS bypass (public resolver): ${hostname} → ${ip}`);
+    return {
+      connectionString: url.toString(),
+      sslServername: hostname,
+    };
+  } catch (error: unknown) {
+    logger.warn('Neon public-DNS resolve failed; using hostname as-is', formatPgError(error));
+    return { connectionString: raw };
+  }
+}
+
+function createPrismaClient(
+  connectionString: string,
+  sslServername?: string,
+): PrismaClient {
+  const normalizedUri = normalizePostgresUri(connectionString);
+  neonSslServername = sslServername;
+
+  pgPool = new Pool({
+    connectionString: normalizedUri,
+    max: 5,
+    idleTimeoutMillis: 20_000,
+    connectionTimeoutMillis: 30_000,
+    allowExitOnIdle: true,
+    ssl: {
+      rejectUnauthorized: false,
+      ...(sslServername ? { servername: sslServername } : {}),
+    },
+  });
+  pgPool.on('error', (err) => {
+    const formatted = formatPgError(err);
+    logger.error('Unexpected Postgres pool error', formatted);
+  });
+
+  const adapter = new PrismaPg(pgPool);
+
+  prismaInstance = new PrismaClient({
+    adapter,
+    log: env.NODE_ENV === 'development' ? ['error', 'warn'] : ['error'],
+  });
+
+  const target = env.USE_DEV_POSTGRES ? 'DEV' : 'PROD';
+  const displayHost = sslServername || safeDbHost(normalizedUri);
+  logger.info(
+    `✅ Prisma Client initialized (${target}) → ${displayHost} (pool max=5, connectTimeout=30s, ssl=neon)`,
+  );
+
+  return prismaInstance;
+}
+
+/**
  * Get or create the single Prisma Client for this process.
  * Target DB is selected by USE_DEV_POSTGRES:
  * - true  → DEV_POSTGRESDB_URI
@@ -91,41 +181,25 @@ function getPrismaClient(): PrismaClient {
       throw new Error('POSTGRESDB_URI is required for Prisma Client');
     }
 
-    const normalizedUri = normalizePostgresUri(connectionString);
-
-    // Explicit pool: Neon pooler + Payments fan-out (summary/bank/wallet/earnings)
-    // needs longer connect timeout and a small max to avoid exhausting free-tier slots.
-    // ssl.rejectUnauthorized=false: Neon TLS works without shipping root CAs in the image.
-    pgPool = new Pool({
-      connectionString: normalizedUri,
-      max: 5,
-      idleTimeoutMillis: 20_000,
-      connectionTimeoutMillis: 30_000,
-      allowExitOnIdle: true,
-      ssl: { rejectUnauthorized: false },
-    });
-    pgPool.on('error', (err) => {
-      const formatted = formatPgError(err);
-      logger.error('Unexpected Postgres pool error', formatted);
-    });
-
-    const adapter = new PrismaPg(pgPool);
-
-    prismaInstance = new PrismaClient({
-      adapter,
-      log: env.NODE_ENV === 'development' ? ['error', 'warn'] : ['error'],
-    });
-
-    const target = env.USE_DEV_POSTGRES ? 'DEV' : 'PROD';
-    logger.info(
-      `✅ Prisma Client initialized (${target}) → ${safeDbHost(normalizedUri)} (pool max=5, connectTimeout=30s, ssl=neon)`,
-    );
+    createPrismaClient(connectionString, neonSslServername);
   }
-  return prismaInstance;
+  return prismaInstance!;
 }
 
-// Export the Prisma client instance
-export const prisma = getPrismaClient();
+/**
+ * Proxy so connectPrisma can rebuild the client after Neon IP rewrite
+ * without breaking existing `import { prisma }` bindings.
+ */
+export const prisma: PrismaClient = new Proxy({} as PrismaClient, {
+  get(_target, prop, receiver) {
+    const client = getPrismaClient();
+    const value = Reflect.get(client as object, prop, receiver);
+    if (typeof value === 'function') {
+      return (value as (...args: unknown[]) => unknown).bind(client);
+    }
+    return value;
+  },
+});
 
 /**
  * Dual-DB merge client is disabled.
@@ -134,11 +208,45 @@ export const prisma = getPrismaClient();
  */
 export const prismaDev: PrismaClient | null = null;
 
+async function rebuildPrismaWithDnsBypass(): Promise<void> {
+  const connectionString = env.POSTGRESDB_URI;
+  if (!connectionString) {
+    throw new Error('POSTGRESDB_URI is required for Prisma Client');
+  }
+
+  const resolved = await resolveNeonUriForBrokenLocalDns(connectionString);
+  if (resolved.connectionString === connectionString && !resolved.sslServername) {
+    return;
+  }
+
+  if (prismaInstance) {
+    try {
+      await prismaInstance.$disconnect();
+    } catch {
+      /* ignore */
+    }
+  }
+  if (pgPool) {
+    try {
+      await pgPool.end();
+    } catch {
+      /* ignore */
+    }
+    pgPool = null;
+  }
+  prismaInstance = null;
+
+  createPrismaClient(resolved.connectionString, resolved.sslServername);
+}
+
 /**
  * Connect to Postgres database via Prisma
  */
 export async function connectPrisma(): Promise<void> {
   try {
+    // Bypass broken LAN DNS for Neon before first query
+    await rebuildPrismaWithDnsBypass();
+
     await prisma.$connect();
     // Warm one connection so the first Payments request after idle doesn't race cold start.
     await prisma.$queryRawUnsafe('SELECT 1');
@@ -185,7 +293,10 @@ export async function pingPostgres(timeoutMs = 5000): Promise<{
  */
 export async function disconnectPrisma(): Promise<void> {
   try {
-    await prisma.$disconnect();
+    if (prismaInstance) {
+      await prismaInstance.$disconnect();
+      prismaInstance = null;
+    }
     if (pgPool) {
       await pgPool.end();
       pgPool = null;

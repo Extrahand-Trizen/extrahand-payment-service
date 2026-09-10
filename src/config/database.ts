@@ -6,8 +6,8 @@ import { connectPrisma, disconnectPrisma } from './prisma';
 
 const env = validateEnv();
 
-// Temporary workaround for local Windows DNS issues with MongoDB Atlas.
-// Remove this once the system/network DNS issue is permanently fixed.
+// Helps MongoDB Atlas (uses dns.resolve*). Does NOT fix `pg`/getaddrinfo —
+// Neon DNS bypass for Postgres lives in prisma.ts (public resolver → IP).
 dns.setServers(['8.8.8.8', '8.8.4.4']);
 
 let isMongoConnected = false;

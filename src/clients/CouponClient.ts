@@ -61,7 +61,7 @@ export class CouponClient {
   static async validate(params: {
     couponCode: string;
     userId: string;
-    flowType: 'BOOK_NOW' | 'POST_COMPARE';
+    flowType: 'BOOK_NOW' | 'POST_COMPARE' | 'QUICK_COMMERCE';
     amount: number;
     serviceIds?: string[];
     lineItems?: Array<{ serviceId: string; amount: number }>;
@@ -99,7 +99,7 @@ export class CouponClient {
 
   static async listEligible(params: {
     userId: string;
-    flowType: 'BOOK_NOW' | 'POST_COMPARE';
+    flowType: 'BOOK_NOW' | 'POST_COMPARE' | 'QUICK_COMMERCE';
     amount: number;
     serviceIds?: string[];
     lineItems?: Array<{ serviceId: string; amount: number }>;
@@ -154,7 +154,7 @@ export class CouponClient {
   static async reserve(params: {
     couponCode: string;
     userId: string;
-    flowType: 'BOOK_NOW' | 'POST_COMPARE';
+    flowType: 'BOOK_NOW' | 'POST_COMPARE' | 'QUICK_COMMERCE';
     amount: number;
     serviceIds?: string[];
     lineItems?: Array<{ serviceId: string; amount: number }>;

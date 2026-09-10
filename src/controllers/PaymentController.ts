@@ -147,6 +147,20 @@ export class PaymentController {
     );
 
     if (!captureResult.success) {
+      const missingEscrow = /escrow not found/i.test(String(captureResult.error || ''));
+      // Grocery / QC payments are verified by signature only — they never create task escrow.
+      if (missingEscrow) {
+        logger.info('Payment verified with no escrow (non-task payment)', {
+          razorpay_order_id,
+          razorpay_payment_id,
+        });
+        res.json({
+          success: true,
+          message: result.message,
+          escrow: false,
+        });
+        return;
+      }
       logger.error('Escrow update failed after payment verification', {
         razorpay_order_id,
         razorpay_payment_id,
@@ -192,12 +206,17 @@ export class PaymentController {
     }
 
     const paymentResult = await getPaymentDetails(razorpay_payment_id);
-    if (!paymentResult.success) {
-      throw new BadRequestError(paymentResult.error || 'Payment not found');
-    }
-    const paymentOrderId = String(paymentResult.payment?.order_id || '');
-    if (paymentOrderId && paymentOrderId !== razorpay_order_id) {
-      throw new BadRequestError('Payment does not belong to this order');
+    if (paymentResult.success) {
+      const paymentOrderId = String(paymentResult.payment?.order_id || '');
+      if (paymentOrderId && paymentOrderId !== razorpay_order_id) {
+        throw new BadRequestError('Payment does not belong to this order');
+      }
+    } else {
+      logger.warn('verify-signature: Razorpay fetch failed after HMAC ok', {
+        razorpay_order_id,
+        razorpay_payment_id,
+        error: paymentResult.error,
+      });
     }
 
     res.json({ success: true, message: result.message });

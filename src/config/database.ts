@@ -25,8 +25,14 @@ export async function connectDatabase(): Promise<void> {
  * Connect to MongoDB (for metadata storage)
  */
 async function connectMongoDB(): Promise<void> {
-  if (isMongoConnected) {
+  if (isMongoConnected || mongoose.connection.readyState === 1) {
+    isMongoConnected = true;
     logger.info('📦 MongoDB already connected');
+    return;
+  }
+
+  if (mongoose.connection.readyState === 2) {
+    logger.info('📦 MongoDB connection already in progress');
     return;
   }
 
@@ -45,6 +51,9 @@ async function connectMongoDB(): Promise<void> {
       connectTimeoutMS: 10000,
       maxPoolSize: 10,
       minPoolSize: 2,
+      // Keep sockets alive so idle CapRover containers don't drop Mongo mid-payment.
+      heartbeatFrequencyMS: 10000,
+      maxIdleTimeMS: 60000,
     };
 
     logger.info('🔌 Attempting to connect to MongoDB...');
@@ -67,6 +76,11 @@ async function connectMongoDB(): Promise<void> {
       }`
     );
 
+    // Avoid stacking listeners on reconnect attempts
+    mongoose.connection.removeAllListeners('error');
+    mongoose.connection.removeAllListeners('disconnected');
+    mongoose.connection.removeAllListeners('reconnected');
+
     mongoose.connection.on('error', (error) => {
       logger.error('❌ MongoDB connection error', {
         error:
@@ -85,6 +99,8 @@ async function connectMongoDB(): Promise<void> {
     mongoose.connection.on('disconnected', () => {
       logger.warn('⚠️ MongoDB disconnected');
       isMongoConnected = false;
+      // Mongoose auto-reconnects; ensurePostgresReady-style soft retry if still down.
+      void scheduleMongoReconnect();
     });
 
     mongoose.connection.on('reconnected', () => {
@@ -102,7 +118,52 @@ async function connectMongoDB(): Promise<void> {
     logger.warn('⚠️ MongoDB features will be disabled');
 
     isMongoConnected = false;
+    void scheduleMongoReconnect();
   }
+}
+
+let mongoReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let mongoReconnectAttempt = 0;
+
+function scheduleMongoReconnect() {
+  if (!env.MONGODB_URI) return;
+  if (mongoReconnectTimer) return;
+
+  const delay = Math.min(30_000, 2000 * Math.max(1, mongoReconnectAttempt + 1));
+  mongoReconnectAttempt += 1;
+  mongoReconnectTimer = setTimeout(async () => {
+    mongoReconnectTimer = null;
+    // 0 = disconnected, 1 = connected, 2 = connecting, 3 = disconnecting
+    const state = mongoose.connection.readyState;
+    if (state === 1) {
+      isMongoConnected = true;
+      mongoReconnectAttempt = 0;
+      return;
+    }
+    if (state === 2) {
+      scheduleMongoReconnect();
+      return;
+    }
+    try {
+      logger.info('🔄 Retrying MongoDB connection…', {
+        attempt: mongoReconnectAttempt,
+        readyState: state,
+      });
+      if (state !== 0) {
+        try {
+          await mongoose.connection.close();
+        } catch {
+          /* ignore */
+        }
+      }
+      isMongoConnected = false;
+      await connectMongoDB();
+      if (isMongoConnected) mongoReconnectAttempt = 0;
+      else scheduleMongoReconnect();
+    } catch {
+      scheduleMongoReconnect();
+    }
+  }, delay);
 }
 
 /**

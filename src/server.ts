@@ -52,15 +52,30 @@ async function startServer() {
       }
     });
 
-    // Graceful shutdown
+    // Graceful shutdown — only when CapRover/Docker actually stops the container
+    let shuttingDown = false;
     const gracefulShutdown = async (signal: string) => {
-      logger.info(`${signal} signal received: starting graceful shutdown`);
-      await disconnectDatabase();
+      if (shuttingDown) return;
+      shuttingDown = true;
+      logger.info(`${signal} signal received: starting graceful shutdown`, {
+        hint: 'If this happens during a payment, CapRover likely restarted the app (deploy, OOM, or old health 503).',
+      });
+      try {
+        await disconnectDatabase();
+      } catch (err) {
+        logger.error('Error during graceful shutdown disconnect', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
       process.exit(0);
     };
 
-    process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-    process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+    process.on('SIGTERM', () => {
+      void gracefulShutdown('SIGTERM');
+    });
+    process.on('SIGINT', () => {
+      void gracefulShutdown('SIGINT');
+    });
 
   } catch (error) {
     logger.error('Failed to start server:', error);

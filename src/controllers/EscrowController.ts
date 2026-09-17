@@ -131,7 +131,7 @@ export class EscrowController {
     });
 
     if (!result.success) {
-      throw new Error(result.error || 'Failed to create booking escrow');
+      throw new BadRequestError(result.error || 'Failed to create booking escrow');
     }
 
     res.status(201).json({

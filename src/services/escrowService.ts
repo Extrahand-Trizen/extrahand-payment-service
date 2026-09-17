@@ -333,7 +333,7 @@ export async function createEscrow(params: {
   autoReleaseAfterDays?: number;
   taskCategory?: string;
   metadata?: Record<string, any>;
-}): Promise<{ success: boolean; escrow?: any; order?: any; error?: string }> {
+}): Promise<{ success: boolean; escrow?: any; order?: any; isFree?: boolean; error?: string }> {
   try {
     const {
       taskId,
@@ -649,6 +649,7 @@ export async function createEscrow(params: {
         typeof metadata.bookingOrderId === 'string' && metadata.bookingOrderId.trim()
           ? metadata.bookingOrderId.trim()
           : null;
+      const isFreeOrder = finalChargeAmount.isZero();
 
       // Create escrow in Postgres (all data - financial + metadata)
       const postgresEscrow = await prisma.escrow.create({
@@ -664,7 +665,9 @@ export async function createEscrow(params: {
           currency,
           amountInRupees: amountInRupeesDecimal,
           taskAmount: taskAmountDecimal,
-          status: 'pending',
+          status: isFreeOrder ? 'held' : 'pending',
+          paymentStatus: isFreeOrder ? 'captured' : 'pending',
+          heldAt: isFreeOrder ? new Date() : null,
           autoReleaseDate: autoReleaseDate,
           razorpayOrderData: sanitizedOrderData as any, // Store sanitized data in JSONB
           metadata: escrowMetadata as any, // JSONB: snapshot + client fields
@@ -674,6 +677,22 @@ export async function createEscrow(params: {
           appliedRazorpayGstPercent: appliedRazorpayGstPercent ?? null,
         },
       });
+
+      if (isFreeOrder && couponRedemptionId) {
+        try {
+          await CouponClient.confirm(couponRedemptionId);
+          logger.info('Confirmed coupon redemption for free booking order', {
+            couponRedemptionId,
+            couponCode: couponCodeApplied,
+            bookingOrderId: bookingOrderIdColumn,
+          });
+        } catch (confErr: any) {
+          logger.warn('Failed to confirm coupon redemption on free order', {
+            couponRedemptionId,
+            error: confErr?.message,
+          });
+        }
+      }
 
       // Create initial ledger entry (escrow created)
       await createLedgerEntry({
@@ -715,6 +734,7 @@ export async function createEscrow(params: {
         success: true,
         escrow: escrowForFrontend,
         order: razorpayOrder,
+        isFree: isFreeOrder,
       };
     } catch (error: any) {
       logger.error('❌ Error creating escrow:', error);

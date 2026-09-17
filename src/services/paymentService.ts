@@ -71,6 +71,30 @@ export const createOrder = async (
       return { success: true, order };
     }
 
+    if (amount <= 0) {
+      const id = `order_free_${crypto.randomBytes(12).toString('hex')}`;
+      logger.info('Free / 100% coupon order: skipped Razorpay order create', {
+        orderId: id,
+        posterUid,
+        amountPaise: amount,
+      });
+      const order: CreateOrderPayload = {
+        id,
+        entity: 'order',
+        amount: 0,
+        amount_paid: 0,
+        amount_due: 0,
+        currency: currency || 'INR',
+        receipt: `rcpt_free_${Date.now()}`,
+        status: 'paid',
+        attempts: 0,
+        created_at: Math.floor(Date.now() / 1000),
+        isFreeOrder: true,
+        keyId: RAZORPAY_CONFIG.keyId,
+      };
+      return { success: true, order };
+    }
+
     const options = {
       amount: amount, // Convert to paise
       currency,

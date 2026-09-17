@@ -65,6 +65,8 @@ export class CouponClient {
     amount: number;
     serviceIds?: string[];
     lineItems?: Array<{ serviceId: string; amount: number }>;
+    city?: string;
+    pinCode?: string;
   }): Promise<CouponValidateResult> {
     try {
       const response = await axios.post(
@@ -75,6 +77,8 @@ export class CouponClient {
           amount: params.amount,
           serviceIds: params.serviceIds || [],
           lineItems: params.lineItems || [],
+          city: params.city,
+          pinCode: params.pinCode,
         },
         { headers: this.headers(params.userId), timeout: 10000 }
       );
@@ -103,6 +107,8 @@ export class CouponClient {
     amount: number;
     serviceIds?: string[];
     lineItems?: Array<{ serviceId: string; amount: number }>;
+    city?: string;
+    pinCode?: string;
   }): Promise<{
     success: boolean;
     coupons?: Array<{
@@ -131,6 +137,8 @@ export class CouponClient {
           amount: params.amount,
           serviceIds: params.serviceIds || [],
           lineItems: params.lineItems || [],
+          city: params.city,
+          pinCode: params.pinCode,
         },
         { headers: this.headers(params.userId), timeout: 15000 }
       );
@@ -158,6 +166,8 @@ export class CouponClient {
     amount: number;
     serviceIds?: string[];
     lineItems?: Array<{ serviceId: string; amount: number }>;
+    city?: string;
+    pinCode?: string;
     bookingOrderId?: string | null;
     taskId?: string | null;
   }): Promise<CouponReserveResult> {
@@ -170,6 +180,8 @@ export class CouponClient {
           amount: params.amount,
           serviceIds: params.serviceIds || [],
           lineItems: params.lineItems || [],
+          city: params.city,
+          pinCode: params.pinCode,
           bookingOrderId: params.bookingOrderId || null,
           taskId: params.taskId || null,
         },

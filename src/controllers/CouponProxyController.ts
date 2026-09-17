@@ -71,6 +71,9 @@ export async function validateCoupon(req: Request, res: Response): Promise<void>
   }
   if (!(amount > 0)) throw new BadRequestError('amount must be a positive number');
 
+  const city = req.body?.city ? String(req.body.city).trim() : undefined;
+  const pinCode = req.body?.pinCode ? String(req.body.pinCode).trim() : undefined;
+
   const result = await CouponClient.validate({
     couponCode,
     userId,
@@ -78,6 +81,8 @@ export async function validateCoupon(req: Request, res: Response): Promise<void>
     amount,
     serviceIds: Array.isArray(req.body?.serviceIds) ? req.body.serviceIds : [],
     lineItems: Array.isArray(req.body?.lineItems) ? req.body.lineItems : [],
+    city,
+    pinCode,
   });
 
   if (!result.valid) {
@@ -128,6 +133,8 @@ export async function listEligibleCoupons(req: Request, res: Response): Promise<
       ? flowTypeRaw
       : null;
   const amount = Number(req.body?.amount);
+  const city = req.body?.city ? String(req.body.city).trim() : undefined;
+  const pinCode = req.body?.pinCode ? String(req.body.pinCode).trim() : undefined;
 
   if (!flowType) {
     throw new BadRequestError('flowType must be BOOK_NOW, POST_COMPARE, or QUICK_COMMERCE');
@@ -140,6 +147,8 @@ export async function listEligibleCoupons(req: Request, res: Response): Promise<
     amount,
     serviceIds: Array.isArray(req.body?.serviceIds) ? req.body.serviceIds : [],
     lineItems: Array.isArray(req.body?.lineItems) ? req.body.lineItems : [],
+    city,
+    pinCode,
   });
 
   if (!result.success) {

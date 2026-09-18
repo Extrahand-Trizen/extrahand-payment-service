@@ -261,7 +261,11 @@ export function recalculateBookNowTotalsAfterCouponDiscount(params: {
     for (const cat of categoriesInput) {
       const key = String(cat.categoryKey || '').trim().toLowerCase();
       if (!key || !(cat.subtotal > 0)) continue;
-      const eligible = !requireEligibleMatch || !hasEligibleFilter || eligibleSet.has(key);
+      const eligible =
+        !requireEligibleMatch ||
+        !hasEligibleFilter ||
+        eligibleSet.has(key) ||
+        (key === 'hourly-helper' && [...eligibleSet].some((s) => s.startsWith('hourly-')));
       if (!eligible) continue;
       weights.push({
         key: cat.categoryKey,

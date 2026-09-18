@@ -388,6 +388,8 @@ export async function createEscrow(params: {
             .map((row: any) => ({
               serviceId: String(row?.serviceId || '').trim(),
               amount: Number(row?.amount) || 0,
+              skuSlug: row?.skuSlug ? String(row.skuSlug).trim() : undefined,
+              categorySlug: row?.categorySlug ? String(row.categorySlug).trim() : undefined,
             }))
             .filter((row: { serviceId: string; amount: number }) => row.serviceId && row.amount > 0)
         : [];
@@ -434,10 +436,28 @@ export async function createEscrow(params: {
           .filter((row) => row.categoryKey && row.subtotal > 0);
 
         if (gstRows.length > 0) {
+          const categoryKeysFromEligible = new Set<string>();
+          if (Array.isArray(lineItems)) {
+            const eligibleLower = new Set(eligibleServiceIds.map((s) => s.toLowerCase()));
+            for (const item of lineItems) {
+              if (
+                (item.serviceId && eligibleLower.has(item.serviceId.toLowerCase())) ||
+                (item.skuSlug && eligibleLower.has(item.skuSlug.toLowerCase()))
+              ) {
+                if (item.categorySlug) {
+                  categoryKeysFromEligible.add(item.categorySlug.toLowerCase());
+                }
+              }
+            }
+          }
+          const eligibleForGst = [
+            ...new Set([...eligibleServiceIds, ...categoryKeysFromEligible]),
+          ];
+
           const recalculated = recalculateBookNowTotalsAfterCouponDiscount({
             categories: gstRows,
             couponDiscountRupees: Number(couponDiscountRupees.toString()),
-            eligibleServiceIds,
+            eligibleServiceIds: eligibleForGst,
           });
           adjustedGstRupees = recalculated.gst;
           adjustedServiceSubtotal = recalculated.subtotal;

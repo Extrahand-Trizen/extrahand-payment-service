@@ -18,6 +18,13 @@ export type CouponValidateResult = {
   error?: string;
 };
 
+export type CouponLineItem = {
+  serviceId: string;
+  amount: number;
+  skuSlug?: string;
+  categorySlug?: string;
+};
+
 export type CouponReserveResult = {
   success: boolean;
   redemption?: {
@@ -64,7 +71,7 @@ export class CouponClient {
     flowType: 'BOOK_NOW' | 'POST_COMPARE' | 'QUICK_COMMERCE';
     amount: number;
     serviceIds?: string[];
-    lineItems?: Array<{ serviceId: string; amount: number }>;
+    lineItems?: CouponLineItem[];
     city?: string;
     pinCode?: string;
   }): Promise<CouponValidateResult> {
@@ -76,7 +83,12 @@ export class CouponClient {
           flowType: params.flowType,
           amount: params.amount,
           serviceIds: params.serviceIds || [],
-          lineItems: params.lineItems || [],
+          lineItems: (params.lineItems || []).map((item) => ({
+            serviceId: item.serviceId,
+            amount: item.amount,
+            skuSlug: item.skuSlug,
+            categorySlug: item.categorySlug,
+          })),
           city: params.city,
           pinCode: params.pinCode,
         },
@@ -106,7 +118,7 @@ export class CouponClient {
     flowType: 'BOOK_NOW' | 'POST_COMPARE' | 'QUICK_COMMERCE';
     amount: number;
     serviceIds?: string[];
-    lineItems?: Array<{ serviceId: string; amount: number }>;
+    lineItems?: CouponLineItem[];
     city?: string;
     pinCode?: string;
   }): Promise<{
@@ -136,7 +148,12 @@ export class CouponClient {
           flowType: params.flowType,
           amount: params.amount,
           serviceIds: params.serviceIds || [],
-          lineItems: params.lineItems || [],
+          lineItems: (params.lineItems || []).map((item) => ({
+            serviceId: item.serviceId,
+            amount: item.amount,
+            skuSlug: item.skuSlug,
+            categorySlug: item.categorySlug,
+          })),
           city: params.city,
           pinCode: params.pinCode,
         },
@@ -165,7 +182,7 @@ export class CouponClient {
     flowType: 'BOOK_NOW' | 'POST_COMPARE' | 'QUICK_COMMERCE';
     amount: number;
     serviceIds?: string[];
-    lineItems?: Array<{ serviceId: string; amount: number }>;
+    lineItems?: CouponLineItem[];
     city?: string;
     pinCode?: string;
     bookingOrderId?: string | null;
@@ -179,7 +196,12 @@ export class CouponClient {
           flowType: params.flowType,
           amount: params.amount,
           serviceIds: params.serviceIds || [],
-          lineItems: params.lineItems || [],
+          lineItems: (params.lineItems || []).map((item) => ({
+            serviceId: item.serviceId,
+            amount: item.amount,
+            skuSlug: item.skuSlug,
+            categorySlug: item.categorySlug,
+          })),
           city: params.city,
           pinCode: params.pinCode,
           bookingOrderId: params.bookingOrderId || null,

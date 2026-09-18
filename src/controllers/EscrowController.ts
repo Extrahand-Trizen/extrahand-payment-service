@@ -5,6 +5,7 @@ import {
   attachPerformerToEscrow,
   resetPerformerOnEscrow,
   reassignRecurringVisitEscrow,
+  linkRealTaskIdToBookingEscrow,
   getEscrowStatus,
   getEscrowByTaskId,
   getEscrowByTaskIdAndVisitId,
@@ -200,6 +201,35 @@ export class EscrowController {
 
     if (!result.success) {
       throw new BadRequestError(result.error || 'Failed to reassign recurring visit escrow');
+    }
+
+    res.json({
+      success: true,
+      escrow: result.escrow,
+    });
+  }
+
+  /**
+   * PATCH /api/v1/escrow/:escrowId/link-task
+   * Link real Mongo task ID to Book Now escrow after materialization
+   */
+  static async linkTask(req: Request, res: Response): Promise<void> {
+    const { escrowId } = req.params;
+    const { taskId, bookingOrderId, lineItemTaskIds } = req.body;
+
+    if (!taskId) {
+      throw new BadRequestError('taskId is required');
+    }
+
+    const result = await linkRealTaskIdToBookingEscrow({
+      escrowId,
+      taskId,
+      bookingOrderId,
+      lineItemTaskIds,
+    });
+
+    if (!result.success) {
+      throw new BadRequestError(result.error || 'Failed to link task to escrow');
     }
 
     res.json({

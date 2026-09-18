@@ -1507,17 +1507,27 @@ export async function updateEscrowOnPaymentCapture(
                 },
               });
 
-              if (shouldPersistTransaction) {
-                await prisma.transaction.updateMany({
-                  where: {
-                    razorpayPaymentId,
-                    taskId: originalTaskId,
-                  },
-                  data: {
-                    taskId: resolvedTaskId,
-                  },
-                });
-              }
+              await prisma.transaction.updateMany({
+                where: {
+                  OR: [
+                    { razorpayOrderId },
+                    { taskId: originalTaskId },
+                    ...(razorpayPaymentId ? [{ razorpayPaymentId }] : []),
+                  ],
+                },
+                data: {
+                  taskId: resolvedTaskId,
+                },
+              });
+
+              await prisma.ledger.updateMany({
+                where: {
+                  escrowId: postgresEscrow.id,
+                },
+                data: {
+                  taskId: resolvedTaskId,
+                },
+              });
 
               postgresEscrow = updatedEscrow;
               logger.info('Updated Book Now escrow to real task ID after task materialization', {
@@ -2066,3 +2076,112 @@ export async function updateEscrowAutoRelease(
     return { success: false, error: error.message || 'Failed to update escrow auto-release' };
   }
 }
+
+/**
+ * Link real materialized MongoDB task ID to a Book Now escrow and its associated transactions/ledgers in PostgreSQL.
+ */
+export async function linkRealTaskIdToBookingEscrow(params: {
+  escrowId: string;
+  taskId: string;
+  bookingOrderId?: string;
+  lineItemTaskIds?: Array<{ packageSlug?: string; taskId: string }>;
+}): Promise<{ success: boolean; escrow?: any; error?: string }> {
+  try {
+    const trimmedEscrowId = String(params.escrowId || '').trim();
+    const resolvedTaskId = String(params.taskId || '').trim();
+    if (!trimmedEscrowId || !resolvedTaskId) {
+      return { success: false, error: 'escrowId and taskId are required' };
+    }
+
+    const existing = await prisma.escrow.findFirst({
+      where: {
+        OR: [
+          { escrowId: trimmedEscrowId },
+          { id: trimmedEscrowId },
+        ],
+      },
+    });
+
+    if (!existing) {
+      return { success: false, error: 'Escrow not found' };
+    }
+
+    const oldMeta = (existing.metadata || {}) as Record<string, unknown>;
+    const oldLineItems = Array.isArray(oldMeta.bookNowLineItems)
+      ? [...oldMeta.bookNowLineItems]
+      : [];
+
+    const lineItemMap = new Map<string, string>();
+    if (Array.isArray(params.lineItemTaskIds)) {
+      for (const item of params.lineItemTaskIds) {
+        if (item.packageSlug && item.taskId) {
+          lineItemMap.set(item.packageSlug, item.taskId);
+        }
+      }
+    }
+
+    const updatedLineItems = oldLineItems.map((item: unknown, idx: number) => {
+      const rowItem = item as Record<string, unknown>;
+      const slug = String(rowItem.packageSlug || rowItem.categorySlug || '').trim();
+      const mappedId = lineItemMap.get(slug);
+      const fallbackId = params.lineItemTaskIds?.[idx]?.taskId;
+      const targetTaskId = mappedId || fallbackId || resolvedTaskId;
+      return { ...rowItem, taskId: targetTaskId };
+    });
+
+    const updatedEscrow = await prisma.escrow.update({
+      where: { id: existing.id },
+      data: {
+        taskId: resolvedTaskId,
+        ...(params.bookingOrderId && !existing.bookingOrderId
+          ? { bookingOrderId: params.bookingOrderId }
+          : {}),
+        metadata: {
+          ...oldMeta,
+          bookNowLineItems: updatedLineItems,
+        } as any,
+      },
+    });
+
+    // Update Transactions with placeholder taskId
+    await prisma.transaction.updateMany({
+      where: {
+        OR: [
+          { razorpayOrderId: existing.razorpayOrderId },
+          { taskId: existing.taskId },
+        ],
+      },
+      data: {
+        taskId: resolvedTaskId,
+      },
+    });
+
+    // Update Ledgers with placeholder taskId
+    await prisma.ledger.updateMany({
+      where: {
+        escrowId: existing.id,
+      },
+      data: {
+        taskId: resolvedTaskId,
+      },
+    });
+
+    logger.info('✅ Linked real taskId to Book Now escrow in Postgres', {
+      escrowId: updatedEscrow.escrowId,
+      oldTaskId: existing.taskId,
+      newTaskId: resolvedTaskId,
+      bookingOrderId: params.bookingOrderId,
+    });
+
+    const escrowForFrontend = await convertPostgresEscrowToFrontendFormat(updatedEscrow);
+    return { success: true, escrow: escrowForFrontend };
+  } catch (err: any) {
+    logger.error('❌ Failed to link real taskId to Book Now escrow', {
+      escrowId: params.escrowId,
+      taskId: params.taskId,
+      error: err.message,
+    });
+    return { success: false, error: err.message };
+  }
+}
+

@@ -489,7 +489,19 @@ model PaymentOrderIdempotency {
   idempotencyKey  String   @unique
   razorpayOrderId String
   orderPayload    Json
+  paymentEnvironment String @default("live")
   createdAt       DateTime @default(now())
+}
+
+model PaymentOrderEnvironment {
+  id                 String   @id @default(uuid())
+  razorpayOrderId    String   @unique
+  paymentEnvironment String   @default("live")
+  userId             String?
+  createdAt          DateTime @default(now())
+
+  @@index([userId])
+  @@index([paymentEnvironment])
 }
 
 enum CategoryFeeMode {

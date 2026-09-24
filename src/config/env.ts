@@ -31,7 +31,13 @@ const envSchema = z.object({
   // Razorpay
   RAZORPAY_KEY_ID: z.string().min(1, 'RAZORPAY_KEY_ID is required'),
   RAZORPAY_KEY_SECRET: z.string().min(1, 'RAZORPAY_KEY_SECRET is required'),
+  RAZORPAY_LIVE_KEY_ID: z.string().optional(),
+  RAZORPAY_LIVE_KEY_SECRET: z.string().optional(),
+  RAZORPAY_TEST_KEY_ID: z.string().optional(),
+  RAZORPAY_TEST_KEY_SECRET: z.string().optional(),
   RAZORPAY_WEBHOOK_SECRET: z.string().optional(), // Optional - only needed for webhook verification
+  RAZORPAY_LIVE_WEBHOOK_SECRET: z.string().optional(),
+  RAZORPAY_TEST_WEBHOOK_SECRET: z.string().optional(),
   RAZORPAYX_KEY_ID: z.string().optional(),
   RAZORPAYX_KEY_SECRET: z.string().optional(),
   RAZORPAYX_ACCOUNT_NUMBER: z.string().optional(),

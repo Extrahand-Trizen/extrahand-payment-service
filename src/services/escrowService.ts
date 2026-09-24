@@ -333,6 +333,7 @@ export async function createEscrow(params: {
   autoReleaseAfterDays?: number;
   taskCategory?: string;
   metadata?: Record<string, any>;
+  authenticatedUid?: string | null;
 }): Promise<{ success: boolean; escrow?: any; order?: any; isFree?: boolean; error?: string }> {
   try {
     const {
@@ -346,6 +347,7 @@ export async function createEscrow(params: {
       autoReleaseAfterDays,
       taskCategory,
       metadata = {},
+      authenticatedUid,
     } = params;
 
     // Validate amount
@@ -560,7 +562,7 @@ export async function createEscrow(params: {
       couponDiscount: couponDiscountRupees.toString(),
       couponRedemptionId,
       amountAfterCoupon: amountAfterCoupon.toString(),
-    });
+    }, authenticatedUid || posterUid);
 
     if (!orderResult.success || !orderResult.order) {
       if (couponRedemptionId) {
@@ -616,6 +618,7 @@ export async function createEscrow(params: {
         ...(String(razorpayOrder.id).startsWith(REVIEW_ORDER_ID_PREFIX)
           ? { reviewBypass: true }
           : {}),
+        paymentEnvironment: razorpayOrder.paymentEnvironment || 'live',
       } as Record<string, unknown>,
       { taskCategory: taskCategory ?? null }
     );
@@ -781,6 +784,7 @@ export async function createBookingEscrow(params: {
   currency?: string;
   taskCategory?: string;
   metadata?: Record<string, any>;
+  authenticatedUid?: string | null;
 }): Promise<{ success: boolean; escrow?: any; order?: any; error?: string }> {
   const {
     taskId,
@@ -791,6 +795,7 @@ export async function createBookingEscrow(params: {
     currency = 'INR',
     taskCategory,
     metadata = {},
+    authenticatedUid,
   } = params;
 
   if (!bookingOrderId?.trim()) {
@@ -810,6 +815,7 @@ export async function createBookingEscrow(params: {
       bookingMode: 'book_now',
       bookingOrderId,
     },
+    authenticatedUid,
   });
 }
 

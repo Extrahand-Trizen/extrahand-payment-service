@@ -68,6 +68,7 @@ export class EscrowController {
       autoReleaseAfterDays,
       taskCategory,
       metadata: baseMeta,
+      authenticatedUid: String(req.headers['x-user-id'] || '').trim() || posterUid,
     });
 
     if (!result.success) {
@@ -129,6 +130,7 @@ export class EscrowController {
       currency,
       taskCategory,
       metadata: baseMeta,
+      authenticatedUid: String(req.headers['x-user-id'] || '').trim() || posterUid,
     });
 
     if (!result.success) {

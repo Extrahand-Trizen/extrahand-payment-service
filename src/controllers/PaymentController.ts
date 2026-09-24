@@ -17,17 +17,57 @@ import {
 import { BadRequestError, NotFoundError } from '../errors/AppError';
 import logger from '../config/logger';
 import { prisma } from '../config/prisma';
-import { RAZORPAY_CONFIG } from '../config/razorpay';
 import { isReviewBypassOrderId } from '../utils/reviewBypass';
 import { processBookNowLineItemRefund } from '../services/refundService';
 import { createPerformerCancellationPenalty } from '../services/performerPenaltyService';
+import { normalizePaymentEnvironment, paymentKeys, resolvePaymentEnvironment } from '../config/paymentEnvironment';
+import { resolvePaymentEnvironmentForPayment } from '../services/paymentService';
 
+async function resolveStoredPaymentEnvironment(orderId: string) {
+  const persistedEnvironment = await resolvePaymentEnvironmentForPayment(undefined, orderId);
+  if (persistedEnvironment === 'test') return persistedEnvironment;
+
+  const escrow = await prisma.escrow.findUnique({
+    where: { razorpayOrderId: orderId },
+    select: { metadata: true },
+  });
+  const escrowEnvironment = (escrow?.metadata as any)?.paymentEnvironment;
+  if (escrowEnvironment) return normalizePaymentEnvironment(escrowEnvironment);
+
+  const idempotency = await prisma.paymentOrderIdempotency.findFirst({
+    where: { razorpayOrderId: orderId },
+    select: { paymentEnvironment: true, orderPayload: true },
+  });
+  return normalizePaymentEnvironment(
+    idempotency?.paymentEnvironment || (idempotency?.orderPayload as any)?.paymentEnvironment || persistedEnvironment,
+  );
+}
+
+function verifySignatureAcrossEnvironments(
+  orderId: string,
+  paymentId: string,
+  signature: string,
+  preferred: 'live' | 'test',
+  allowFallback: boolean,
+): { result: ReturnType<typeof verifyPaymentSignature>; environment: 'live' | 'test' } {
+  const first = verifyPaymentSignature(orderId, paymentId, signature, preferred);
+  if (first.success || !allowFallback) return { result: first, environment: preferred };
+
+  const alternate = preferred === 'live' ? 'test' : 'live';
+  const second = verifyPaymentSignature(orderId, paymentId, signature, alternate);
+  return second.success
+    ? { result: second, environment: alternate }
+    : { result: first, environment: preferred };
+}
 export class PaymentController {
   /**
    * POST /api/v1/payment/create-order
    */
   static async createOrder(req: Request, res: Response): Promise<void> {
     const { amount, currency, metadata } = req.body;
+    const authenticatedUid = String(req.headers['x-user-id'] || '').trim();
+    const paymentEnvironment = await import('../config/paymentEnvironment').then(({ resolvePaymentEnvironment }) =>
+      resolvePaymentEnvironment(authenticatedUid));
     const rawIdempotencyKey =
       (req.headers['idempotency-key'] as string | undefined) ||
       (req.headers['Idempotency-Key'] as string | undefined) ||
@@ -45,7 +85,7 @@ export class PaymentController {
       const existing = await prisma.paymentOrderIdempotency.findUnique({
         where: { idempotencyKey },
       });
-      if (existing) {
+      if (existing && normalizePaymentEnvironment((existing.orderPayload as any)?.paymentEnvironment) === paymentEnvironment) {
         logger.info('ℹ️ Returning existing order for idempotency key', {
           idempotencyKey,
           razorpayOrderId: existing.razorpayOrderId,
@@ -55,7 +95,7 @@ export class PaymentController {
       }
     }
 
-    const result = await createOrder(amount, currency || 'INR', metadata || {});
+    const result = await createOrder(amount, currency || 'INR', metadata || {}, authenticatedUid);
 
     if (!result.success) {
       throw new Error(result.error || 'Failed to create order');
@@ -69,6 +109,7 @@ export class PaymentController {
             idempotencyKey,
             razorpayOrderId: result.order.id ,
             orderPayload: result.order as any,
+            paymentEnvironment,
           },
         });
       } catch (error: any) {
@@ -126,18 +167,26 @@ export class PaymentController {
       return;
     }
 
-    const result = verifyPaymentSignature(
+    const requestedEnvironment = normalizePaymentEnvironment(req.body.payment_environment);
+    let paymentEnvironment = req.body.payment_environment
+      ? requestedEnvironment
+      : await resolveStoredPaymentEnvironment(razorpay_order_id);
+    const verification = verifySignatureAcrossEnvironments(
       razorpay_order_id,
       razorpay_payment_id,
-      razorpay_signature
+      razorpay_signature,
+      paymentEnvironment,
+      !req.body.payment_environment,
     );
+    paymentEnvironment = verification.environment;
+    const result = verification.result;
 
     if (!result.success) {
       throw new BadRequestError(result.message || result.error || 'Payment verification failed');
     }
 
     // Update escrow with payment entity so razorpayPaymentData is stored (sanitized)
-    const paymentResult = await getPaymentDetails(razorpay_payment_id);
+    const paymentResult = await getPaymentDetails(razorpay_payment_id, paymentEnvironment);
     const paymentEntity = paymentResult.success ? paymentResult.payment : undefined;
     const captureResult = await updateEscrowOnPaymentCapture(
       razorpay_order_id,
@@ -194,18 +243,26 @@ export class PaymentController {
       throw new BadRequestError('Missing required parameters');
     }
 
-    const result = verifyPaymentSignature(
+    const requestedEnvironment = normalizePaymentEnvironment(req.body.payment_environment);
+    let paymentEnvironment = req.body.payment_environment
+      ? requestedEnvironment
+      : await resolveStoredPaymentEnvironment(razorpay_order_id);
+    const verification = verifySignatureAcrossEnvironments(
       razorpay_order_id,
       razorpay_payment_id,
       razorpay_signature,
+      paymentEnvironment,
+      !req.body.payment_environment,
     );
+    paymentEnvironment = verification.environment;
+    const result = verification.result;
     if (!result.success) {
       throw new BadRequestError(
         result.message || result.error || 'Payment verification failed',
       );
     }
 
-    const paymentResult = await getPaymentDetails(razorpay_payment_id);
+    const paymentResult = await getPaymentDetails(razorpay_payment_id, paymentEnvironment);
     if (paymentResult.success) {
       const paymentOrderId = String(paymentResult.payment?.order_id || '');
       if (paymentOrderId && paymentOrderId !== razorpay_order_id) {
@@ -227,8 +284,9 @@ export class PaymentController {
    */
   static async getOrderStatus(req: Request, res: Response): Promise<void> {
     const { orderId } = req.params;
+    const paymentEnvironment = await resolveStoredPaymentEnvironment(orderId);
 
-    const result = await getOrderDetails(orderId);
+    const result = await getOrderDetails(orderId, paymentEnvironment);
 
     if (!result.success) {
       if (result.statusCode === 404) {
@@ -281,10 +339,11 @@ export class PaymentController {
       throw new BadRequestError('Payment ID is required');
     }
 
+    const paymentEnvironment = await resolvePaymentEnvironmentForPayment(paymentId);
     const result =
       amountPaise != null
-        ? await createRefundAmountPaise(paymentId, Number(amountPaise))
-        : await createRefund(paymentId, amount);
+        ? await createRefundAmountPaise(paymentId, Number(amountPaise), paymentEnvironment)
+        : await createRefund(paymentId, amount, paymentEnvironment);
 
     if (!result.success) {
       throw new Error(result.error || 'Failed to create refund');
@@ -553,8 +612,10 @@ export class PaymentController {
    * GET /api/v1/payment/razorpay-key
    * Public: publishable Key ID for client checkout only (never expose key secret).
    */
-  static async getRazorpayKeyId(_req: Request, res: Response): Promise<void> {
-    res.json({ keyId: RAZORPAY_CONFIG.keyId });
+  static async getRazorpayKeyId(req: Request, res: Response): Promise<void> {
+    const uid = String(req.headers['x-user-id'] || '').trim();
+    const paymentEnvironment = await resolvePaymentEnvironment(uid);
+    res.json({ keyId: paymentKeys[paymentEnvironment], paymentEnvironment });
   }
 }
 

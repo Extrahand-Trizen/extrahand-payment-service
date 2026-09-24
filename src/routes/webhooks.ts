@@ -16,11 +16,9 @@ import {
   logWebhookReceived,
   markWebhookProcessed,
 } from '../services/auditLogService';
+import { getWebhookSecret, type PaymentEnvironment } from '../config/paymentEnvironment';
 
 const router = express.Router();
-
-// Webhook secret from environment (Razorpay provides this)
-const WEBHOOK_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET || '';
 
 /**
  * Verify Razorpay webhook signature
@@ -43,6 +41,17 @@ function verifyWebhookSignature(
   }
 }
 
+function resolveWebhookEnvironment(payload: string, signature: string): PaymentEnvironment | null {
+  const candidates: Array<[PaymentEnvironment, string]> = [
+    ['live', getWebhookSecret('live')],
+    ['test', getWebhookSecret('test')],
+  ];
+  for (const [environment, secret] of candidates) {
+    if (secret && verifyWebhookSignature(payload, signature, secret)) return environment;
+  }
+  return null;
+}
+
 /**
  * POST /api/v1/webhooks/razorpay
  * Handle Razorpay webhook events
@@ -59,24 +68,11 @@ router.post('/razorpay', express.raw({ type: 'application/json' }), async (req, 
       return res.status(400).json({ error: 'Missing signature' });
     }
 
-    if (!WEBHOOK_SECRET) {
-      logger.warn('⚠️ WEBHOOK_SECRET not configured - webhook verification disabled');
-      // In development, allow webhooks without secret (for testing)
-      if (process.env.NODE_ENV === 'production') {
-        return res.status(500).json({ error: 'Webhook secret not configured' });
-      }
-    }
-
-    // Get raw body as string for signature verification
     const rawBody = req.body.toString('utf8');
-    
-    // Verify webhook signature (if secret is configured)
-    if (WEBHOOK_SECRET) {
-      const isValid = verifyWebhookSignature(rawBody, signature, WEBHOOK_SECRET);
-      if (!isValid) {
-        logger.warn('⚠️ Invalid webhook signature');
-        return res.status(400).json({ error: 'Invalid signature' });
-      }
+    const webhookEnvironment = resolveWebhookEnvironment(rawBody, signature);
+    if (!webhookEnvironment) {
+      logger.warn('⚠️ WEBHOOK_SECRET not configured - webhook verification disabled');
+      return res.status(400).json({ error: 'Invalid signature or webhook secret' });
     }
 
     // Parse JSON body
@@ -105,6 +101,7 @@ router.post('/razorpay', express.raw({ type: 'application/json' }), async (req, 
 
     logger.info('📥 Razorpay webhook received', {
       event: event.event,
+      paymentEnvironment: webhookEnvironment,
       entity: event.entity,
       payloadId: event.payload?.payment?.entity?.id,
     });

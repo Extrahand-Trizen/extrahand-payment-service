@@ -11,7 +11,7 @@ import {
 import { prisma, prismaDev } from '../config/prisma';
 import { Prisma } from '@prisma/client';
 import mongoose from 'mongoose';
-import { createRefundAmountPaise, getPaymentDetails } from './paymentService';
+import { createRefundAmountPaise, getPaymentDetails, resolvePaymentEnvironmentForPayment } from './paymentService';
 import { sanitizeRazorpayRefundData } from '../utils/paymentSanitizer';
 import { notifyRefundInitiated } from './paymentNotificationService';
 import { razorpay } from '../config/razorpay';
@@ -319,7 +319,10 @@ export async function processRefund(params: {
 
     const escrowAmountRupees = escrow.amountInRupees;
 
-    const paymentFetch = await getPaymentDetails(razorpayPaymentId);
+    const paymentFetch = await getPaymentDetails(
+      razorpayPaymentId,
+      await resolvePaymentEnvironmentForPayment(razorpayPaymentId, razorpayOrderId),
+    );
     if (!paymentFetch.success || !paymentFetch.payment) {
       return {
         success: false,
@@ -500,6 +503,7 @@ export async function processRefund(params: {
       const razorpayRefundResult = await createRefundAmountPaise(
         razorpayPaymentId,
         refundAmountInPaise,
+        await resolvePaymentEnvironmentForPayment(razorpayPaymentId, razorpayOrderId),
       );
 
       if (!razorpayRefundResult.success || !razorpayRefundResult.refund) {
@@ -1110,7 +1114,10 @@ export async function processBookNowLineItemRefund(params: {
       return { success: false, error: 'This service was already refunded' };
     }
 
-    const paymentFetch = await getPaymentDetails(razorpayPaymentId);
+    const paymentFetch = await getPaymentDetails(
+      razorpayPaymentId,
+      await resolvePaymentEnvironmentForPayment(razorpayPaymentId, bookingOrderId),
+    );
     if (!paymentFetch.success || !paymentFetch.payment) {
       return { success: false, error: 'Could not load payment for refund' };
     }
@@ -1181,6 +1188,7 @@ export async function processBookNowLineItemRefund(params: {
     const razorpayRefundResult = await createRefundAmountPaise(
       razorpayPaymentId,
       refundPaise,
+      await resolvePaymentEnvironmentForPayment(razorpayPaymentId, bookingOrderId),
     );
     if (!razorpayRefundResult.success || !razorpayRefundResult.refund) {
       return {

@@ -15,6 +15,7 @@ import { Prisma } from '@prisma/client';
 import mongoose from 'mongoose';
 import { applyPayoutStatusToProfile } from './userPaymentProfileService';
 import { createRazorpayXPayout, getRazorpayXPayoutStatus } from './razorpayxService';
+import { UserServiceClient } from '../clients/UserServiceClient';
 import { applyPenaltyLinesInTx, planPenaltyDeductionsFromGross } from './performerPenaltyService';
 import { notifyPayoutCompleted, notifyPayoutInitiated } from './paymentNotificationService';
 import { getFeeStructureForCategory, resolveBiddingPayoutFeePercents, resolveEscrowCategoryFeeConfigKey } from './feeConfigService';
@@ -1643,11 +1644,13 @@ export async function processTaskCompletionPayout(params: {
         taskId,
         netAmount: netAmount.toString(),
       });
+      const usePaymentTestCredentials = await UserServiceClient.isPaymentTester(performerUid);
       const payoutResponse = await createRazorpayXPayout({
         fundAccountId,
         amountInPaise: Math.round(parseFloat(netAmount.toString()) * 100),
         referenceId: payoutId,
         narration: payoutNarration,
+        usePaymentTestCredentials,
       });
 
       status = mapRazorpayPayoutStatusToInternal(payoutResponse.status);
@@ -1852,7 +1855,12 @@ export async function getPayoutStatus(payoutId: string): Promise<{
     ) {
       try {
         const razorpayLookupId = payout.bankTransferId as string;
-        const razorpayStatus = await getRazorpayXPayoutStatus(razorpayLookupId);
+        const usePaymentTestCredentials = await UserServiceClient.isPaymentTester(
+          payout.performerUid,
+        );
+        const razorpayStatus = await getRazorpayXPayoutStatus(razorpayLookupId, {
+          usePaymentTestCredentials,
+        });
         const internalStatus = mapRazorpayPayoutStatusToInternal(razorpayStatus.status);
 
         if (internalStatus !== payout.status) {

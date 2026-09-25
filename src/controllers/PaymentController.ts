@@ -171,6 +171,13 @@ export class PaymentController {
     let paymentEnvironment = req.body.payment_environment
       ? requestedEnvironment
       : await resolveStoredPaymentEnvironment(razorpay_order_id);
+    logger.info('[PAYMENT DEBUG] Verification request', {
+      requestedEnvironment: req.body.payment_environment ? requestedEnvironment : 'not_provided',
+      paymentEnvironment,
+      orderIdSuffix: String(razorpay_order_id).slice(-8),
+      paymentIdPresent: Boolean(razorpay_payment_id),
+      signaturePresent: Boolean(razorpay_signature),
+    });
     const verification = verifySignatureAcrossEnvironments(
       razorpay_order_id,
       razorpay_payment_id,

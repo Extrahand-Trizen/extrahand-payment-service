@@ -81,7 +81,8 @@ export class RefundController {
       throw new BadRequestError('refundId is required');
     }
 
-    const result = await getRefundStatus(refundId);
+    const syncRazorpay = String(req.query.syncRazorpay || '').toLowerCase() === 'true';
+    const result = await getRefundStatus(refundId, { syncRazorpay });
 
     if (!result.success) {
       throw new NotFoundError(result.error || 'Refund not found');

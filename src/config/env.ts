@@ -29,8 +29,6 @@ const envSchema = z.object({
   PROD_POSTGRESDB_URI: z.string().url('PROD_POSTGRESDB_URI must be a valid URL').optional(),
   
   // Razorpay
-  RAZORPAY_KEY_ID: z.string().min(1, 'RAZORPAY_KEY_ID is required'),
-  RAZORPAY_KEY_SECRET: z.string().min(1, 'RAZORPAY_KEY_SECRET is required'),
   RAZORPAY_LIVE_KEY_ID: z.string().optional(),
   RAZORPAY_LIVE_KEY_SECRET: z.string().optional(),
   RAZORPAY_TEST_KEY_ID: z.string().optional(),
@@ -115,13 +113,13 @@ export function validateEnv() {
   try {
     const env = envSchema.parse(process.env);
 
-    const payoutKeyId = env.RAZORPAYX_KEY_ID || env.RAZORPAY_KEY_ID;
-    const payoutKeySecret = env.RAZORPAYX_KEY_SECRET || env.RAZORPAY_KEY_SECRET;
+    const payoutKeyId = env.RAZORPAYX_KEY_ID || env.RAZORPAY_LIVE_KEY_ID;
+    const payoutKeySecret = env.RAZORPAYX_KEY_SECRET || env.RAZORPAY_LIVE_KEY_SECRET;
     const payoutAccountNumber = env.RAZORPAYX_ACCOUNT_NUMBER || env.RAZORPAY_ACCOUNT_NUMBER;
 
     if (!payoutKeyId || !payoutKeySecret || !payoutAccountNumber) {
       console.error('❌ Environment validation failed: Razorpay payout credentials missing');
-      console.error('  - Provide either RAZORPAYX_* values or RAZORPAY_* + RAZORPAY_ACCOUNT_NUMBER');
+      console.error('  - Provide either RAZORPAYX_* values or RAZORPAY_LIVE_* + RAZORPAY_ACCOUNT_NUMBER');
       process.exit(1);
     }
 

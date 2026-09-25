@@ -111,6 +111,12 @@ export const createOrder = async (
     const paymentEnvironment = await resolvePaymentEnvironment(authenticatedUid);
     const razorpay = getPaymentClient(paymentEnvironment);
     const keyId = paymentKeys[paymentEnvironment];
+    logger.info('[PAYMENT DEBUG] Creating Razorpay order', {
+      uidPresent: Boolean(authenticatedUid?.trim()),
+      paymentEnvironment,
+      keyPrefix: keyId.slice(0, 8),
+      amountPaise: amount,
+    });
     const paymentMetadata = {
       ...metadata,
       paymentEnvironment,
@@ -121,6 +127,7 @@ export const createOrder = async (
     const posterPhone =
       typeof posterPhoneRaw === 'string' ? posterPhoneRaw.trim() : '';
     if (
+      paymentEnvironment !== 'test' &&
       posterUid &&
       (isReviewBypassUid(posterUid) || isReviewBypassPhone(posterPhone))
     ) {
@@ -182,7 +189,12 @@ export const createOrder = async (
     };
 
     const order = await razorpay.orders.create(options);
-    logger.info('Order created successfully', { orderId: order.id, amount });
+    logger.info('Order created successfully', {
+      orderId: order.id,
+      amount,
+      paymentEnvironment,
+      keyPrefix: keyId.slice(0, 8),
+    });
     // Plain JSON + keyId: Razorpay SDK objects can lose custom fields across axios hops
     // (task-service Book Now path). Checkout must use this same publishable key.
     const plainOrder =
@@ -225,7 +237,13 @@ export const verifyPaymentSignature = (
 
     const isValid = generatedSignature === signature;
 
-    logger.info('Payment signature verification', { orderId, isValid });
+    logger.info('Payment signature verification', {
+      paymentEnvironment,
+      isValid,
+      orderIdSuffix: orderId.slice(-8),
+      paymentIdPresent: Boolean(paymentId),
+      signaturePresent: Boolean(signature),
+    });
     return {
       success: isValid,
       message: isValid ? 'Payment verified successfully' : 'Invalid signature',

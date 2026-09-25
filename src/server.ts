@@ -43,7 +43,7 @@ async function startServer() {
       logger.info(
         '[REFERRAL_COINS] payment-service ready — issue-grants logs use tag [REFERRAL_COINS]'
       );
-      logger.info(`💳 Razorpay Key ID: ${env.RAZORPAY_KEY_ID.substring(0, 10)}...`);
+      logger.info(`💳 Razorpay Live Key ID: ${(env.RAZORPAY_LIVE_KEY_ID || '').substring(0, 10)}...`);
       if (env.PAYOUT_MANUAL_OPS_MODE) {
         logger.info('PAYOUT_MANUAL_OPS_MODE enabled — task payouts queued for operations (RazorpayX skipped)');
       }

@@ -861,7 +861,10 @@ export async function processRefund(params: {
  * @param refundId - Refund ID
  * @returns Refund status
  */
-export async function getRefundStatus(refundId: string): Promise<{
+export async function getRefundStatus(
+  refundId: string,
+  options?: { syncRazorpay?: boolean },
+): Promise<{
   success: boolean;
   refund?: any;
   error?: string;
@@ -885,6 +888,22 @@ export async function getRefundStatus(refundId: string): Promise<{
     // Get original amount from escrow (not stored in refund table)
     const originalAmount = refund.escrow?.amountInRupees || new Prisma.Decimal('0.00');
 
+    let providerRefund: any = null;
+    if (options?.syncRazorpay && refund.razorpayRefundId) {
+      try {
+        providerRefund = await razorpay.refunds.fetch(refund.razorpayRefundId);
+      } catch (error: any) {
+        logger.warn('Failed to sync refund status from Razorpay', {
+          refundId,
+          razorpayRefundId: refund.razorpayRefundId,
+          error: error?.message || String(error),
+        });
+      }
+    }
+
+    const providerAmountRupees = Number(providerRefund?.amount) / 100;
+    const hasProviderAmount = Number.isFinite(providerAmountRupees) && providerAmountRupees >= 0;
+
     return {
       success: true,
       refund: {
@@ -892,14 +911,21 @@ export async function getRefundStatus(refundId: string): Promise<{
         razorpayRefundId: refund.razorpayRefundId,
         amount: originalAmount.toString(),
         cancellationFee: refund.cancellationFee?.toString(),
-        refundAmount: refund.refundAmount.toString(),
+        refundAmount: hasProviderAmount
+          ? providerAmountRupees.toFixed(2)
+          : refund.refundAmount.toString(),
         toOtherParty: refund.toOtherParty?.toString(),
         toPlatform: refund.toPlatform?.toString(),
         reason: refund.reason,
         cancelledBy: refund.cancelledBy,
-        status: refund.status,
+        status: providerRefund?.status || refund.status,
+        razorpayRefundStatus: providerRefund?.status || null,
+        razorpaySpeedProcessed:
+          providerRefund?.speed_processed || providerRefund?.speed_requested || null,
         createdAt: refund.createdAt,
-        completedAt: refund.completedAt,
+        completedAt: providerRefund?.created_at
+          ? new Date(Number(providerRefund.created_at) * 1000).toISOString()
+          : refund.completedAt,
       },
     };
   } catch (error: any) {

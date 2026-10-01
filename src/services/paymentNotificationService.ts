@@ -191,9 +191,11 @@ export async function notifyRefundInitiated(params: {
   taskId?: string | null;
   reason?: string | null;
   email?: string | null;
+  /** Firebase uid of the email recipient when `posterUid` may be a profile _id */
+  emailUid?: string | null;
   userName?: string | null;
 }): Promise<void> {
-  const { posterUid, amount, taskTitle, taskId, reason, email, userName } = params;
+  const { posterUid, amount, taskTitle, taskId, reason, email, emailUid, userName } = params;
   logger.info('[paymentNotificationService] notifyRefundInitiated', {
     posterUid,
     amount,
@@ -227,7 +229,7 @@ export async function notifyRefundInitiated(params: {
       taskTitle: taskTitle || undefined,
       refundReason: reason || undefined,
       processingTime: '5-7 days',
-    });
+    }, emailUid || posterUid);
     if (!sent) {
       logger.warn('[paymentNotificationService] Refund initiated email not sent', { email });
     }
@@ -240,9 +242,11 @@ export async function notifyPayoutInitiated(params: {
   taskTitle?: string | null;
   taskId?: string | null;
   email?: string | null;
+  /** Firebase uid of the email recipient when `performerUid` may be a profile _id */
+  emailUid?: string | null;
   userName?: string | null;
 }): Promise<void> {
-  const { performerUid, amount, taskTitle, taskId, email, userName } = params;
+  const { performerUid, amount, taskTitle, taskId, email, emailUid, userName } = params;
   logger.info('[paymentNotificationService] notifyPayoutInitiated', {
     performerUid,
     amount,
@@ -270,7 +274,7 @@ export async function notifyPayoutInitiated(params: {
       amount: Number(amount),
       taskTitle: taskTitle || undefined,
       processingTime: 'a few minutes',
-    });
+    }, emailUid || performerUid);
     if (!sent) {
       logger.warn('[paymentNotificationService] Payout initiated email not sent', { email });
     }

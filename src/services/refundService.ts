@@ -69,7 +69,7 @@ function paiseToRupeeDecimal(paise: number): Prisma.Decimal {
   return new Prisma.Decimal((safe / 100).toFixed(2));
 }
 
-async function getProfileContact(uid: string): Promise<{ email?: string; name?: string } | null> {
+async function getProfileContact(uid: string): Promise<{ uid?: string; email?: string; name?: string } | null> {
   if (!uid || mongoose.connection.readyState !== 1) return null;
 
   try {
@@ -81,6 +81,7 @@ async function getProfileContact(uid: string): Promise<{ email?: string; name?: 
     if (!profile) return null;
 
     return {
+      uid: profile.uid ? String(profile.uid) : undefined,
       email: profile.email,
       name: profile.name || profile.displayName || 'User',
     };
@@ -807,6 +808,7 @@ export async function processRefund(params: {
         taskTitle,
         reason,
         email: posterContact?.email || null,
+        emailUid: posterContact?.uid || null,
         userName: posterContact?.name || null,
       }).catch((error) => {
         logger.warn('[RefundService.processRefund] Failed to send refund initiated notification', {

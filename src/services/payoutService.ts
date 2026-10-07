@@ -137,7 +137,7 @@ function pendingTaskPayoutJobId(taskId: string, performerUid: string): string {
   return `pending_task_payout_${taskId}_${performerUid}`;
 }
 
-async function getProfileContact(uid: string): Promise<{ email?: string; name?: string } | null> {
+async function getProfileContact(uid: string): Promise<{ uid?: string; email?: string; name?: string } | null> {
   if (!uid || mongoose.connection.readyState !== 1) return null;
 
   try {
@@ -149,6 +149,7 @@ async function getProfileContact(uid: string): Promise<{ email?: string; name?: 
     if (!profile) return null;
 
     return {
+      uid: profile.uid ? String(profile.uid) : undefined,
       email: profile.email,
       name: profile.name || profile.displayName || 'Tasker',
     };
@@ -866,6 +867,7 @@ export async function processPayout(params: {
         taskId: postgresEscrow.taskId,
         taskTitle,
         email: performerContact?.email || null,
+        emailUid: performerContact?.uid || null,
         userName: performerContact?.name || null,
       }).catch((error) => {
         logger.warn('Failed to send payout initiated notification', { error });
@@ -1876,6 +1878,7 @@ export async function processTaskCompletionPayout(params: {
         taskTitle,
         taskId,
         email: performerContact?.email || null,
+        emailUid: performerContact?.uid || null,
         userName: performerContact?.name || null,
       }).catch((error) => {
         logger.warn('Failed to send payout initiated notification', { error });

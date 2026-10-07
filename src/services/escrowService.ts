@@ -1588,7 +1588,8 @@ export async function updateEscrowOnPaymentCapture(
                   transactionId: razorpayPaymentId,
                   paymentDate: new Date().toLocaleString(),
                   isEscrow: true
-                }
+                },
+                notifyUid
               );
             }
           } else {
@@ -2200,7 +2201,8 @@ export async function releaseEscrow(
                   requesterName: posterProfile?.name || 'Poster',
                   transactionId: transactionId,
                   estimatedArrival: '1-2 business days'
-                }
+                },
+                performerNotifyUid
               );
             }
 

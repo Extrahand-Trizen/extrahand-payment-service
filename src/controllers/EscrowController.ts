@@ -12,9 +12,24 @@ import {
   getEscrowByBookingOrderId,
   releaseEscrow,
   updateEscrowAutoRelease,
+  convertPostgresEscrowToFrontendFormat,
 } from '../services/escrowService';
+import {
+  settlePendingRecurringVisitOrders,
+  withRecurringVisitOrderLock,
+} from '../services/recurringVisitOrderService';
 import { getTaskDeletionSafety } from '../services/deletionSafetyService';
-import { BadRequestError, NotFoundError } from '../errors/AppError';
+import { BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '../errors/AppError';
+import { TaskServiceClient } from '../clients/TaskServiceClient';
+import { calculatePosterFees } from '../services/feeCalculationService';
+import { pickCategoryFeeConfigKey } from '../services/feeConfigService';
+import {
+  isPaidEscrowRecord,
+  readEscrowVisitAmountRupees,
+  readRecurringVisitOrderScope,
+  validateRecurringVisitOrderAmounts,
+  visitAmountsMatch,
+} from '../utils/recurringVisitOrderValidation';
 
 export class EscrowController {
   /**
@@ -57,18 +72,134 @@ export class EscrowController {
       baseMeta.taskTitle = titleFromBody;
     }
 
+    const authenticatedUid = String(req.headers['x-user-id'] || '').trim() || posterUid;
+    let escrowPosterUid = posterUid;
+    let quotedVisitAmount: number | undefined;
+
+    const visitScope = readRecurringVisitOrderScope(String(taskId), baseMeta);
+    if (visitScope && 'error' in visitScope) {
+      throw new BadRequestError(visitScope.error);
+    }
+    if (visitScope) {
+      const quoteResult = await TaskServiceClient.quoteRecurringVisitPayment({
+        parentTaskId: visitScope.parentTaskId,
+        visitId: visitScope.visitId,
+        posterUid: authenticatedUid,
+        applicationId:
+          String(applicationId || baseMeta.applicationId || '').trim() || undefined,
+      });
+      if (!quoteResult.ok) {
+        if (quoteResult.status === 403) throw new ForbiddenError(quoteResult.error);
+        if (quoteResult.status === 404) throw new NotFoundError(quoteResult.error);
+        if (quoteResult.status === 409) throw new ConflictError(quoteResult.error);
+        if (quoteResult.status < 500) throw new BadRequestError(quoteResult.error);
+        throw new Error(quoteResult.error);
+      }
+      const { quote } = quoteResult;
+
+      const feeCategoryKey = pickCategoryFeeConfigKey(quote.categorySlug || quote.category);
+      const fees = await calculatePosterFees(quote.amount, feeCategoryKey);
+      const amountCheck = validateRecurringVisitOrderAmounts({
+        quotedVisitAmount: quote.amount,
+        quotedPlatformFeeTotal: Number(fees.platformFeeTotal),
+        requestedTaskAmount: taskAmount,
+        requestedGrossAmount: amount,
+      });
+      if (!amountCheck.ok) {
+        throw new BadRequestError(amountCheck.message);
+      }
+
+      baseMeta.visitId = visitScope.visitId;
+      baseMeta.parentTaskId = visitScope.parentTaskId;
+      baseMeta.recurringPlan = true;
+      baseMeta.visitBudgetRupees = quote.amount;
+      escrowPosterUid = authenticatedUid;
+      quotedVisitAmount = quote.amount;
+
+      const visitAmount = quote.amount;
+      const outcome = await withRecurringVisitOrderLock(
+        visitScope.parentTaskId,
+        visitScope.visitId,
+        async () => {
+          const existingForVisit = await getEscrowByTaskIdAndVisitId(
+            visitScope.parentTaskId,
+            visitScope.visitId,
+          );
+          if (existingForVisit && isPaidEscrowRecord(existingForVisit)) {
+            const paidVisitAmount = readEscrowVisitAmountRupees(existingForVisit);
+            if (paidVisitAmount != null && visitAmountsMatch(paidVisitAmount, visitAmount)) {
+              return { kind: 'alreadyPaid' as const, escrow: existingForVisit };
+            }
+            throw new ConflictError('A payment for this visit is already on hold');
+          }
+
+          const { reuse } = await settlePendingRecurringVisitOrders({
+            parentTaskId: visitScope.parentTaskId,
+            visitId: visitScope.visitId,
+            posterUid: escrowPosterUid,
+            performerUid,
+            applicationId: applicationId || null,
+            grossAmountRupees: Number(amount),
+            quotedVisitAmountRupees: visitAmount,
+            metadata: baseMeta,
+            authenticatedUid,
+          });
+          if (reuse) {
+            return {
+              kind: 'reused' as const,
+              escrow: await convertPostgresEscrowToFrontendFormat(reuse),
+              order: reuse.razorpayOrderData,
+            };
+          }
+
+          const created = await createEscrow({
+            taskId,
+            applicationId,
+            posterUid: escrowPosterUid,
+            performerUid,
+            amount,
+            taskAmount: visitAmount,
+            currency,
+            autoReleaseAfterDays,
+            taskCategory,
+            metadata: baseMeta,
+            authenticatedUid,
+          });
+          return { kind: 'created' as const, result: created };
+        },
+      );
+
+      if (outcome.kind === 'alreadyPaid') {
+        res.status(200).json({ success: true, alreadyPaid: true, escrow: outcome.escrow });
+        return;
+      }
+      if (outcome.kind === 'reused') {
+        res.status(200).json({ success: true, reused: true, escrow: outcome.escrow, order: outcome.order });
+        return;
+      }
+      if (!outcome.result.success) {
+        throw new Error(outcome.result.error || 'Failed to create escrow');
+      }
+      res.status(201).json({
+        success: true,
+        escrow: outcome.result.escrow,
+        order: outcome.result.order,
+      });
+      return;
+    }
+
     const result = await createEscrow({
       taskId,
       applicationId,
-      posterUid,
+      posterUid: escrowPosterUid,
       performerUid,
       amount,
-      taskAmount,
+      taskAmount: quotedVisitAmount ?? taskAmount,
       currency,
       autoReleaseAfterDays,
       taskCategory,
       metadata: baseMeta,
-      authenticatedUid: String(req.headers['x-user-id'] || '').trim() || posterUid,
+      authenticatedUid,
     });
 
     if (!result.success) {

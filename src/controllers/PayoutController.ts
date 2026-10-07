@@ -13,6 +13,8 @@ import {
 } from '../services/payoutBundleService';
 import { BadRequestError, NotFoundError } from '../errors/AppError';
 
+const TRUSTED_TASK_COMPLETION_PAYOUT_SERVICES = new Set(['task-service']);
+
 export class PayoutController {
   /**
    * POST /api/v1/payouts/process
@@ -77,6 +79,7 @@ export class PayoutController {
       useExtraCoins,
       requestedCoinRedeemRupees,
       visitId,
+      parentTaskId,
       source,
       isQuickCommerce,
     } = req.body;
@@ -90,19 +93,38 @@ export class PayoutController {
       throw new BadRequestError('amount must be a valid number greater than 0');
     }
 
+    // Only task-service completion flows are trusted internal callers. Everything else (the
+    // api-gateway relaying an app request, or an unnamed caller) acts for the authenticated user
+    // in X-User-Id and may only request that user's own payout.
+    const callerService = String(req.headers['x-service-name'] || '').trim();
+    const internalCaller = TRUSTED_TASK_COMPLETION_PAYOUT_SERVICES.has(callerService);
+    const callerUid = String(req.headers['x-user-id'] || '').trim();
+    if (!internalCaller) {
+      if (!callerUid) {
+        res.status(401).json({ success: false, error: 'Authenticated user required for payout' });
+        return;
+      }
+      if (callerUid !== String(performerUid).trim()) {
+        res.status(403).json({ success: false, error: 'Payout can only be requested by the assigned helper' });
+        return;
+      }
+    }
+
     const result = await processTaskCompletionPayout({
       taskId,
       performerUid,
       amount: numericAmount,
       taskTitle,
-      userId,
+      userId: internalCaller ? userId : callerUid,
       enqueueOnMissingBank: false,
       useExtraCoins: useExtraCoins === true,
       requestedCoinRedeemRupees:
         requestedCoinRedeemRupees != null ? Number(requestedCoinRedeemRupees) : undefined,
       visitId: typeof visitId === 'string' ? visitId : undefined,
-      source: typeof source === 'string' ? source : undefined,
-      isQuickCommerce: isQuickCommerce === true,
+      parentTaskId: typeof parentTaskId === 'string' ? parentTaskId : undefined,
+      source: internalCaller && typeof source === 'string' ? source : undefined,
+      isQuickCommerce: internalCaller && isQuickCommerce === true,
+      callerUid: internalCaller ? undefined : callerUid,
     });
 
     if (!result.success) {

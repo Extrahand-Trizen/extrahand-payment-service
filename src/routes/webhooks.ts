@@ -281,8 +281,8 @@ async function handleOrderPaid(payload: any): Promise<void> {
  * Handle payment.refunded / refund.processed — sync ExtraHand refund row with Razorpay.
  */
 async function handlePaymentRefunded(payload: {
-  refund?: { entity?: { id?: string; status?: string } };
-  payment?: { entity?: { id?: string } };
+  refund?: { entity?: { id?: string; status?: string; payment_id?: string } };
+  payment?: { entity?: { id?: string; amount?: number; amount_refunded?: number; status?: string } };
 }): Promise<void> {
   try {
     const refund = payload?.refund?.entity;

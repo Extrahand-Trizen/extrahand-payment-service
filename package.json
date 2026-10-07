@@ -19,6 +19,8 @@
     "test": "echo \"No tests specified\" && exit 0",
     "lint": "eslint src --ext .ts",
     "health": "curl -f http://localhost:4003/api/v1/health || exit 1",
+    "test:recurring-visit-order": "node --require ts-node/register/transpile-only --test src/utils/recurringVisitOrderValidation.test.ts",
+    "test:recurring-visit-integrity": "node --require ts-node/register/transpile-only --test src/services/recurringVisitPaymentIntegrity.test.ts",
     "test:bank-crypto": "node --require ts-node/register/transpile-only --test src/utils/bankFieldCrypto.test.ts src/utils/queryDateRange.test.ts",
     "migrate:bank-encryption": "ts-node --require dotenv/config scripts/run-bank-encryption-migration.ts",
     "sync:postgres-dev-to-prod": "ts-node --require dotenv/config scripts/sync-dev-postgres-to-prod.ts",

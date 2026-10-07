@@ -29,6 +29,17 @@ import { paymentRewardsFlags } from '../config/rewardsFlags';
 import { CoinUsageConfigProvider } from '../rewards/config/CoinUsageConfigProvider';
 import { CouponClient } from '../clients/CouponClient';
 import { recalculateBookNowTotalsAfterCouponDiscount } from './bookNowGstService';
+import {
+  isEscrowActiveHeldRecord,
+  isEscrowPaidRecord,
+  resolveEscrowPaymentTransition,
+} from '../utils/escrowPaymentState';
+import {
+  bindRecurringVisitCapture,
+  ensureDuplicateVisitPaymentRefund,
+  recurringVisitCaptureScope,
+  type DuplicateVisitRefundStatus,
+} from './recurringVisitCaptureService';
 
 /**
  * Generate unique escrow ID
@@ -193,7 +204,7 @@ function calculateAutoReleaseDays(autoReleaseDate: Date | null, createdAt: Date)
  * Computes derived fields: autoReleaseEnabled, autoReleaseAfterDays
  * Queries related tables for: releaseTransactionId, refundTransactionId, refundReason
  */
-async function convertPostgresEscrowToFrontendFormat(postgresEscrow: any): Promise<any> {
+export async function convertPostgresEscrowToFrontendFormat(postgresEscrow: any): Promise<any> {
   if (!postgresEscrow) return null;
 
   // Compute derived fields
@@ -994,20 +1005,6 @@ export async function reassignRecurringVisitEscrow(params: {
       return { success: false, error: 'Escrow does not belong to this task' };
     }
 
-    const status = String(existing.status || '').toLowerCase();
-    const paymentStatus = String(existing.paymentStatus || '').toLowerCase();
-    const isPaid =
-      status === 'held' ||
-      status === 'released' ||
-      paymentStatus === 'captured' ||
-      paymentStatus === 'authorized';
-    if (!isPaid) {
-      return {
-        success: false,
-        error: `Escrow payment is not held. Current status: ${existing.status}`,
-      };
-    }
-
     const metadata =
       existing.metadata && typeof existing.metadata === 'object' && !Array.isArray(existing.metadata)
         ? { ...(existing.metadata as Record<string, unknown>) }
@@ -1016,29 +1013,93 @@ export async function reassignRecurringVisitEscrow(params: {
     const currentVisitId =
       typeof metadata.visitId === 'string' ? metadata.visitId.trim() : '';
     const reassignedFromVisitId = currentVisitId || trimmedFromVisitId;
-    if (currentVisitId && currentVisitId !== trimmedFromVisitId) {
-      logger.warn('Reassign recurring visit: fromVisitId differs from escrow metadata visitId; proceeding', {
+    const movesPayment = currentVisitId !== trimmedToVisitId && trimmedFromVisitId !== trimmedToVisitId;
+
+    // Tagging a paid escrow with its own visit is allowed for any paid escrow; moving it to
+    // another visit requires a payment that is still held (not released, refunded or failed).
+    const eligible = movesPayment ? isEscrowActiveHeldRecord(existing) : isEscrowPaidRecord(existing);
+    if (!eligible) {
+      logger.warn('Reassign recurring visit rejected: escrow payment is not active', {
+        escrowId: trimmedEscrowId,
+        taskId: trimmedTaskId,
+        status: existing.status,
+        paymentStatus: existing.paymentStatus,
+        fromVisitId: trimmedFromVisitId,
+        toVisitId: trimmedToVisitId,
+      });
+      return {
+        success: false,
+        error: `Escrow payment is not held. Current status: ${existing.status}`,
+      };
+    }
+
+    if (currentVisitId !== trimmedToVisitId) {
+      const targetPayments = await prisma.escrow.findMany({
+        where: {
+          taskId: trimmedTaskId,
+          id: { not: existing.id },
+          metadata: { path: ['visitId'], equals: trimmedToVisitId },
+        },
+      });
+      const targetActive = targetPayments.find((row) => isEscrowActiveHeldRecord(row));
+      if (targetActive) {
+        logger.warn('Reassign recurring visit rejected: target visit already has an active payment', {
+          escrowId: trimmedEscrowId,
+          taskId: trimmedTaskId,
+          toVisitId: trimmedToVisitId,
+          targetEscrowId: targetActive.escrowId,
+        });
+        return { success: false, error: 'Target visit already has an active payment' };
+      }
+    }
+    if (
+      currentVisitId &&
+      currentVisitId !== trimmedFromVisitId &&
+      currentVisitId !== trimmedToVisitId
+    ) {
+      logger.warn('Reassign recurring visit rejected: escrow was paid for a different visit', {
         escrowId: trimmedEscrowId,
         taskId: trimmedTaskId,
         metadataVisitId: currentVisitId,
         requestedFromVisitId: trimmedFromVisitId,
         toVisitId: trimmedToVisitId,
       });
+      return {
+        success: false,
+        error: 'Escrow belongs to a different visit',
+      };
     }
+
+    // Conditional on the row that was validated: a concurrent re-tag either already did this
+    // move (idempotent success) or changed the escrow (rejected, caller re-reads).
+    const writeVisitTag = async (
+      nextMetadata: Record<string, unknown>,
+    ): Promise<{ ok: true; escrow: typeof existing } | { ok: false; error: string }> => {
+      const result = await prisma.escrow.updateMany({
+        where: { id: existing.id, updatedAt: existing.updatedAt },
+        data: { metadata: nextMetadata as any },
+      });
+      const latest = await prisma.escrow.findUnique({ where: { id: existing.id } });
+      if (!latest) return { ok: false, error: 'Escrow not found' };
+      if (result.count === 0) {
+        const latestVisitId = String((latest.metadata as Record<string, unknown> | null)?.visitId || '').trim();
+        if (latestVisitId !== trimmedToVisitId) {
+          return { ok: false, error: 'Escrow changed while reassigning; please retry' };
+        }
+      }
+      return { ok: true, escrow: latest };
+    };
 
     if (trimmedFromVisitId === trimmedToVisitId || currentVisitId === trimmedToVisitId) {
       if (currentVisitId !== trimmedToVisitId) {
-        const updated = await prisma.escrow.update({
-          where: { id: existing.id },
-          data: {
-            metadata: {
-              ...metadata,
-              visitId: trimmedToVisitId,
-              recurringVisitReassignedFrom: reassignedFromVisitId || undefined,
-              recurringVisitReassignedAt: new Date().toISOString(),
-            } as any,
-          },
+        const written = await writeVisitTag({
+          ...metadata,
+          visitId: trimmedToVisitId,
+          recurringVisitReassignedFrom: reassignedFromVisitId || undefined,
+          recurringVisitReassignedAt: new Date().toISOString(),
         });
+        if (!written.ok) return { success: false, error: written.error };
+        const updated = written.escrow;
 
         logger.info('Reassign recurring visit: bound missing visitId metadata to target visit', {
           escrowId: updated.escrowId,
@@ -1059,17 +1120,14 @@ export async function reassignRecurringVisitEscrow(params: {
       return { success: true, escrow: escrowForFrontend };
     }
 
-    const updated = await prisma.escrow.update({
-      where: { id: existing.id },
-      data: {
-        metadata: {
-          ...metadata,
-          visitId: trimmedToVisitId,
-          recurringVisitReassignedFrom: reassignedFromVisitId,
-          recurringVisitReassignedAt: new Date().toISOString(),
-        } as any,
-      },
+    const written = await writeVisitTag({
+      ...metadata,
+      visitId: trimmedToVisitId,
+      recurringVisitReassignedFrom: reassignedFromVisitId,
+      recurringVisitReassignedAt: new Date().toISOString(),
     });
+    if (!written.ok) return { success: false, error: written.error };
+    const updated = written.escrow;
 
     logger.info('Reassigned recurring visit escrow to next visit', {
       escrowId: updated.escrowId,
@@ -1191,6 +1249,48 @@ function readCouponRedemptionIdFromEscrow(escrow: {
 }
 
 /**
+ * Books the money of a duplicate visit capture (transaction + payment ledger entry) so its refund
+ * balances, without any of the bound-payment side effects. Safe to repeat.
+ */
+async function recordDuplicateVisitCapture(
+  escrow: any,
+  razorpayOrderId: string,
+  razorpayPaymentId: string,
+  sanitizedPaymentData: unknown,
+): Promise<void> {
+  if (razorpayPaymentId && razorpayPaymentId !== 'unknown') {
+    const metadata = sanitizedPaymentData ? { payment: sanitizedPaymentData as any } : undefined;
+    await prisma.transaction.upsert({
+      where: { razorpayPaymentId },
+      create: {
+        userId: escrow.posterUid,
+        taskId: escrow.taskId,
+        razorpayOrderId,
+        razorpayPaymentId,
+        amount: escrow.amountInRupees,
+        currency: escrow.currency || 'INR',
+        status: 'captured',
+        metadata,
+      },
+      update: {},
+    });
+  }
+  const paymentEntry = await prisma.ledger.findFirst({ where: { escrowId: escrow.id, type: 'payment' } });
+  if (!paymentEntry) {
+    const balance = (await getEscrowBalance(escrow.id)).balance || new Prisma.Decimal('0.00');
+    await createLedgerEntry({
+      escrowId: escrow.id,
+      type: 'payment',
+      amount: escrow.amountInRupees,
+      balanceBefore: balance,
+      balanceAfter: balance.add(escrow.amountInRupees),
+      description: `Duplicate visit payment captured for escrow ${escrow.escrowId} (to be refunded)`,
+      metadata: { razorpayPaymentId, razorpayOrderId, escrowId: escrow.escrowId, duplicateVisitPayment: true },
+    });
+  }
+}
+
+/**
  * Update escrow status when payment is captured
  * Now uses Postgres only
  */
@@ -1199,7 +1299,15 @@ export async function updateEscrowOnPaymentCapture(
   razorpayPaymentId: string,
   paymentStatus: 'authorized' | 'captured' | 'failed',
   razorpayPaymentData?: any // Optional: Razorpay payment response
-): Promise<{ success: boolean; escrow?: any; error?: string }> {
+): Promise<{
+  success: boolean;
+  escrow?: any;
+  ignored?: boolean;
+  /** Capture for a recurring visit that already had a bound payment; it is refunded, never held. */
+  duplicate?: boolean;
+  refundStatus?: DuplicateVisitRefundStatus;
+  error?: string;
+}> {
   try {
     if (!(await ensurePostgresReady())) {
       return { success: false, error: 'Postgres not connected' };
@@ -1224,10 +1332,55 @@ export async function updateEscrowOnPaymentCapture(
       return { success: false, error: 'Escrow not found' };
     }
 
-    const existingEscrow = postgresEscrow;
+    let existingEscrow = postgresEscrow;
+
+    // Sanitize payment data if provided
+    const sanitizedPaymentData = razorpayPaymentData 
+      ? sanitizeRazorpayPaymentData(razorpayPaymentData)
+      : null;
+
+    // Recurring visit captures are bound (or rejected as duplicates) under the visit lock.
+    const visitCaptureScope =
+      paymentStatus === 'captured' ? recurringVisitCaptureScope(existingEscrow) : null;
+    let recurringCaptureBound = false;
+    if (visitCaptureScope) {
+      const binding = await bindRecurringVisitCapture({
+        escrowDbId: existingEscrow.id,
+        scope: visitCaptureScope,
+        razorpayPaymentId,
+        razorpayPaymentData: sanitizedPaymentData,
+      });
+      if (binding.outcome === 'ignored') {
+        logger.warn('Ignored recurring visit capture event', {
+          escrowId: existingEscrow.escrowId,
+          razorpayOrderId,
+          razorpayPaymentId,
+          currentStatus: binding.escrow.status,
+          currentPaymentStatus: binding.escrow.paymentStatus,
+          reason: binding.reason,
+        });
+        return { success: true, ignored: true, escrow: binding.escrow };
+      }
+      if (binding.outcome === 'duplicate') {
+        await recordDuplicateVisitCapture(binding.escrow, razorpayOrderId, razorpayPaymentId, sanitizedPaymentData);
+        const refund = await ensureDuplicateVisitPaymentRefund(binding.escrow.id);
+        const latest = (await prisma.escrow.findUnique({ where: { id: binding.escrow.id } })) ?? binding.escrow;
+        return {
+          success: true,
+          duplicate: true,
+          refundStatus: refund.status,
+          escrow: await convertPostgresEscrowToFrontendFormat(latest),
+        };
+      }
+      const boundEscrow = binding.escrow as typeof existingEscrow;
+      postgresEscrow = boundEscrow;
+      existingEscrow = boundEscrow;
+      recurringCaptureBound = binding.outcome === 'winner';
+    }
 
     // Idempotency: if this escrow is already captured for this payment, skip update and ledger
     if (
+      !recurringCaptureBound &&
       paymentStatus === 'captured' &&
       existingEscrow.paymentStatus === 'captured' &&
       existingEscrow.razorpayPaymentId === razorpayPaymentId
@@ -1245,10 +1398,20 @@ export async function updateEscrowOnPaymentCapture(
       return { success: true, escrow: postgresEscrow };
     }
 
-    // Sanitize payment data if provided
-    const sanitizedPaymentData = razorpayPaymentData 
-      ? sanitizeRazorpayPaymentData(razorpayPaymentData)
-      : null;
+    if (!recurringCaptureBound) {
+    const transition = resolveEscrowPaymentTransition(existingEscrow, paymentStatus, razorpayPaymentId);
+    if (!transition.apply) {
+      logger.warn('Ignored stale escrow payment event', {
+        escrowId: existingEscrow.escrowId,
+        razorpayOrderId,
+        razorpayPaymentId,
+        event: paymentStatus,
+        currentStatus: existingEscrow.status,
+        currentPaymentStatus: existingEscrow.paymentStatus,
+        reason: transition.reason,
+      });
+      return { success: true, ignored: true, escrow: existingEscrow };
+    }
 
     const updateData: any = {
       razorpayPaymentId,
@@ -1269,16 +1432,39 @@ export async function updateEscrowOnPaymentCapture(
       updateData.status = 'cancelled';
       updateData.errorMessage = (razorpayPaymentData as any)?.error_description || 'Payment failed';
       updateData.errorCode = (razorpayPaymentData as any)?.error_code || null;
+    }
+
+    // Conditional on the state that was validated, so a concurrent capture cannot be overwritten.
+    const guarded = await prisma.escrow.updateMany({
+      where: {
+        id: postgresEscrow.id,
+        status: existingEscrow.status,
+        paymentStatus: existingEscrow.paymentStatus,
+      },
+      data: updateData,
+    });
+    if (guarded.count === 0) {
+      const latest = await prisma.escrow.findUnique({ where: { id: postgresEscrow.id } });
+      logger.warn('Ignored escrow payment event: escrow changed concurrently', {
+        escrowId: existingEscrow.escrowId,
+        razorpayOrderId,
+        razorpayPaymentId,
+        event: paymentStatus,
+        currentStatus: latest?.status,
+        currentPaymentStatus: latest?.paymentStatus,
+      });
+      return { success: true, ignored: true, escrow: latest ?? existingEscrow };
+    }
+    }
+
+    if (paymentStatus === 'failed') {
       const couponRedemptionId = readCouponRedemptionIdFromEscrow(postgresEscrow);
       if (couponRedemptionId) {
         await CouponClient.cancel(couponRedemptionId);
       }
     }
 
-    let updatedEscrow = await prisma.escrow.update({
-      where: { id: postgresEscrow.id },
-      data: updateData,
-    });
+    let updatedEscrow = (await prisma.escrow.findUnique({ where: { id: postgresEscrow.id } }))!;
 
     const shouldPersistTransaction =
       typeof razorpayPaymentId === 'string' &&
@@ -1809,32 +1995,32 @@ export async function getEscrowByTaskIdAndVisitId(
       return null;
     }
 
-    let postgresEscrow = await prisma.escrow.findFirst({
-      where: {
-        taskId,
-        metadata: {
-          path: ['visitId'],
-          equals: trimmedVisitId,
+    const visitWhere = {
+      taskId,
+      metadata: {
+        path: ['visitId'],
+        equals: trimmedVisitId,
+      },
+    };
+    // A later abandoned order for the same visit must not hide the payment that was captured.
+    const paidWhere = {
+      ...visitWhere,
+      OR: [
+        { status: { in: ['held', 'released'] } },
+        {
+          paymentStatus: { in: ['captured', 'authorized'] },
+          status: { notIn: ['refunded', 'cancelled'] },
         },
-      },
-      orderBy: {
-        createdAt: 'desc',
-      },
-    });
+      ],
+    };
+    const findForVisit = async (client: typeof prisma): Promise<any | null> =>
+      (await client.escrow.findFirst({ where: paidWhere, orderBy: { createdAt: 'desc' } })) ??
+      (await client.escrow.findFirst({ where: visitWhere, orderBy: { createdAt: 'desc' } }));
+
+    let postgresEscrow = await findForVisit(prisma);
 
     if (!postgresEscrow && prismaDev) {
-      postgresEscrow = await prismaDev.escrow.findFirst({
-        where: {
-          taskId,
-          metadata: {
-            path: ['visitId'],
-            equals: trimmedVisitId,
-          },
-        },
-        orderBy: {
-          createdAt: 'desc',
-        },
-      });
+      postgresEscrow = await findForVisit(prismaDev);
     }
 
     return postgresEscrow ? await convertPostgresEscrowToFrontendFormat(postgresEscrow) : null;

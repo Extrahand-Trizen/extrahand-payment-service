@@ -14,7 +14,8 @@ import {
   cancelEscrowByTaskId,
   cancelEscrowByBookingOrderId,
 } from '../services/cancellationService';
-import { BadRequestError, NotFoundError } from '../errors/AppError';
+import { BadRequestError, ConflictError, NotFoundError } from '../errors/AppError';
+import { issueDirectRefund } from '../services/recurringVisitRefundSync';
 import logger from '../config/logger';
 import { prisma } from '../config/prisma';
 import { isReviewBypassOrderId } from '../utils/reviewBypass';
@@ -347,11 +348,25 @@ export class PaymentController {
     }
 
     const paymentEnvironment = await resolvePaymentEnvironmentForPayment(paymentId);
-    const result =
+    const outcome = await issueDirectRefund(String(paymentId), () =>
       amountPaise != null
-        ? await createRefundAmountPaise(paymentId, Number(amountPaise), paymentEnvironment)
-        : await createRefund(paymentId, amount, paymentEnvironment);
+        ? createRefundAmountPaise(paymentId, Number(amountPaise), paymentEnvironment)
+        : createRefund(paymentId, amount, paymentEnvironment),
+    );
 
+    if (outcome.kind === 'rejected') {
+      throw new ConflictError(outcome.error);
+    }
+    if (outcome.kind === 'already_refunded') {
+      res.json({
+        success: true,
+        refund: outcome.refund,
+        refundId: outcome.refund.id,
+      });
+      return;
+    }
+
+    const result = outcome.result;
     if (!result.success) {
       throw new Error(result.error || 'Failed to create refund');
     }

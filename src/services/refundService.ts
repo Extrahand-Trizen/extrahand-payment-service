@@ -403,6 +403,19 @@ async function processRefundUnlocked(params: {
     if (!Number.isFinite(maxRefundablePaise) || maxRefundablePaise <= 0) {
       return { success: false, error: 'No capturable balance left to refund on this payment' };
     }
+    // A partial amount would mark the visit payment refunded while part of it was kept.
+    if (recurringVisitEscrow && amount && !precomputedSettlement) {
+      const requestedPaise = Math.round(Number(amount) * 100);
+      if (requestedPaise !== maxRefundablePaise) {
+        return {
+          success: false,
+          error:
+            requestedPaise > maxRefundablePaise
+              ? 'Refund amount exceeds the refundable visit payment'
+              : 'Partial refunds of a recurring visit payment are not supported; refund the full visit payment',
+        };
+      }
+    }
 
     /** Actual INR captured on Razorpay (task + platform fee + GST, etc.) */
     const capturedRupees = new Prisma.Decimal((capturedPaise / 100).toFixed(2));

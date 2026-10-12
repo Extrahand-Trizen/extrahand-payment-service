@@ -10,6 +10,10 @@ import {
 import { validatePaymentRewardsConfiguration } from './config/rewardsFlags';
 // Payouts/escrow release/auto-release disabled - handled elsewhere
 // import { startAutoReleaseScheduler, stopAutoReleaseScheduler } from './services/autoReleaseScheduler';
+import {
+  startRefundReconciliationScheduler,
+  stopRefundReconciliationScheduler,
+} from './services/refundReconciliationScheduler';
 
 const env = validateEnv();
 
@@ -52,6 +56,8 @@ async function startServer() {
       }
     });
 
+    startRefundReconciliationScheduler();
+
     // Graceful shutdown — only when CapRover/Docker actually stops the container
     let shuttingDown = false;
     const gracefulShutdown = async (signal: string) => {
@@ -61,6 +67,7 @@ async function startServer() {
         hint: 'If this happens during a payment, CapRover likely restarted the app (deploy, OOM, or old health 503).',
       });
       try {
+        stopRefundReconciliationScheduler();
         await disconnectDatabase();
       } catch (err) {
         logger.error('Error during graceful shutdown disconnect', {

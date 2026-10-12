@@ -426,12 +426,13 @@ export type DirectRefundOutcome<T extends RazorpayRefundResult> =
 
 /**
  * POST /payment/refund for a recurring visit payment: refuses paid-out or already refunded
- * payments, records the refund once and marks only that escrow refunded. Other payments keep
- * the existing direct Razorpay refund behaviour.
+ * payments and partial amounts, records the refund once and marks only that escrow refunded.
+ * Other payments keep the existing direct Razorpay refund behaviour.
  */
 export async function issueDirectRefund<T extends RazorpayRefundResult>(
   razorpayPaymentId: string,
   issueRefund: () => Promise<T>,
+  options: { requestedPaise?: number | null } = {},
 ): Promise<DirectRefundOutcome<T>> {
   const paymentId = str(razorpayPaymentId);
   const found = await findEscrowForRazorpayPayment({ razorpayPaymentId: paymentId });
@@ -462,6 +463,25 @@ export async function issueDirectRefund<T extends RazorpayRefundResult>(
       return { kind: 'rejected', error: 'Payment already refunded' };
     }
 
+    // A partial refund would leave the visit counted as paid in full; only the whole remaining
+    // visit payment can be refunded here.
+    if (options.requestedPaise != null) {
+      const requested = Number(options.requestedPaise);
+      const refundable = escrowCapturedPaise(escrow) - (await refundedPaiseForPayment(paymentId));
+      if (!Number.isFinite(requested) || requested <= 0) {
+        return { kind: 'rejected', error: 'Refund amount must be a positive number' };
+      }
+      if (requested > refundable) {
+        return { kind: 'rejected', error: 'Refund amount exceeds the refundable visit payment' };
+      }
+      if (requested < refundable) {
+        return {
+          kind: 'rejected',
+          error: 'Partial refunds of a recurring visit payment are not supported; refund the full visit payment',
+        };
+      }
+    }
+
     const result = await issueRefund();
     if (!result.success) return { kind: 'issued', result };
     const recorded = await recordDirectRefund(escrow, paymentId, result.refund);
@@ -473,6 +493,48 @@ export async function issueDirectRefund<T extends RazorpayRefundResult>(
 
   if (syncEscrowDbId) await syncRecurringVisitRefundSafely(syncEscrowDbId);
   return outcome;
+}
+
+export type UserDirectRefundOutcome =
+  | { kind: 'already_refunded'; refund: Record<string, unknown> }
+  | { kind: 'not_found' }
+  | { kind: 'forbidden' }
+  | { kind: 'rejected'; error: string };
+
+/**
+ * POST /payment/refund relayed for an app user. The payment must be an escrow the user paid for,
+ * and a user never starts a new refund here: refunds of active or cancelled bookings go through
+ * the cancellation flow, which applies the cancellation policy. Asking again for a refund that
+ * already happened returns the recorded refund.
+ */
+export async function resolveUserDirectRefund(
+  razorpayPaymentId: string,
+  callerUids: string[],
+): Promise<UserDirectRefundOutcome> {
+  const paymentId = str(razorpayPaymentId);
+  const found = await findEscrowForRazorpayPayment({ razorpayPaymentId: paymentId });
+  if (!found.escrow) return { kind: 'not_found' };
+  const escrow = found.escrow;
+  const poster = str(escrow.posterUid);
+  if (!poster || !callerUids.includes(poster)) return { kind: 'forbidden' };
+
+  const status = str(escrow.status).toLowerCase();
+  if (status === 'released') {
+    return { kind: 'rejected', error: 'This payment was already paid out; a refund needs manual review' };
+  }
+  if (status === 'refunded') {
+    const existing = await prisma.refund.findFirst({
+      where: { paymentId, status: { in: ['processing', 'completed'] }, razorpayRefundId: { not: null } },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (isRecurringVisitEscrow(escrow)) await syncRecurringVisitRefundSafely(escrow.id);
+    if (existing) return { kind: 'already_refunded', refund: refundEntityFromRecord(existing) };
+    return { kind: 'rejected', error: 'Payment already refunded' };
+  }
+  return {
+    kind: 'rejected',
+    error: 'Refunds for a booking are issued by cancelling the task or visit',
+  };
 }
 
 type RefundWebhookPayment = { id?: string; amount?: number; amount_refunded?: number; status?: string };

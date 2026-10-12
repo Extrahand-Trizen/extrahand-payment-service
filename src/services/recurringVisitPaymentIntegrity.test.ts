@@ -1733,3 +1733,235 @@ test('Refund P: non-recurring direct refunds keep the existing behaviour (no esc
   assert.equal(fakeDb.refund.rows.length, 0);
   assert.equal(refundSyncs.length, 0);
 });
+
+// ── Refund / cancel authorization ────────────────────────────────────────────
+const { RefundController } = require('../controllers/RefundController');
+
+/** App request relayed by the api-gateway for the verified user. */
+const gatewayUser = (uid: string) => ({ 'x-service-name': 'api-gateway', 'x-user-id': uid });
+const taskServiceCaller = { 'x-service-name': 'task-service' };
+const statusOf = (code: number) => (error: any) => error?.statusCode === code;
+const seedPlainEscrow = (overrides: Row = {}) =>
+  seedEscrow({ escrowId: 'EN', taskId: 'task-plain', visitId: null, metadata: {}, razorpayPaymentId: 'pay_N', ...overrides });
+const FAR_START = () => new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+
+async function callController(handler: (req: any, res: any) => Promise<void>, body: Row, headers: Row = {}): Promise<Row> {
+  const res = fakeRes();
+  await handler({ body, headers } as any, res as any);
+  return res.body;
+}
+const refundAs = (headers: Row, body: Row) => callController(PaymentController.createRefund, body, headers);
+const cancelAs = (headers: Row, body: Row) => callController(PaymentController.cancelPayment, body, headers);
+const processAs = (headers: Row, body: Row) => callController(RefundController.processRefund, body, headers);
+
+test('Auth refund 1: a user cannot refund another user’s payment', async () => {
+  resetRefundSync();
+  seedEscrow({ escrowId: 'E1', razorpayPaymentId: 'pay_1' });
+  seedPlainEscrow();
+  await assert.rejects(refundAs(gatewayUser('mallory'), { paymentId: 'pay_1', amountPaise: 55000 }), statusOf(403));
+  await assert.rejects(refundAs(gatewayUser('mallory'), { paymentId: 'pay_N' }), statusOf(403));
+  await assert.rejects(refundAs({ 'x-service-name': 'api-gateway' }, { paymentId: 'pay_N' }), statusOf(401));
+  await assert.rejects(refundAs(gatewayUser('mallory'), { paymentId: 'pay_unknown' }), statusOf(404));
+  assert.equal(razorpayRefunds.length, 0);
+  assert.equal(escrowRow('E1').status, 'held');
+  assert.equal(escrowRow('EN').status, 'held');
+});
+
+test('Auth refund 2: the owner cannot refund a released payment or start a refund outside cancellation', async () => {
+  resetRefundSync();
+  seedEscrow({ escrowId: 'ER', status: 'released', razorpayPaymentId: 'pay_R' });
+  seedPlainEscrow();
+  await assert.rejects(refundAs(gatewayUser('poster-uid'), { paymentId: 'pay_R' }), /already paid out/);
+  // An active (held) payment is refunded only through cancellation, which applies the policy.
+  await assert.rejects(refundAs(gatewayUser('poster-uid'), { paymentId: 'pay_N', amountPaise: 55000 }), statusOf(409));
+  await assert.rejects(refundAs(gatewayUser('poster-uid'), { paymentId: 'pay_N', amount: 999999 }), statusOf(409));
+  assert.equal(razorpayRefunds.length, 0);
+  assert.equal(escrowRow('ER').status, 'released');
+  assert.equal(escrowRow('EN').status, 'held');
+});
+
+test('Auth refund 3: a recurring refund can neither exceed nor partially refund the visit payment', async () => {
+  resetRefundSync();
+  seedEscrow({ escrowId: 'E1', razorpayPaymentId: 'pay_1' });
+  await assert.rejects(refundAs({}, { paymentId: 'pay_1', amountPaise: 60000 }), /exceeds the refundable/);
+  await assert.rejects(refundAs({}, { paymentId: 'pay_1', amountPaise: 20000 }), /Partial refunds of a recurring visit payment/);
+  await assert.rejects(refundAs({}, { paymentId: 'pay_1', amount: 200 }), /Partial refunds of a recurring visit payment/);
+  const viaProcess = await processRefund({
+    razorpayOrderId: escrowRow('E1').razorpayOrderId,
+    razorpayPaymentId: 'pay_1',
+    cancelledBy: 'poster',
+    taskStartDate: new Date(FAR_START()),
+    cancelledAt: new Date(),
+    amount: 200,
+  });
+  assert.equal(viaProcess.success, false);
+  assert.match(viaProcess.error, /Partial refunds of a recurring visit payment/);
+  assert.equal(razorpayRefunds.length, 0);
+  assert.equal(escrowRow('E1').status, 'held', 'still payable only because nothing was refunded');
+  assert.equal(refundSyncs.length, 0);
+});
+
+test('Auth refund 4: a full recurring refund syncs exactly that visit; repeats by the owner stay idempotent', async () => {
+  resetRefundSync();
+  seedEscrow({ escrowId: 'E1', visitId: V1, razorpayPaymentId: 'pay_1' });
+  seedEscrow({ escrowId: 'E2', visitId: V2, razorpayPaymentId: 'pay_2' });
+  const first = await refundAs(taskServiceCaller, { paymentId: 'pay_1', amountPaise: 55000 });
+  assert.equal(first.success, true);
+  assert.deepEqual(refundSyncs, [expectedSync(escrowRow('E1'), V1)]);
+
+  const again = await refundAs(gatewayUser('poster-uid'), { paymentId: 'pay_1', amountPaise: 55000 });
+  const internalAgain = await refundAs({}, { paymentId: 'pay_1' });
+  assert.equal(again.refundId, first.refundId, 'owner sees the recorded refund');
+  assert.equal(internalAgain.refundId, first.refundId);
+  assert.equal(razorpayRefunds.length, 1, 'no duplicate refund');
+  assert.equal(refundRowsFor('pay_1').length, 1);
+  assert.equal(refundSyncs.length, 1, 'no duplicate visit sync');
+  assert.equal(escrowRow('E2').status, 'held');
+  await assert.rejects(refundAs(gatewayUser('mallory'), { paymentId: 'pay_1' }), statusOf(403));
+});
+
+test('Auth cancel 1: a user cannot cancel another user’s payment by any identifier', async () => {
+  resetRefundSync();
+  const n = seedPlainEscrow();
+  for (const body of [{ escrowId: 'EN' }, { razorpayOrderId: n.razorpayOrderId }, { taskId: 'task-plain' }]) {
+    await assert.rejects(
+      cancelAs(gatewayUser('mallory'), { ...body, cancelledBy: 'poster', userId: 'poster-uid', taskStartDate: FAR_START() }),
+      statusOf(403),
+    );
+  }
+  assert.equal(razorpayRefunds.length, 0);
+  assert.equal(escrowRow('EN').status, 'held');
+});
+
+test('Auth cancel 2: cancelledBy, userId and fee inputs come from the escrow, not the request', async () => {
+  resetRefundSync();
+  seedPlainEscrow();
+  const body = await cancelAs(gatewayUser('poster-uid'), {
+    escrowId: 'EN',
+    cancelledBy: 'performer',
+    userId: 'someone-else',
+    feeBaseAmount: 1,
+    partnerAssigned: false,
+    taskStartDate: FAR_START(),
+  });
+  assert.equal(body.success, true);
+  assert.equal(escrowRow('EN').status, 'refunded');
+  assert.equal(fakeDb.refund.rows.length, 1);
+  assert.equal(fakeDb.refund.rows[0].cancelledBy, 'poster', 'role derived from the escrow');
+  assert.equal(fakeDb.performerPenalty.rows.length, 0, 'no performer penalty from a spoofed role');
+});
+
+test('Auth cancel 3: only task-service may supply a precomputed settlement', async () => {
+  resetRefundSync();
+  seedPlainEscrow();
+  seedPlainEscrow({ escrowId: 'EM', razorpayOrderId: 'order_EM', razorpayPaymentId: 'pay_M' });
+  seedPlainEscrow({ escrowId: 'ET', razorpayOrderId: 'order_ET', razorpayPaymentId: 'pay_T' });
+  const refundedPaiseFor = (paymentId: string) => razorpayRefunds.filter((r) => r.paymentId === paymentId).map((r) => r.paise);
+  const settlement = { refundAmountPaise: 1000, workerCompensationPaise: 0, platformRetainedAmountPaise: 54000 };
+
+  await cancelAs(gatewayUser('poster-uid'), { escrowId: 'EN', settlement, taskStartDate: FAR_START() });
+  assert.equal(refundedPaiseFor('pay_N').length, 1);
+  assert.notEqual(refundedPaiseFor('pay_N')[0], 1000, 'user settlement ignored; policy decides');
+
+  await cancelAs({ 'x-service-name': 'coupon-service' }, { escrowId: 'EM', cancelledBy: 'poster', settlement, taskStartDate: FAR_START() });
+  assert.equal(refundedPaiseFor('pay_M').length, 1);
+  assert.notEqual(refundedPaiseFor('pay_M')[0], 1000, 'other backends cannot supply a settlement either');
+
+  await cancelAs(taskServiceCaller, { escrowId: 'ET', cancelledBy: 'poster', settlement, taskStartDate: FAR_START() });
+  assert.deepEqual(refundedPaiseFor('pay_T'), [1000], 'task-service settlement honoured');
+});
+
+test('Auth cancel 4: a recurring task id never selects a visit payment', async () => {
+  resetRefundSync();
+  seedEscrow({ escrowId: 'E1', visitId: V1, razorpayPaymentId: 'pay_1' });
+  seedEscrow({ escrowId: 'E2', visitId: V2, razorpayPaymentId: 'pay_2', createdAt: now() }); // newest
+  await assert.rejects(
+    cancelAs(taskServiceCaller, { taskId: PARENT, cancelledBy: 'poster', taskStartDate: FAR_START() }),
+    /exact visit payment/,
+  );
+  await assert.rejects(
+    cancelAs(gatewayUser('poster-uid'), { taskId: PARENT, taskStartDate: FAR_START() }),
+    /exact visit payment/,
+  );
+  await assert.rejects(
+    processAs(gatewayUser('poster-uid'), { taskId: PARENT, taskStartDate: FAR_START() }),
+    /exact visit payment/,
+  );
+  assert.equal(razorpayRefunds.length, 0);
+  assert.equal(escrowRow('E1').status, 'held');
+  assert.equal(escrowRow('E2').status, 'held');
+
+  // The exact visit payment still cancels, refunds and syncs only that visit.
+  const exact = await cancelAs(taskServiceCaller, { escrowId: 'E1', cancelledBy: 'poster', taskStartDate: FAR_START() });
+  assert.equal(exact.success, true);
+  assert.equal(escrowRow('E1').status, 'refunded');
+  assert.equal(escrowRow('E2').status, 'held');
+  assert.deepEqual(refundSyncs.map((s) => s.visitId), [V1]);
+});
+
+test('Auth cancel 5: a failed refund never leaves a captured escrow cancelled; a retry recovers', async () => {
+  resetRefundSync();
+  seedPlainEscrow();
+  refundApiDown = true;
+  await assert.rejects(cancelAs(taskServiceCaller, { escrowId: 'EN', cancelledBy: 'poster', taskStartDate: FAR_START() }), statusOf(409));
+  await assert.rejects(cancelAs(gatewayUser('poster-uid'), { escrowId: 'EN', taskStartDate: FAR_START() }), statusOf(409));
+  assert.equal(escrowRow('EN').status, 'held', 'money still held, not cancelled');
+  assert.equal(reconciliationJobs('cancel_refund_failed').length, 1, 'failure is visible to operators');
+  assert.equal(fakeDb.refund.rows.length, 0);
+
+  refundApiDown = false;
+  const retry = await cancelAs(taskServiceCaller, { escrowId: 'EN', cancelledBy: 'poster', taskStartDate: FAR_START() });
+  assert.equal(retry.success, true);
+  assert.equal(escrowRow('EN').status, 'refunded');
+  assert.equal(razorpayRefunds.length, 1);
+});
+
+test('Auth cancel 6: legitimate cancellations keep working', async () => {
+  resetRefundSync();
+  // Unpaid order: cancelled without a refund, as before.
+  seedPlainEscrow({ escrowId: 'EU', razorpayOrderId: 'order_EU', razorpayPaymentId: null, status: 'pending', paymentStatus: 'pending' });
+  const unpaid = await cancelAs(gatewayUser('poster-uid'), { razorpayOrderId: 'order_EU', taskStartDate: FAR_START() });
+  assert.equal(unpaid.success, true);
+  assert.equal(escrowRow('EU').status, 'cancelled');
+
+  // Paid order cancelled by its payer through the app and by task-service.
+  seedPlainEscrow({ escrowId: 'EP', razorpayOrderId: 'order_EP', razorpayPaymentId: 'pay_P' });
+  seedPlainEscrow({ escrowId: 'EQ', razorpayOrderId: 'order_EQ', razorpayPaymentId: 'pay_Q', taskId: 'task-q' });
+  assert.equal((await cancelAs(gatewayUser('poster-uid'), { escrowId: 'EP', taskStartDate: FAR_START() })).success, true);
+  assert.equal((await cancelAs(taskServiceCaller, { taskId: 'task-q', cancelledBy: 'poster', taskStartDate: FAR_START() })).success, true);
+  assert.equal(escrowRow('EP').status, 'refunded');
+  assert.equal(escrowRow('EQ').status, 'refunded');
+  assert.deepEqual(razorpayRefunds.map((r) => r.paymentId).sort(), ['pay_P', 'pay_Q']);
+
+  // Repeating a finished cancel does not refund twice.
+  await cancelAs(gatewayUser('poster-uid'), { escrowId: 'EP', taskStartDate: FAR_START() }).catch(() => undefined);
+  assert.equal(razorpayRefunds.length, 2);
+});
+
+test('Auth refunds/process: ownership, derived role and server-decided amount', async () => {
+  resetRefundSync();
+  const n = seedPlainEscrow();
+  const body = { razorpayOrderId: n.razorpayOrderId, razorpayPaymentId: 'pay_N', taskStartDate: FAR_START(), cancelledAt: new Date().toISOString() };
+  await assert.rejects(processAs(gatewayUser('mallory'), { ...body, cancelledBy: 'poster' }), statusOf(403));
+  await assert.rejects(processAs(gatewayUser('poster-uid'), { ...body, amount: 550 }), statusOf(400));
+  await assert.rejects(processAs(gatewayUser('poster-uid'), { ...body, razorpayPaymentId: 'pay_other' }), /does not belong/);
+  assert.equal(razorpayRefunds.length, 0);
+
+  const done = await processAs(gatewayUser('poster-uid'), { ...body, cancelledBy: 'performer', feeBaseAmount: 1 });
+  assert.equal(done.success, true);
+  assert.equal(fakeDb.refund.rows[0].cancelledBy, 'poster');
+  assert.equal(razorpayRefunds.length, 1);
+});
+
+test('Auth line item: app users cannot request a Book Now line-item refund', async () => {
+  resetRefundSync();
+  await assert.rejects(
+    callController(
+      PaymentController.cancelBookNowLineItem,
+      { bookingOrderId: 'bo-1', taskId: 't-1', lineAmountRupees: 500, taskStartDate: FAR_START() },
+      gatewayUser('poster-uid'),
+    ),
+    statusOf(403),
+  );
+  assert.equal(razorpayRefunds.length, 0);
+});

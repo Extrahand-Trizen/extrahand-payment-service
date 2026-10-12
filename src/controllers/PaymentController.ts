@@ -13,9 +13,16 @@ import {
   cancelEscrow,
   cancelEscrowByTaskId,
   cancelEscrowByBookingOrderId,
+  resolveEscrowForCancellation,
 } from '../services/cancellationService';
-import { BadRequestError, ConflictError, NotFoundError } from '../errors/AppError';
-import { issueDirectRefund } from '../services/recurringVisitRefundSync';
+import { BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '../errors/AppError';
+import { issueDirectRefund, resolveUserDirectRefund } from '../services/recurringVisitRefundSync';
+import {
+  callerMaySupplySettlement,
+  callerRoleForEscrow,
+  requireCallerIdentity,
+  resolvePaymentCaller,
+} from '../utils/paymentCaller';
 import logger from '../config/logger';
 import { prisma } from '../config/prisma';
 import { isReviewBypassOrderId } from '../utils/reviewBypass';
@@ -347,11 +354,30 @@ export class PaymentController {
       throw new BadRequestError('Payment ID is required');
     }
 
-    const paymentEnvironment = await resolvePaymentEnvironmentForPayment(paymentId);
-    const outcome = await issueDirectRefund(String(paymentId), () =>
+    const caller = resolvePaymentCaller(req);
+    if (caller.kind === 'user') {
+      const userOutcome = await resolveUserDirectRefund(String(paymentId), requireCallerIdentity(caller));
+      if (userOutcome.kind === 'not_found') throw new NotFoundError('Payment not found');
+      if (userOutcome.kind === 'forbidden') throw new ForbiddenError('You can only refund your own payments');
+      if (userOutcome.kind === 'rejected') throw new ConflictError(userOutcome.error);
+      res.json({ success: true, refund: userOutcome.refund, refundId: userOutcome.refund.id });
+      return;
+    }
+
+    const requestedPaise =
       amountPaise != null
-        ? createRefundAmountPaise(paymentId, Number(amountPaise), paymentEnvironment)
-        : createRefund(paymentId, amount, paymentEnvironment),
+        ? Number(amountPaise)
+        : amount != null && amount !== ''
+        ? Math.round(Number(amount) * 100)
+        : null;
+    const paymentEnvironment = await resolvePaymentEnvironmentForPayment(paymentId);
+    const outcome = await issueDirectRefund(
+      String(paymentId),
+      () =>
+        amountPaise != null
+          ? createRefundAmountPaise(paymentId, Number(amountPaise), paymentEnvironment)
+          : createRefund(paymentId, amount, paymentEnvironment),
+      { requestedPaise },
     );
 
     if (outcome.kind === 'rejected') {
@@ -452,6 +478,15 @@ export class PaymentController {
     const partnerAssignedToPass =
       typeof partnerAssigned === 'boolean' ? partnerAssigned : undefined;
 
+    const caller = resolvePaymentCaller(req);
+    if (settlementToPass && !callerMaySupplySettlement(caller)) {
+      logger.warn('[PaymentController.cancelPayment] Ignoring settlement from an untrusted caller', {
+        callerKind: caller.kind,
+        callerService: caller.service || null,
+      });
+      settlementToPass = undefined;
+    }
+
     const common = {
       reason,
       userId,
@@ -468,7 +503,29 @@ export class PaymentController {
 
     let result;
 
-    if (razorpayOrderId) {
+    if (caller.kind === 'user') {
+      // App request: the payment must be the caller's, and identity, role and fee inputs come from
+      // the escrow record — never from the request body.
+      const uids = requireCallerIdentity(caller);
+      const resolved = await resolveEscrowForCancellation({ razorpayOrderId, bookingOrderId, escrowId, taskId });
+      if ('error' in resolved) {
+        if (resolved.notFound) throw new NotFoundError(resolved.error);
+        if (/postgres/i.test(resolved.error)) throw new Error(resolved.error);
+        throw new BadRequestError(resolved.error);
+      }
+      const role = callerRoleForEscrow(resolved.escrow, uids);
+      if (!role) {
+        throw new ForbiddenError('You can only cancel your own payments');
+      }
+      result = await cancelPaymentOrder({
+        razorpayOrderId: resolved.escrow.razorpayOrderId,
+        reason,
+        userId: uids[0],
+        cancelledBy: role,
+        taskStartDate: taskStart,
+        taskTitle: common.taskTitle,
+      });
+    } else if (razorpayOrderId) {
       result = await cancelPaymentOrder({
         razorpayOrderId,
         ...common,
@@ -504,6 +561,9 @@ export class PaymentController {
         cancelledBy,
         error: result.error,
       });
+      if (result.refundPending) {
+        throw new ConflictError(result.error || 'Refund could not be processed; the payment was not cancelled');
+      }
       throw new Error(result.error || 'Failed to cancel payment');
     }
 
@@ -550,6 +610,12 @@ export class PaymentController {
       partnerReachedLocation,
       partnerAssigned,
     } = req.body;
+
+    // The line amount and fee inputs come from the caller, so only task-service (which owns the
+    // booking and its cancellation rules) may request a line-item refund.
+    if (resolvePaymentCaller(req).kind === 'user') {
+      throw new ForbiddenError('Cancel the booked service from the task to get a refund');
+    }
 
     if (!bookingOrderId || !taskId || lineAmountRupees == null || !taskStartDate) {
       throw new BadRequestError(

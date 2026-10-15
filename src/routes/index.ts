@@ -15,27 +15,76 @@ import internalRoutes from './internal';
 import { validateEnv } from '../config/env';
 import { isDatabaseConnected, isPostgresConnected } from '../config/database';
 import { pingPostgres } from '../config/prisma';
+import logger from '../config/logger';
 
 const router = express.Router();
 const env = validateEnv();
 
-// Health check — live-ping Postgres so ETIMEDOUT / Neon sleep is visible
+/**
+ * Liveness for CapRover / Docker — MUST stay 200 while the process is up.
+ * Returning 503 on a Neon/Mongo blip caused Swarm to SIGTERM the container
+ * mid-payment (Mongo/Prisma “disconnected” logs).
+ *
+ * Use GET /api/v1/health/ready for deeper dependency checks (ops / alerts).
+ */
 router.get('/health', async (req, res) => {
-  const pg = await pingPostgres(5000);
-  const healthy = pg.ok;
-  res.status(healthy ? 200 : 503).json({
-    success: healthy,
+  let pg: Awaited<ReturnType<typeof pingPostgres>> = {
+    ok: false,
+    ms: 0,
+    error: 'not_probed',
+  };
+  try {
+    pg = await pingPostgres(2500);
+  } catch (error) {
+    pg = {
+      ok: false,
+      ms: 0,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+
+  const mongoOk = isDatabaseConnected();
+  const degraded = !pg.ok || !mongoOk;
+
+  if (degraded) {
+    logger.warn('Health liveness OK but dependencies degraded', {
+      mongodb: mongoOk ? 'connected' : 'disconnected',
+      postgres: pg.ok ? 'connected' : 'unreachable',
+      postgresError: pg.error,
+      postgresErrorCode: pg.code,
+    });
+  }
+
+  res.status(200).json({
+    success: true,
     service: 'extrahand-payment-service',
-    status: healthy ? 'healthy' : 'degraded',
+    status: degraded ? 'degraded' : 'healthy',
     timestamp: new Date().toISOString(),
     environment: env.NODE_ENV,
     razorpay: 'configured',
-    mongodb: isDatabaseConnected() ? 'connected' : 'disconnected',
+    mongodb: mongoOk ? 'connected' : 'disconnected',
     postgres: pg.ok ? 'connected' : 'unreachable',
     postgresPingMs: pg.ms,
     postgresError: pg.error,
     postgresErrorCode: pg.code,
     postgresBootFlag: isPostgresConnected() ? 'connected' : 'disconnected',
+  });
+});
+
+/** Readiness — 503 when Postgres is down (do NOT point CapRover HTTP health here). */
+router.get('/health/ready', async (req, res) => {
+  const pg = await pingPostgres(5000);
+  const ready = pg.ok;
+  res.status(ready ? 200 : 503).json({
+    success: ready,
+    service: 'extrahand-payment-service',
+    status: ready ? 'ready' : 'not_ready',
+    timestamp: new Date().toISOString(),
+    mongodb: isDatabaseConnected() ? 'connected' : 'disconnected',
+    postgres: pg.ok ? 'connected' : 'unreachable',
+    postgresPingMs: pg.ms,
+    postgresError: pg.error,
+    postgresErrorCode: pg.code,
   });
 });
 

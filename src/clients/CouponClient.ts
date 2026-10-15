@@ -18,6 +18,13 @@ export type CouponValidateResult = {
   error?: string;
 };
 
+export type CouponLineItem = {
+  serviceId: string;
+  amount: number;
+  skuSlug?: string;
+  categorySlug?: string;
+};
+
 export type CouponReserveResult = {
   success: boolean;
   redemption?: {
@@ -61,10 +68,12 @@ export class CouponClient {
   static async validate(params: {
     couponCode: string;
     userId: string;
-    flowType: 'BOOK_NOW' | 'POST_COMPARE';
+    flowType: 'BOOK_NOW' | 'POST_COMPARE' | 'QUICK_COMMERCE';
     amount: number;
     serviceIds?: string[];
-    lineItems?: Array<{ serviceId: string; amount: number }>;
+    lineItems?: CouponLineItem[];
+    city?: string;
+    pinCode?: string;
   }): Promise<CouponValidateResult> {
     try {
       const response = await axios.post(
@@ -74,7 +83,14 @@ export class CouponClient {
           flowType: params.flowType,
           amount: params.amount,
           serviceIds: params.serviceIds || [],
-          lineItems: params.lineItems || [],
+          lineItems: (params.lineItems || []).map((item) => ({
+            serviceId: item.serviceId,
+            amount: item.amount,
+            skuSlug: item.skuSlug,
+            categorySlug: item.categorySlug,
+          })),
+          city: params.city,
+          pinCode: params.pinCode,
         },
         { headers: this.headers(params.userId), timeout: 10000 }
       );
@@ -99,10 +115,12 @@ export class CouponClient {
 
   static async listEligible(params: {
     userId: string;
-    flowType: 'BOOK_NOW' | 'POST_COMPARE';
+    flowType: 'BOOK_NOW' | 'POST_COMPARE' | 'QUICK_COMMERCE';
     amount: number;
     serviceIds?: string[];
-    lineItems?: Array<{ serviceId: string; amount: number }>;
+    lineItems?: CouponLineItem[];
+    city?: string;
+    pinCode?: string;
   }): Promise<{
     success: boolean;
     coupons?: Array<{
@@ -130,7 +148,14 @@ export class CouponClient {
           flowType: params.flowType,
           amount: params.amount,
           serviceIds: params.serviceIds || [],
-          lineItems: params.lineItems || [],
+          lineItems: (params.lineItems || []).map((item) => ({
+            serviceId: item.serviceId,
+            amount: item.amount,
+            skuSlug: item.skuSlug,
+            categorySlug: item.categorySlug,
+          })),
+          city: params.city,
+          pinCode: params.pinCode,
         },
         { headers: this.headers(params.userId), timeout: 15000 }
       );
@@ -154,10 +179,12 @@ export class CouponClient {
   static async reserve(params: {
     couponCode: string;
     userId: string;
-    flowType: 'BOOK_NOW' | 'POST_COMPARE';
+    flowType: 'BOOK_NOW' | 'POST_COMPARE' | 'QUICK_COMMERCE';
     amount: number;
     serviceIds?: string[];
-    lineItems?: Array<{ serviceId: string; amount: number }>;
+    lineItems?: CouponLineItem[];
+    city?: string;
+    pinCode?: string;
     bookingOrderId?: string | null;
     taskId?: string | null;
   }): Promise<CouponReserveResult> {
@@ -169,7 +196,14 @@ export class CouponClient {
           flowType: params.flowType,
           amount: params.amount,
           serviceIds: params.serviceIds || [],
-          lineItems: params.lineItems || [],
+          lineItems: (params.lineItems || []).map((item) => ({
+            serviceId: item.serviceId,
+            amount: item.amount,
+            skuSlug: item.skuSlug,
+            categorySlug: item.categorySlug,
+          })),
+          city: params.city,
+          pinCode: params.pinCode,
           bookingOrderId: params.bookingOrderId || null,
           taskId: params.taskId || null,
         },

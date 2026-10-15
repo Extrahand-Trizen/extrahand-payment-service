@@ -15,6 +15,34 @@ import { sanitizeRazorpayData } from '../utils/paymentSanitizer';
 import { processRefund } from './refundService';
 import type { CancellationSettlementPaise } from './refundService';
 import { createPerformerCancellationPenalty } from './performerPenaltyService';
+import { flagRefundReconciliation, isRecurringVisitEscrow } from './recurringVisitRefundSync';
+import { taskHoldsRecurringVisitEscrows } from './recurringVisitPayoutScope';
+
+export type CancellationResult = {
+  success: boolean;
+  cancelled?: boolean;
+  refundRequired?: boolean;
+  /** The refund failed: the payment is still held and the escrow was not cancelled. */
+  refundPending?: boolean;
+  refund?: any;
+  error?: string;
+};
+
+/** Refund outcomes after which the booking may still be cancelled (nothing is owed back). */
+const CANCEL_WITHOUT_REFUND_ERRORS = [
+  /no capturable balance/i,
+  /refund after cancellation fees is zero/i,
+  /already refunded/i,
+];
+
+function holdsCapturedPayment(escrow: { status?: unknown; paymentStatus?: unknown }): boolean {
+  const status = String(escrow.status || '').toLowerCase();
+  const paymentStatus = String(escrow.paymentStatus || '').toLowerCase();
+  return status === 'held' || paymentStatus === 'captured';
+}
+
+const RECURRING_TASK_CANCEL_ERROR =
+  'Recurring visit cancellations must identify the exact visit payment (escrowId or razorpayOrderId)';
 
 /**
  * Cancel payment order
@@ -40,7 +68,7 @@ export async function cancelPayment(params: {
   partnerAssigned?: boolean;
   /** Hourly Helper: execute settlement from task-service (no fee recalculation). */
   precomputedSettlement?: CancellationSettlementPaise;
-}): Promise<{ success: boolean; cancelled?: boolean; refundRequired?: boolean; refund?: any; error?: string }> {
+}): Promise<CancellationResult> {
   try {
     const {
       razorpayOrderId,
@@ -95,6 +123,7 @@ export async function cancelPayment(params: {
 
     let razorpayCancelled = false;
     let refundRequired = false;
+    let refundFailure: string | null = null;
 
     // If a payment exists, try refund automatically
     if (canAttemptRefund && postgresEscrow.razorpayPaymentId) {
@@ -200,16 +229,16 @@ export async function cancelPayment(params: {
           });
           if ((refundResult.error || '').toLowerCase().includes('no capturable balance')) {
             refundRequired = false;
+          } else if (!CANCEL_WITHOUT_REFUND_ERRORS.some((pattern) => pattern.test(refundResult.error || ''))) {
+            refundFailure = refundResult.error || 'Refund failed';
           }
-          // Continue with cancellation even if refund fails
-          // The escrow will be marked as cancelled, and refund can be processed manually later
         }
       } catch (refundError: any) {
         logger.error('❌ Error processing refund automatically', {
           razorpayOrderId,
           error: refundError.message,
         });
-        // Continue with cancellation even if refund processing fails
+        refundFailure = refundError?.message || 'Refund failed';
       }
     } else {
       // Try to cancel the Razorpay order (if not captured)
@@ -232,6 +261,23 @@ export async function cancelPayment(params: {
     const updatedEscrow = await prisma.escrow.findUnique({
       where: { id: postgresEscrow.id },
     });
+
+    // A captured payment whose refund failed stays held (recoverable): marking it cancelled would
+    // record a cancellation while the customer's money was never returned.
+    if (refundFailure && updatedEscrow && updatedEscrow.status !== 'refunded' && holdsCapturedPayment(updatedEscrow)) {
+      await flagRefundReconciliation(updatedEscrow, 'cancel_refund_failed', {
+        razorpayOrderId,
+        error: refundFailure,
+        cancelledBy: cancelledBy || 'poster',
+        userId: userId || null,
+      });
+      return {
+        success: false,
+        refundRequired: true,
+        refundPending: true,
+        error: `Refund could not be processed, so the payment was not cancelled: ${refundFailure}`,
+      };
+    }
 
     // Only update escrow status if it hasn't been updated to 'refunded' by processRefund
     if (updatedEscrow && updatedEscrow.status !== 'refunded') {
@@ -359,7 +405,7 @@ export async function cancelEscrow(params: {
   partnerReachedLocation?: boolean;
   partnerAssigned?: boolean;
   precomputedSettlement?: CancellationSettlementPaise;
-}): Promise<{ success: boolean; cancelled?: boolean; refundRequired?: boolean; error?: string }> {
+}): Promise<CancellationResult> {
   try {
     const {
       escrowId,
@@ -426,7 +472,7 @@ export async function cancelEscrowByBookingOrderId(params: {
   partnerReachedLocation?: boolean;
   partnerAssigned?: boolean;
   precomputedSettlement?: CancellationSettlementPaise;
-}): Promise<{ success: boolean; cancelled?: boolean; refundRequired?: boolean; refund?: any; error?: string }> {
+}): Promise<CancellationResult> {
   try {
     const {
       bookingOrderId,
@@ -474,6 +520,66 @@ export async function cancelEscrowByBookingOrderId(params: {
 }
 
 /**
+ * Escrow for a task-id cancel. A recurring plan holds one payment per visit, so a task id alone
+ * (whose newest payment may belong to another visit) never selects a recurring visit payment.
+ */
+async function resolveEscrowForTaskCancellation(
+  taskId: string,
+): Promise<{ escrow: any } | { error: string; notFound?: boolean }> {
+  const trimmed = String(taskId || '').trim();
+  if (trimmed && (await taskHoldsRecurringVisitEscrows(trimmed))) {
+    logger.error('Cancel by task id refused for a recurring visit plan', { taskId: trimmed });
+    return { error: RECURRING_TASK_CANCEL_ERROR };
+  }
+  const { resolveEscrowRecordForTaskId } = await import('./escrowService');
+  const escrow = await resolveEscrowRecordForTaskId(trimmed);
+  if (!escrow) return { error: 'Escrow not found for task', notFound: true };
+  if (isRecurringVisitEscrow(escrow)) {
+    logger.error('Cancel by task id resolved a recurring visit payment; refused', {
+      taskId: trimmed,
+      escrowId: escrow.escrowId,
+    });
+    return { error: RECURRING_TASK_CANCEL_ERROR };
+  }
+  return { escrow };
+}
+
+/**
+ * The exact escrow a relayed user cancel refers to (same precedence as the cancel endpoint).
+ */
+export async function resolveEscrowForCancellation(ids: {
+  razorpayOrderId?: unknown;
+  bookingOrderId?: unknown;
+  escrowId?: unknown;
+  taskId?: unknown;
+}): Promise<{ escrow: any } | { error: string; notFound?: boolean }> {
+  const value = (v: unknown) => (v == null ? '' : String(v).trim());
+  const orderId = value(ids.razorpayOrderId);
+  const bookingOrderId = value(ids.bookingOrderId);
+  const escrowId = value(ids.escrowId);
+  const taskId = value(ids.taskId);
+  if (!isPostgresConnected()) return { error: 'Postgres not connected' };
+
+  let escrow: any = null;
+  if (orderId) {
+    escrow = await prisma.escrow.findUnique({ where: { razorpayOrderId: orderId } });
+  } else if (bookingOrderId) {
+    const { findEscrowByBookingOrderId } = await import('./escrowService');
+    escrow = await findEscrowByBookingOrderId(bookingOrderId);
+  } else if (escrowId) {
+    escrow = await prisma.escrow.findUnique({ where: { escrowId } });
+  } else if (taskId) {
+    const resolved = await resolveEscrowForTaskCancellation(taskId);
+    if ('error' in resolved) return resolved;
+    escrow = resolved.escrow;
+  } else {
+    return { error: 'Either razorpayOrderId, escrowId, bookingOrderId, or taskId is required' };
+  }
+  if (!escrow) return { error: 'Escrow not found', notFound: true };
+  return { escrow };
+}
+
+/**
  * Cancel escrow by task ID
  *
  * Book Now escrows are often stored under `booknow-pending-{bookingOrderId}` while
@@ -493,7 +599,7 @@ export async function cancelEscrowByTaskId(params: {
   partnerReachedLocation?: boolean;
   partnerAssigned?: boolean;
   precomputedSettlement?: CancellationSettlementPaise;
-}): Promise<{ success: boolean; cancelled?: boolean; refundRequired?: boolean; refund?: any; error?: string }> {
+}): Promise<CancellationResult> {
   try {
     const {
       taskId,
@@ -514,12 +620,11 @@ export async function cancelEscrowByTaskId(params: {
       return { success: false, error: 'Postgres not connected' };
     }
 
-    const { resolveEscrowRecordForTaskId } = await import('./escrowService');
-    const postgresEscrow = await resolveEscrowRecordForTaskId(taskId);
-
-    if (!postgresEscrow) {
-      return { success: false, error: 'Escrow not found for task' };
+    const resolved = await resolveEscrowForTaskCancellation(taskId);
+    if ('error' in resolved) {
+      return { success: false, error: resolved.error };
     }
+    const postgresEscrow = resolved.escrow;
 
     return await cancelPayment({
       razorpayOrderId: postgresEscrow.razorpayOrderId,

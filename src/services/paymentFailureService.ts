@@ -50,6 +50,9 @@ export async function handlePaymentFailure(params: {
       logger.error('❌ Failed to update escrow on payment failure:', updateResult.error);
       return { success: false, error: updateResult.error };
     }
+    if (updateResult.ignored) {
+      return { success: true };
+    }
 
     // Create ledger entry for payment failure
     const postgresEscrow = await prisma.escrow.findUnique({

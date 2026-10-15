@@ -3,8 +3,13 @@ import { prisma, prismaDev } from '../config/prisma';
 import { applyPayoutStatusToProfile } from '../services/userPaymentProfileService';
 import { notifyPayoutCompleted } from '../services/paymentNotificationService';
 import { Prisma } from '@prisma/client';
-import { BadRequestError, NotFoundError } from '../errors/AppError';
+import { BadRequestError, ConflictError, NotFoundError } from '../errors/AppError';
 import { createRefundAmountPaise } from '../services/paymentService';
+import {
+  markEscrowRefunded,
+  syncRecurringVisitRefundSafely,
+  withRecurringEscrowRefundLock,
+} from '../services/recurringVisitRefundSync';
 import { createLedgerEntry, getEscrowBalance } from '../services/ledgerService';
 import { toAdminBankAccount } from '../services/bankAccountSecrets';
 import { calculateFees } from '../services/feeCalculationService';
@@ -1208,9 +1213,49 @@ export class AdminFinanceController {
       throw new BadRequestError('razorpayOrderId and razorpayPaymentId are required');
     }
 
-    const escrow = await prisma.escrow.findUnique({ where: { razorpayOrderId } });
-    if (!escrow) throw new NotFoundError('Escrow not found');
+    const located = await prisma.escrow.findUnique({ where: { razorpayOrderId } });
+    if (!located) throw new NotFoundError('Escrow not found');
+    if (located.razorpayPaymentId && located.razorpayPaymentId !== razorpayPaymentId) {
+      throw new BadRequestError('razorpayPaymentId does not belong to this escrow');
+    }
 
+    let syncEscrowDbId: string | null = null;
+    const response = await withRecurringEscrowRefundLock(located, async () => {
+      const escrow = await prisma.escrow.findUnique({ where: { id: located.id } });
+      if (!escrow) throw new NotFoundError('Escrow not found');
+
+      const existingRefund = await prisma.refund.findFirst({
+        where: { paymentId: razorpayPaymentId, status: { in: ['processing', 'completed'] } },
+        orderBy: { createdAt: 'desc' },
+      });
+      if (escrow.status === 'refunded' || existingRefund) {
+        if (escrow.status === 'refunded') syncEscrowDbId = escrow.id;
+        if (!existingRefund) throw new ConflictError('Escrow already refunded');
+        return { success: true, refund: existingRefund, alreadyRefunded: true };
+      }
+      if (escrow.status === 'released') {
+        throw new ConflictError('Escrow already paid out; refund needs manual reconciliation');
+      }
+
+      const refund = await AdminFinanceController.issueManualRefund(escrow, {
+        razorpayPaymentId,
+        amount,
+        reason,
+        cancelledBy,
+      });
+      syncEscrowDbId = escrow.id;
+      return { success: true, refund };
+    });
+
+    if (syncEscrowDbId) await syncRecurringVisitRefundSafely(syncEscrowDbId);
+    res.json(response);
+  }
+
+  private static async issueManualRefund(
+    escrow: Prisma.EscrowGetPayload<Record<string, never>>,
+    params: { razorpayPaymentId: string; amount?: unknown; reason?: string; cancelledBy?: string },
+  ) {
+    const { razorpayPaymentId, amount, reason, cancelledBy } = params;
     const amountPaise = amount != null ? Math.round(Number(amount) * 100) : undefined;
     const fallbackPaise = Math.round(Number(escrow.amountInRupees.toString()) * 100);
     const razorpayRefund = await createRefundAmountPaise(
@@ -1242,10 +1287,7 @@ export class AdminFinanceController {
       },
     });
 
-    await prisma.escrow.update({
-      where: { id: escrow.id },
-      data: { status: 'refunded', refundedAt: new Date() },
-    });
+    await markEscrowRefunded(escrow, { source: 'admin_manual_refund', razorpayRefundId: refund.razorpayRefundId });
 
     const balanceResult = await getEscrowBalance(escrow.id);
     const currentBalance = balanceResult.balance || new Prisma.Decimal('0.00');
@@ -1278,7 +1320,7 @@ export class AdminFinanceController {
       },
     });
 
-    res.json({ success: true, refund });
+    return refund;
   }
 
   static async getLedger(req: Request, res: Response): Promise<void> {

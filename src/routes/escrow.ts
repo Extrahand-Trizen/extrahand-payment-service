@@ -25,6 +25,8 @@ router.patch(
   asyncHandler(EscrowController.reassignRecurringVisit),
 );
 
+router.patch('/:escrowId/link-task', asyncHandler(EscrowController.linkTask));
+
 /**
  * GET /api/v1/escrow/status/:escrowId
  * Get escrow status by escrow ID

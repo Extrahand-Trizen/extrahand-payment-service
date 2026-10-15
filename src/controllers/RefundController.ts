@@ -1,6 +1,8 @@
 import { Response, Request } from 'express';
 import { processRefund, getRefundStatus, getRefundsByEscrowId } from '../services/refundService';
-import { BadRequestError, NotFoundError } from '../errors/AppError';
+import { resolveEscrowForCancellation } from '../services/cancellationService';
+import { BadRequestError, ForbiddenError, NotFoundError } from '../errors/AppError';
+import { callerRoleForEscrow, requireCallerIdentity, resolvePaymentCaller } from '../utils/paymentCaller';
 
 export class RefundController {
   /**
@@ -21,6 +23,12 @@ export class RefundController {
       assignedAt,
       feeBaseAmount,
     } = req.body;
+
+    const caller = resolvePaymentCaller(req);
+    if (caller.kind === 'user') {
+      await RefundController.processUserRefund(req, res, requireCallerIdentity(caller));
+      return;
+    }
 
     // Validate required fields — allow taskId alone as fallback
     if (!razorpayOrderId && !taskId) {
@@ -71,6 +79,61 @@ export class RefundController {
   }
 
   /**
+   * POST /api/v1/refunds/process relayed for an app user: the payment must be the caller's, the
+   * caller's role comes from the escrow record, and the amount and fee inputs are server-decided.
+   */
+  private static async processUserRefund(req: Request, res: Response, callerUids: string[]): Promise<void> {
+    const { razorpayOrderId, razorpayPaymentId, taskId, reason, taskStartDate, amount } = req.body;
+
+    if (amount != null && amount !== '') {
+      throw new BadRequestError('The refund amount is set by the cancellation policy; do not send amount');
+    }
+    if (!razorpayOrderId && !taskId) {
+      throw new BadRequestError('razorpayOrderId or taskId is required');
+    }
+    const taskStart = new Date(taskStartDate);
+    if (!taskStartDate || isNaN(taskStart.getTime())) {
+      throw new BadRequestError('A valid taskStartDate is required');
+    }
+
+    const resolved = await resolveEscrowForCancellation({ razorpayOrderId, taskId });
+    if ('error' in resolved) {
+      if (resolved.notFound) throw new NotFoundError(resolved.error);
+      if (/postgres/i.test(resolved.error)) throw new Error(resolved.error);
+      throw new BadRequestError(resolved.error);
+    }
+    const escrow = resolved.escrow;
+    const role = callerRoleForEscrow(escrow, callerUids);
+    if (!role) {
+      throw new ForbiddenError('You can only refund your own payments');
+    }
+    const escrowPaymentId = String(escrow.razorpayPaymentId || '').trim();
+    const requestedPaymentId = String(razorpayPaymentId || '').trim();
+    if (requestedPaymentId && escrowPaymentId && requestedPaymentId !== escrowPaymentId) {
+      throw new BadRequestError('Payment does not belong to this booking');
+    }
+
+    const result = await processRefund({
+      razorpayOrderId: escrow.razorpayOrderId,
+      razorpayPaymentId: escrowPaymentId,
+      reason,
+      cancelledBy: role,
+      taskStartDate: taskStart,
+      cancelledAt: new Date(),
+      userId: callerUids[0],
+    });
+
+    if (!result.success) {
+      throw new BadRequestError(result.error || 'Failed to process refund');
+    }
+
+    res.json({
+      success: true,
+      refund: result.refund,
+    });
+  }
+
+  /**
    * GET /api/v1/refunds/status/:refundId
    * Get refund status
    */
@@ -81,7 +144,8 @@ export class RefundController {
       throw new BadRequestError('refundId is required');
     }
 
-    const result = await getRefundStatus(refundId);
+    const syncRazorpay = String(req.query.syncRazorpay || '').toLowerCase() === 'true';
+    const result = await getRefundStatus(refundId, { syncRazorpay });
 
     if (!result.success) {
       throw new NotFoundError(result.error || 'Refund not found');

@@ -5,6 +5,7 @@ import {
   getOrderDetails,
   getPaymentDetails,
   createRefund,
+  createRefundAmountPaise,
 } from '../services/paymentService';
 import { updateEscrowOnPaymentCapture } from '../services/escrowService';
 import {
@@ -12,21 +13,69 @@ import {
   cancelEscrow,
   cancelEscrowByTaskId,
   cancelEscrowByBookingOrderId,
+  resolveEscrowForCancellation,
 } from '../services/cancellationService';
-import { BadRequestError, NotFoundError } from '../errors/AppError';
+import { BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '../errors/AppError';
+import { issueDirectRefund, resolveUserDirectRefund } from '../services/recurringVisitRefundSync';
+import {
+  callerMaySupplySettlement,
+  callerRoleForEscrow,
+  requireCallerIdentity,
+  resolvePaymentCaller,
+} from '../utils/paymentCaller';
 import logger from '../config/logger';
 import { prisma } from '../config/prisma';
-import { RAZORPAY_CONFIG } from '../config/razorpay';
 import { isReviewBypassOrderId } from '../utils/reviewBypass';
 import { processBookNowLineItemRefund } from '../services/refundService';
 import { createPerformerCancellationPenalty } from '../services/performerPenaltyService';
+import { normalizePaymentEnvironment, paymentKeys, resolvePaymentEnvironment } from '../config/paymentEnvironment';
+import { resolvePaymentEnvironmentForPayment } from '../services/paymentService';
 
+async function resolveStoredPaymentEnvironment(orderId: string) {
+  const persistedEnvironment = await resolvePaymentEnvironmentForPayment(undefined, orderId);
+  if (persistedEnvironment === 'test') return persistedEnvironment;
+
+  const escrow = await prisma.escrow.findUnique({
+    where: { razorpayOrderId: orderId },
+    select: { metadata: true },
+  });
+  const escrowEnvironment = (escrow?.metadata as any)?.paymentEnvironment;
+  if (escrowEnvironment) return normalizePaymentEnvironment(escrowEnvironment);
+
+  const idempotency = await prisma.paymentOrderIdempotency.findFirst({
+    where: { razorpayOrderId: orderId },
+    select: { paymentEnvironment: true, orderPayload: true },
+  });
+  return normalizePaymentEnvironment(
+    idempotency?.paymentEnvironment || (idempotency?.orderPayload as any)?.paymentEnvironment || persistedEnvironment,
+  );
+}
+
+function verifySignatureAcrossEnvironments(
+  orderId: string,
+  paymentId: string,
+  signature: string,
+  preferred: 'live' | 'test',
+  allowFallback: boolean,
+): { result: ReturnType<typeof verifyPaymentSignature>; environment: 'live' | 'test' } {
+  const first = verifyPaymentSignature(orderId, paymentId, signature, preferred);
+  if (first.success || !allowFallback) return { result: first, environment: preferred };
+
+  const alternate = preferred === 'live' ? 'test' : 'live';
+  const second = verifyPaymentSignature(orderId, paymentId, signature, alternate);
+  return second.success
+    ? { result: second, environment: alternate }
+    : { result: first, environment: preferred };
+}
 export class PaymentController {
   /**
    * POST /api/v1/payment/create-order
    */
   static async createOrder(req: Request, res: Response): Promise<void> {
     const { amount, currency, metadata } = req.body;
+    const authenticatedUid = String(req.headers['x-user-id'] || '').trim();
+    const paymentEnvironment = await import('../config/paymentEnvironment').then(({ resolvePaymentEnvironment }) =>
+      resolvePaymentEnvironment(authenticatedUid));
     const rawIdempotencyKey =
       (req.headers['idempotency-key'] as string | undefined) ||
       (req.headers['Idempotency-Key'] as string | undefined) ||
@@ -44,7 +93,7 @@ export class PaymentController {
       const existing = await prisma.paymentOrderIdempotency.findUnique({
         where: { idempotencyKey },
       });
-      if (existing) {
+      if (existing && normalizePaymentEnvironment((existing.orderPayload as any)?.paymentEnvironment) === paymentEnvironment) {
         logger.info('ℹ️ Returning existing order for idempotency key', {
           idempotencyKey,
           razorpayOrderId: existing.razorpayOrderId,
@@ -54,7 +103,7 @@ export class PaymentController {
       }
     }
 
-    const result = await createOrder(amount, currency || 'INR', metadata || {});
+    const result = await createOrder(amount, currency || 'INR', metadata || {}, authenticatedUid);
 
     if (!result.success) {
       throw new Error(result.error || 'Failed to create order');
@@ -68,6 +117,7 @@ export class PaymentController {
             idempotencyKey,
             razorpayOrderId: result.order.id ,
             orderPayload: result.order as any,
+            paymentEnvironment,
           },
         });
       } catch (error: any) {
@@ -125,18 +175,33 @@ export class PaymentController {
       return;
     }
 
-    const result = verifyPaymentSignature(
+    const requestedEnvironment = normalizePaymentEnvironment(req.body.payment_environment);
+    let paymentEnvironment = req.body.payment_environment
+      ? requestedEnvironment
+      : await resolveStoredPaymentEnvironment(razorpay_order_id);
+    logger.info('[PAYMENT DEBUG] Verification request', {
+      requestedEnvironment: req.body.payment_environment ? requestedEnvironment : 'not_provided',
+      paymentEnvironment,
+      orderIdSuffix: String(razorpay_order_id).slice(-8),
+      paymentIdPresent: Boolean(razorpay_payment_id),
+      signaturePresent: Boolean(razorpay_signature),
+    });
+    const verification = verifySignatureAcrossEnvironments(
       razorpay_order_id,
       razorpay_payment_id,
-      razorpay_signature
+      razorpay_signature,
+      paymentEnvironment,
+      !req.body.payment_environment,
     );
+    paymentEnvironment = verification.environment;
+    const result = verification.result;
 
     if (!result.success) {
       throw new BadRequestError(result.message || result.error || 'Payment verification failed');
     }
 
     // Update escrow with payment entity so razorpayPaymentData is stored (sanitized)
-    const paymentResult = await getPaymentDetails(razorpay_payment_id);
+    const paymentResult = await getPaymentDetails(razorpay_payment_id, paymentEnvironment);
     const paymentEntity = paymentResult.success ? paymentResult.payment : undefined;
     const captureResult = await updateEscrowOnPaymentCapture(
       razorpay_order_id,
@@ -146,6 +211,20 @@ export class PaymentController {
     );
 
     if (!captureResult.success) {
+      const missingEscrow = /escrow not found/i.test(String(captureResult.error || ''));
+      // Grocery / QC payments are verified by signature only — they never create task escrow.
+      if (missingEscrow) {
+        logger.info('Payment verified with no escrow (non-task payment)', {
+          razorpay_order_id,
+          razorpay_payment_id,
+        });
+        res.json({
+          success: true,
+          message: result.message,
+          escrow: false,
+        });
+        return;
+      }
       logger.error('Escrow update failed after payment verification', {
         razorpay_order_id,
         razorpay_payment_id,
@@ -165,12 +244,64 @@ export class PaymentController {
   }
 
   /**
+   * POST /api/v1/payment/verify-signature
+   * Service-authenticated verification for payments that do not use task escrow
+   * (for example Quick Commerce orders).
+   */
+  static async verifySignatureOnly(req: Request, res: Response): Promise<void> {
+    const {
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+    } = req.body;
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      throw new BadRequestError('Missing required parameters');
+    }
+
+    const requestedEnvironment = normalizePaymentEnvironment(req.body.payment_environment);
+    let paymentEnvironment = req.body.payment_environment
+      ? requestedEnvironment
+      : await resolveStoredPaymentEnvironment(razorpay_order_id);
+    const verification = verifySignatureAcrossEnvironments(
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+      paymentEnvironment,
+      !req.body.payment_environment,
+    );
+    paymentEnvironment = verification.environment;
+    const result = verification.result;
+    if (!result.success) {
+      throw new BadRequestError(
+        result.message || result.error || 'Payment verification failed',
+      );
+    }
+
+    const paymentResult = await getPaymentDetails(razorpay_payment_id, paymentEnvironment);
+    if (paymentResult.success) {
+      const paymentOrderId = String(paymentResult.payment?.order_id || '');
+      if (paymentOrderId && paymentOrderId !== razorpay_order_id) {
+        throw new BadRequestError('Payment does not belong to this order');
+      }
+    } else {
+      logger.warn('verify-signature: Razorpay fetch failed after HMAC ok', {
+        razorpay_order_id,
+        razorpay_payment_id,
+        error: paymentResult.error,
+      });
+    }
+
+    res.json({ success: true, message: result.message });
+  }
+
+  /**
    * GET /api/v1/payment/order-status/:orderId
    */
   static async getOrderStatus(req: Request, res: Response): Promise<void> {
     const { orderId } = req.params;
+    const paymentEnvironment = await resolveStoredPaymentEnvironment(orderId);
 
-    const result = await getOrderDetails(orderId);
+    const result = await getOrderDetails(orderId, paymentEnvironment);
 
     if (!result.success) {
       if (result.statusCode === 404) {
@@ -211,14 +342,57 @@ export class PaymentController {
    * POST /api/v1/payment/refund
    */
   static async createRefund(req: Request, res: Response): Promise<void> {
-    const { paymentId, amount } = req.body;
+    const {
+      paymentId: rawPaymentId,
+      razorpay_payment_id,
+      amount,
+      amountPaise,
+    } = req.body;
+    const paymentId = rawPaymentId || razorpay_payment_id;
 
     if (!paymentId) {
       throw new BadRequestError('Payment ID is required');
     }
 
-    const result = await createRefund(paymentId, amount);
+    const caller = resolvePaymentCaller(req);
+    if (caller.kind === 'user') {
+      const userOutcome = await resolveUserDirectRefund(String(paymentId), requireCallerIdentity(caller));
+      if (userOutcome.kind === 'not_found') throw new NotFoundError('Payment not found');
+      if (userOutcome.kind === 'forbidden') throw new ForbiddenError('You can only refund your own payments');
+      if (userOutcome.kind === 'rejected') throw new ConflictError(userOutcome.error);
+      res.json({ success: true, refund: userOutcome.refund, refundId: userOutcome.refund.id });
+      return;
+    }
 
+    const requestedPaise =
+      amountPaise != null
+        ? Number(amountPaise)
+        : amount != null && amount !== ''
+        ? Math.round(Number(amount) * 100)
+        : null;
+    const paymentEnvironment = await resolvePaymentEnvironmentForPayment(paymentId);
+    const outcome = await issueDirectRefund(
+      String(paymentId),
+      () =>
+        amountPaise != null
+          ? createRefundAmountPaise(paymentId, Number(amountPaise), paymentEnvironment)
+          : createRefund(paymentId, amount, paymentEnvironment),
+      { requestedPaise },
+    );
+
+    if (outcome.kind === 'rejected') {
+      throw new ConflictError(outcome.error);
+    }
+    if (outcome.kind === 'already_refunded') {
+      res.json({
+        success: true,
+        refund: outcome.refund,
+        refundId: outcome.refund.id,
+      });
+      return;
+    }
+
+    const result = outcome.result;
     if (!result.success) {
       throw new Error(result.error || 'Failed to create refund');
     }
@@ -226,6 +400,7 @@ export class PaymentController {
     res.json({
       success: true,
       refund: result.refund,
+      refundId: result.refund?.id,
     });
   }
 
@@ -303,6 +478,15 @@ export class PaymentController {
     const partnerAssignedToPass =
       typeof partnerAssigned === 'boolean' ? partnerAssigned : undefined;
 
+    const caller = resolvePaymentCaller(req);
+    if (settlementToPass && !callerMaySupplySettlement(caller)) {
+      logger.warn('[PaymentController.cancelPayment] Ignoring settlement from an untrusted caller', {
+        callerKind: caller.kind,
+        callerService: caller.service || null,
+      });
+      settlementToPass = undefined;
+    }
+
     const common = {
       reason,
       userId,
@@ -319,7 +503,29 @@ export class PaymentController {
 
     let result;
 
-    if (razorpayOrderId) {
+    if (caller.kind === 'user') {
+      // App request: the payment must be the caller's, and identity, role and fee inputs come from
+      // the escrow record — never from the request body.
+      const uids = requireCallerIdentity(caller);
+      const resolved = await resolveEscrowForCancellation({ razorpayOrderId, bookingOrderId, escrowId, taskId });
+      if ('error' in resolved) {
+        if (resolved.notFound) throw new NotFoundError(resolved.error);
+        if (/postgres/i.test(resolved.error)) throw new Error(resolved.error);
+        throw new BadRequestError(resolved.error);
+      }
+      const role = callerRoleForEscrow(resolved.escrow, uids);
+      if (!role) {
+        throw new ForbiddenError('You can only cancel your own payments');
+      }
+      result = await cancelPaymentOrder({
+        razorpayOrderId: resolved.escrow.razorpayOrderId,
+        reason,
+        userId: uids[0],
+        cancelledBy: role,
+        taskStartDate: taskStart,
+        taskTitle: common.taskTitle,
+      });
+    } else if (razorpayOrderId) {
       result = await cancelPaymentOrder({
         razorpayOrderId,
         ...common,
@@ -355,6 +561,9 @@ export class PaymentController {
         cancelledBy,
         error: result.error,
       });
+      if (result.refundPending) {
+        throw new ConflictError(result.error || 'Refund could not be processed; the payment was not cancelled');
+      }
       throw new Error(result.error || 'Failed to cancel payment');
     }
 
@@ -401,6 +610,12 @@ export class PaymentController {
       partnerReachedLocation,
       partnerAssigned,
     } = req.body;
+
+    // The line amount and fee inputs come from the caller, so only task-service (which owns the
+    // booking and its cancellation rules) may request a line-item refund.
+    if (resolvePaymentCaller(req).kind === 'user') {
+      throw new ForbiddenError('Cancel the booked service from the task to get a refund');
+    }
 
     if (!bookingOrderId || !taskId || lineAmountRupees == null || !taskStartDate) {
       throw new BadRequestError(
@@ -485,8 +700,10 @@ export class PaymentController {
    * GET /api/v1/payment/razorpay-key
    * Public: publishable Key ID for client checkout only (never expose key secret).
    */
-  static async getRazorpayKeyId(_req: Request, res: Response): Promise<void> {
-    res.json({ keyId: RAZORPAY_CONFIG.keyId });
+  static async getRazorpayKeyId(req: Request, res: Response): Promise<void> {
+    const uid = String(req.headers['x-user-id'] || '').trim();
+    const paymentEnvironment = await resolvePaymentEnvironment(uid);
+    res.json({ keyId: paymentKeys[paymentEnvironment], paymentEnvironment });
   }
 }
 

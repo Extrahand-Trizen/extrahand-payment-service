@@ -11,10 +11,18 @@ import {
 import { prisma, prismaDev } from '../config/prisma';
 import { Prisma } from '@prisma/client';
 import mongoose from 'mongoose';
-import { createRefundAmountPaise, getPaymentDetails } from './paymentService';
+import { createRefundAmountPaise, getPaymentDetails, resolvePaymentEnvironmentForPayment } from './paymentService';
 import { sanitizeRazorpayRefundData } from '../utils/paymentSanitizer';
 import { notifyRefundInitiated } from './paymentNotificationService';
 import { razorpay } from '../config/razorpay';
+import { ConflictError } from '../errors/AppError';
+import { taskHoldsRecurringVisitEscrows } from './recurringVisitPayoutScope';
+import {
+  isRecurringVisitEscrow,
+  syncRecurringEscrowFromRefundWebhook,
+  syncRecurringVisitRefundSafely,
+  withRecurringEscrowRefundLock,
+} from './recurringVisitRefundSync';
 
 function generateRefundId(): string {
   return `refund_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
@@ -69,7 +77,7 @@ function paiseToRupeeDecimal(paise: number): Prisma.Decimal {
   return new Prisma.Decimal((safe / 100).toFixed(2));
 }
 
-async function getProfileContact(uid: string): Promise<{ email?: string; name?: string } | null> {
+async function getProfileContact(uid: string): Promise<{ uid?: string; email?: string; name?: string } | null> {
   if (!uid || mongoose.connection.readyState !== 1) return null;
 
   try {
@@ -81,6 +89,7 @@ async function getProfileContact(uid: string): Promise<{ email?: string; name?: 
     if (!profile) return null;
 
     return {
+      uid: profile.uid ? String(profile.uid) : undefined,
       email: profile.email,
       name: profile.name || profile.displayName || 'User',
     };
@@ -90,7 +99,38 @@ async function getProfileContact(uid: string): Promise<{ email?: string; name?: 
   }
 }
 
-export async function processRefund(params: {
+/**
+ * Refunds one payment. A recurring visit payment is refunded under its visit lock (so captures
+ * and concurrent refunds for the visit are serialized) and its visit is synced to task-service.
+ */
+export async function processRefund(
+  params: Parameters<typeof processRefundUnlocked>[0],
+): ReturnType<typeof processRefundUnlocked> {
+  const orderId = params.razorpayOrderId ? String(params.razorpayOrderId).trim() : '';
+  let lockEscrow: any = null;
+  if (orderId && isPostgresConnected()) {
+    try {
+      lockEscrow = await prisma.escrow.findUnique({ where: { razorpayOrderId: orderId } });
+    } catch {
+      lockEscrow = null;
+    }
+  }
+  if (!isRecurringVisitEscrow(lockEscrow)) return processRefundUnlocked(params);
+
+  let result: Awaited<ReturnType<typeof processRefundUnlocked>>;
+  try {
+    result = await withRecurringEscrowRefundLock(lockEscrow, () => processRefundUnlocked(params));
+  } catch (error) {
+    if (error instanceof ConflictError) return { success: false, error: error.message };
+    throw error;
+  }
+  if (result.success || /already refunded/i.test(String(result.error || ''))) {
+    await syncRecurringVisitRefundSafely(lockEscrow.id);
+  }
+  return result;
+}
+
+async function processRefundUnlocked(params: {
   razorpayOrderId: string;
   razorpayPaymentId: string;
   taskId?: string;
@@ -171,6 +211,17 @@ export async function processRefund(params: {
 
     // 2. Fallback: lookup Escrow by taskId if razorpayOrderId didn't find it
     if (!postgresEscrow && cleanTaskId) {
+      // A recurring plan has one payment per visit; its newest payment may belong to another visit.
+      if (await taskHoldsRecurringVisitEscrows(cleanTaskId)) {
+        logger.error('Refund by task id refused for a recurring visit plan', {
+          taskId: cleanTaskId,
+          razorpayOrderId,
+        });
+        return {
+          success: false,
+          error: 'Recurring visit refunds must identify the exact visit payment',
+        };
+      }
       try {
         postgresEscrow = await prisma.escrow.findFirst({ where: { taskId: cleanTaskId }, orderBy: { createdAt: 'desc' } });
       } catch { /* ignore */ }
@@ -182,8 +233,10 @@ export async function processRefund(params: {
       }
     }
 
+    const recurringVisitEscrow = isRecurringVisitEscrow(postgresEscrow);
+
     // 3. Lookup Transaction record by taskId or razorpayOrderId
-    if (cleanTaskId) {
+    if (cleanTaskId && !recurringVisitEscrow) {
       try {
         txRecord = await prisma.transaction.findFirst({ where: { taskId: cleanTaskId }, orderBy: { createdAt: 'desc' } });
       } catch { /* ignore */ }
@@ -223,6 +276,18 @@ export async function processRefund(params: {
     }
     if (!razorpayPaymentId) {
       razorpayPaymentId = postgresEscrow?.razorpayPaymentId || txRecord?.razorpayPaymentId || '';
+    }
+
+    if (
+      recurringVisitEscrow &&
+      postgresEscrow?.razorpayPaymentId &&
+      razorpayPaymentId !== String(postgresEscrow.razorpayPaymentId)
+    ) {
+      logger.error('Refund refused: payment id does not belong to this visit payment', {
+        escrowId: postgresEscrow.escrowId,
+        razorpayPaymentId,
+      });
+      return { success: false, error: 'Payment does not belong to this visit payment record' };
     }
 
     // 6. If razorpayPaymentId is STILL empty, fetch it from Razorpay order payments API!
@@ -319,7 +384,10 @@ export async function processRefund(params: {
 
     const escrowAmountRupees = escrow.amountInRupees;
 
-    const paymentFetch = await getPaymentDetails(razorpayPaymentId);
+    const paymentFetch = await getPaymentDetails(
+      razorpayPaymentId,
+      await resolvePaymentEnvironmentForPayment(razorpayPaymentId, razorpayOrderId),
+    );
     if (!paymentFetch.success || !paymentFetch.payment) {
       return {
         success: false,
@@ -334,6 +402,19 @@ export async function processRefund(params: {
     const maxRefundablePaise = capturedPaise - alreadyRefunded;
     if (!Number.isFinite(maxRefundablePaise) || maxRefundablePaise <= 0) {
       return { success: false, error: 'No capturable balance left to refund on this payment' };
+    }
+    // A partial amount would mark the visit payment refunded while part of it was kept.
+    if (recurringVisitEscrow && amount && !precomputedSettlement) {
+      const requestedPaise = Math.round(Number(amount) * 100);
+      if (requestedPaise !== maxRefundablePaise) {
+        return {
+          success: false,
+          error:
+            requestedPaise > maxRefundablePaise
+              ? 'Refund amount exceeds the refundable visit payment'
+              : 'Partial refunds of a recurring visit payment are not supported; refund the full visit payment',
+        };
+      }
     }
 
     /** Actual INR captured on Razorpay (task + platform fee + GST, etc.) */
@@ -500,6 +581,7 @@ export async function processRefund(params: {
       const razorpayRefundResult = await createRefundAmountPaise(
         razorpayPaymentId,
         refundAmountInPaise,
+        await resolvePaymentEnvironmentForPayment(razorpayPaymentId, razorpayOrderId),
       );
 
       if (!razorpayRefundResult.success || !razorpayRefundResult.refund) {
@@ -803,6 +885,7 @@ export async function processRefund(params: {
         taskTitle,
         reason,
         email: posterContact?.email || null,
+        emailUid: posterContact?.uid || null,
         userName: posterContact?.name || null,
       }).catch((error) => {
         logger.warn('[RefundService.processRefund] Failed to send refund initiated notification', {
@@ -857,7 +940,10 @@ export async function processRefund(params: {
  * @param refundId - Refund ID
  * @returns Refund status
  */
-export async function getRefundStatus(refundId: string): Promise<{
+export async function getRefundStatus(
+  refundId: string,
+  options?: { syncRazorpay?: boolean },
+): Promise<{
   success: boolean;
   refund?: any;
   error?: string;
@@ -881,6 +967,22 @@ export async function getRefundStatus(refundId: string): Promise<{
     // Get original amount from escrow (not stored in refund table)
     const originalAmount = refund.escrow?.amountInRupees || new Prisma.Decimal('0.00');
 
+    let providerRefund: any = null;
+    if (options?.syncRazorpay && refund.razorpayRefundId) {
+      try {
+        providerRefund = await razorpay.refunds.fetch(refund.razorpayRefundId);
+      } catch (error: any) {
+        logger.warn('Failed to sync refund status from Razorpay', {
+          refundId,
+          razorpayRefundId: refund.razorpayRefundId,
+          error: error?.message || String(error),
+        });
+      }
+    }
+
+    const providerAmountRupees = Number(providerRefund?.amount) / 100;
+    const hasProviderAmount = Number.isFinite(providerAmountRupees) && providerAmountRupees >= 0;
+
     return {
       success: true,
       refund: {
@@ -888,15 +990,21 @@ export async function getRefundStatus(refundId: string): Promise<{
         razorpayRefundId: refund.razorpayRefundId,
         amount: originalAmount.toString(),
         cancellationFee: refund.cancellationFee?.toString(),
-        refundAmount: refund.refundAmount.toString(),
+        refundAmount: hasProviderAmount
+          ? providerAmountRupees.toFixed(2)
+          : refund.refundAmount.toString(),
         toOtherParty: refund.toOtherParty?.toString(),
         toPlatform: refund.toPlatform?.toString(),
         reason: refund.reason,
         cancelledBy: refund.cancelledBy,
-        status: refund.status,
+        status: providerRefund?.status || refund.status,
+        razorpayRefundStatus: providerRefund?.status || null,
+        razorpaySpeedProcessed:
+          providerRefund?.speed_processed || providerRefund?.speed_requested || null,
         createdAt: refund.createdAt,
-        completedAt: refund.completedAt,
-        expectedDepositAt: refund.expectedDepositAt,
+        completedAt: providerRefund?.created_at
+          ? new Date(Number(providerRefund.created_at) * 1000).toISOString()
+          : refund.completedAt,
       },
     };
   } catch (error: any) {
@@ -1112,7 +1220,10 @@ export async function processBookNowLineItemRefund(params: {
       return { success: false, error: 'This service was already refunded' };
     }
 
-    const paymentFetch = await getPaymentDetails(razorpayPaymentId);
+    const paymentFetch = await getPaymentDetails(
+      razorpayPaymentId,
+      await resolvePaymentEnvironmentForPayment(razorpayPaymentId, bookingOrderId),
+    );
     if (!paymentFetch.success || !paymentFetch.payment) {
       return { success: false, error: 'Could not load payment for refund' };
     }
@@ -1183,6 +1294,7 @@ export async function processBookNowLineItemRefund(params: {
     const razorpayRefundResult = await createRefundAmountPaise(
       razorpayPaymentId,
       refundPaise,
+      await resolvePaymentEnvironmentForPayment(razorpayPaymentId, bookingOrderId),
     );
     if (!razorpayRefundResult.success || !razorpayRefundResult.refund) {
       return {
@@ -1315,8 +1427,8 @@ export async function processBookNowLineItemRefund(params: {
 }
 
 type RazorpayRefundWebhookPayload = {
-  refund?: { entity?: { id?: string; status?: string } };
-  payment?: { entity?: { id?: string } };
+  refund?: { entity?: { id?: string; status?: string; payment_id?: string } };
+  payment?: { entity?: { id?: string; amount?: number; amount_refunded?: number; status?: string } };
 };
 
 /**
@@ -1332,12 +1444,46 @@ export async function completeRefundFromRazorpayWebhook(
   }
 
   const refundEntity = payload?.refund?.entity;
+  const paymentEntity = payload?.payment?.entity;
   const razorpayRefundId = refundEntity?.id;
   if (!razorpayRefundId) {
     logger.warn('Refund webhook missing refund entity id');
+    if (paymentEntity?.id) {
+      await syncRecurringEscrowAfterRefundWebhook(undefined, paymentEntity);
+    }
     return;
   }
 
+  await updateRefundRecordFromRazorpayWebhook(razorpayRefundId, refundEntity);
+  const razorpayStatus = String(refundEntity?.status || '').trim().toLowerCase();
+  if (razorpayStatus && !['processed', 'completed', 'success'].includes(razorpayStatus)) return;
+  await syncRecurringEscrowAfterRefundWebhook(razorpayRefundId, paymentEntity, refundEntity?.payment_id);
+}
+
+async function syncRecurringEscrowAfterRefundWebhook(
+  razorpayRefundId: string | undefined,
+  paymentEntity: NonNullable<RazorpayRefundWebhookPayload['payment']>['entity'],
+  refundPaymentId?: string,
+): Promise<void> {
+  try {
+    await syncRecurringEscrowFromRefundWebhook({
+      razorpayRefundId,
+      razorpayPaymentId: refundPaymentId || paymentEntity?.id,
+      payment: paymentEntity,
+    });
+  } catch (error: any) {
+    logger.error('Refund webhook: recurring visit escrow sync failed', {
+      razorpayRefundId,
+      razorpayPaymentId: refundPaymentId || paymentEntity?.id,
+      error: error?.message || String(error),
+    });
+  }
+}
+
+async function updateRefundRecordFromRazorpayWebhook(
+  razorpayRefundId: string,
+  refundEntity: NonNullable<RazorpayRefundWebhookPayload['refund']>['entity'],
+): Promise<void> {
   const razorpayStatus = String(refundEntity?.status || '').trim().toLowerCase();
 
   if (razorpayStatus === 'failed') {

@@ -38,6 +38,25 @@ export class UserServiceClient {
     }
   }
 
+  static async isPaymentTester(uid: string): Promise<boolean> {
+    if (!uid?.trim()) return false;
+    try {
+      const res = await axios.get(
+        `${this.baseURL()}/api/v1/profiles/internal/${encodeURIComponent(uid)}`,
+        { headers: this.headers(), timeout: 5000 },
+      );
+      return res.data?.profile?.isPaymentTester === true;
+    } catch (err) {
+      const axiosErr = err as AxiosError;
+      logger.warn('[UserServiceClient] payment tester lookup failed; defaulting live', {
+        uid,
+        status: axiosErr.response?.status,
+        message: axiosErr.message,
+      });
+      return false;
+    }
+  }
+
   static async getCoinUsageConfig(): Promise<{
     posterBooking: number;
     taskerPlatformFee: number;

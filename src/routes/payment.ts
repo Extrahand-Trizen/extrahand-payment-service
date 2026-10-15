@@ -18,6 +18,13 @@ router.post('/create-order', asyncHandler(PaymentController.createOrder));
 // POST /api/v1/payment/verify-payment
 router.post('/verify-payment', asyncHandler(PaymentController.verifyPayment));
 
+// POST /api/v1/payment/verify-signature
+// For service-owned payments that do not have task escrow records.
+router.post(
+  '/verify-signature',
+  asyncHandler(PaymentController.verifySignatureOnly),
+);
+
 // GET /api/v1/payment/order-status/:orderId
 router.get('/order-status/:orderId', asyncHandler(PaymentController.getOrderStatus));
 

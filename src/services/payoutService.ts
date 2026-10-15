@@ -15,6 +15,7 @@ import { Prisma } from '@prisma/client';
 import mongoose from 'mongoose';
 import { applyPayoutStatusToProfile } from './userPaymentProfileService';
 import { createRazorpayXPayout, getRazorpayXPayoutStatus } from './razorpayxService';
+import { UserServiceClient } from '../clients/UserServiceClient';
 import { applyPenaltyLinesInTx, planPenaltyDeductionsFromGross } from './performerPenaltyService';
 import { notifyPayoutCompleted, notifyPayoutInitiated } from './paymentNotificationService';
 import { getFeeStructureForCategory, resolveBiddingPayoutFeePercents, resolveEscrowCategoryFeeConfigKey } from './feeConfigService';
@@ -29,6 +30,7 @@ import {
 } from './bankAccountSecrets';
 import { resolveEscrowTaskAmountForPayout } from '../utils/escrowFinanceUtils';
 import { resolveEscrowRecordForTaskId } from './escrowService';
+import { resolveRecurringVisitPayoutScope } from './recurringVisitPayoutScope';
 import { enrichRecurringPayoutMetadata } from '../utils/recurringPayoutDisplay';
 import { mapRazorpayPayoutStatusToInternal } from '../utils/payoutStatusMapping';
 import {
@@ -135,7 +137,7 @@ function pendingTaskPayoutJobId(taskId: string, performerUid: string): string {
   return `pending_task_payout_${taskId}_${performerUid}`;
 }
 
-async function getProfileContact(uid: string): Promise<{ email?: string; name?: string } | null> {
+async function getProfileContact(uid: string): Promise<{ uid?: string; email?: string; name?: string } | null> {
   if (!uid || mongoose.connection.readyState !== 1) return null;
 
   try {
@@ -147,6 +149,7 @@ async function getProfileContact(uid: string): Promise<{ email?: string; name?: 
     if (!profile) return null;
 
     return {
+      uid: profile.uid ? String(profile.uid) : undefined,
       email: profile.email,
       name: profile.name || profile.displayName || 'Tasker',
     };
@@ -161,8 +164,10 @@ async function enqueuePendingTaskCompletionPayout(params: {
   performerUid: string;
   amount: number;
   taskTitle?: string;
+  visitId?: string;
+  parentTaskId?: string;
 }): Promise<void> {
-  const { taskId, performerUid, amount, taskTitle } = params;
+  const { taskId, performerUid, amount, taskTitle, visitId, parentTaskId } = params;
 
   await prisma.jobQueue.upsert({
     where: { jobId: pendingTaskPayoutJobId(taskId, performerUid) },
@@ -172,6 +177,8 @@ async function enqueuePendingTaskCompletionPayout(params: {
         performerUid,
         amount,
         taskTitle,
+        visitId,
+        parentTaskId,
       },
       status: 'pending',
       nextRetryAt: new Date(),
@@ -187,6 +194,8 @@ async function enqueuePendingTaskCompletionPayout(params: {
         performerUid,
         amount,
         taskTitle,
+        visitId,
+        parentTaskId,
       },
       nextRetryAt: new Date(),
       status: 'pending',
@@ -220,6 +229,8 @@ export async function processPendingTaskCompletionPayouts(
       performerUid?: string;
       amount?: number;
       taskTitle?: string;
+      visitId?: string;
+      parentTaskId?: string;
     };
 
     if (!payload.taskId || !payload.performerUid || !payload.amount) {
@@ -240,6 +251,8 @@ export async function processPendingTaskCompletionPayouts(
       performerUid: payload.performerUid,
       amount: Number(payload.amount),
       taskTitle: payload.taskTitle,
+      visitId: payload.visitId,
+      parentTaskId: payload.parentTaskId,
       enqueueOnMissingBank: false,
     });
 
@@ -451,6 +464,26 @@ export async function processPayout(params: {
       return { success: false, error: 'Escrow not found' };
     }
 
+    // Recurring visit payments are released only by the visit-validated task completion payout.
+    const escrowMetaForGuard =
+      postgresEscrow.metadata && typeof postgresEscrow.metadata === 'object' && !Array.isArray(postgresEscrow.metadata)
+        ? (postgresEscrow.metadata as Record<string, unknown>)
+        : {};
+    if (
+      escrowMetaForGuard.recurringPlan === true ||
+      (typeof escrowMetaForGuard.visitId === 'string' && escrowMetaForGuard.visitId.trim())
+    ) {
+      logger.warn('⚠️ processPayout rejected for recurring visit escrow', {
+        escrowId: postgresEscrow.escrowId,
+        taskId: postgresEscrow.taskId,
+        visitId: escrowMetaForGuard.visitId,
+      });
+      return {
+        success: false,
+        error: 'Recurring visit payments can only be paid out through visit completion',
+      };
+    }
+
     // Check escrow status
     if (postgresEscrow.status !== 'held') {
       logger.warn('⚠️ Cannot payout - escrow status:', postgresEscrow.status);
@@ -562,6 +595,18 @@ export async function processPayout(params: {
     // Generate payout ID
     const payoutId = generatePayoutId();
 
+    // Claim the escrow before moving money so concurrent requests cannot both transfer.
+    const claimed = await prisma.escrow.updateMany({
+      where: { id: postgresEscrow.id, status: 'held' },
+      data: { status: 'released', releasedAt: new Date() },
+    });
+    if (claimed.count === 0) {
+      logger.warn('⚠️ processPayout lost the escrow claim (already released or changed)', {
+        escrowId: postgresEscrow.escrowId,
+      });
+      return { success: false, error: 'Payout already in progress' };
+    }
+
     // Process bank transfer (mock)
     const bankTransferResult = await transferToBank({
       amount: netPayoutAmount,
@@ -596,6 +641,12 @@ export async function processPayout(params: {
             },
           });
         }
+
+      // No money moved: hand the escrow back so the payout can be retried.
+      await prisma.escrow.updateMany({
+        where: { id: postgresEscrow.id, status: 'released' },
+        data: { status: 'held', releasedAt: null },
+      });
 
       return {
         success: false,
@@ -641,14 +692,7 @@ export async function processPayout(params: {
             },
           });
 
-          // Update escrow status to 'released'
-          await tx.escrow.update({
-            where: { id: postgresEscrow.id },
-            data: {
-              status: 'released',
-              releasedAt: new Date(),
-            },
-          });
+          // Escrow was claimed (held → released) before the transfer.
 
           // Prepare all ledger entries for batch creation
           const ledgerEntries: Array<{
@@ -823,6 +867,7 @@ export async function processPayout(params: {
         taskId: postgresEscrow.taskId,
         taskTitle,
         email: performerContact?.email || null,
+        emailUid: performerContact?.uid || null,
         userName: performerContact?.name || null,
       }).catch((error) => {
         logger.warn('Failed to send payout initiated notification', { error });
@@ -886,8 +931,16 @@ export async function processTaskCompletionPayout(params: {
   requestedCoinRedeemRupees?: number;
   /** Recurring visit id when paying out a per-visit child task. */
   visitId?: string;
+  /** Recurring Work id that holds the visit escrow. */
+  parentTaskId?: string;
   source?: string;
   isQuickCommerce?: boolean;
+  /**
+   * Authenticated end-user behind the request (gateway `X-User-Id`). Set for every user-originated
+   * call; such calls may only pay the caller and only from a held payment assigned to them.
+   * Omitted for trusted internal callers (task-service completion flows, pending payout queue).
+   */
+  callerUid?: string;
 }): Promise<{
   success: boolean;
   payout?: any;
@@ -935,10 +988,40 @@ export async function processTaskCompletionPayout(params: {
       return { success: false, error: 'Postgres not connected' };
     }
 
-    const trimmedVisitId = typeof visitId === 'string' ? visitId.trim() : '';
+    const userOriginated = params.callerUid !== undefined;
+    if (userOriginated && (!String(params.callerUid).trim() || String(params.callerUid).trim() !== performerUid)) {
+      logger.warn('[payoutService] Task completion payout rejected: caller is not the performer', {
+        taskId,
+        performerUid,
+        callerUid: params.callerUid,
+      });
+      return { success: false, error: 'Payout can only be requested by the assigned helper' };
+    }
+
+    const recurringScope = await resolveRecurringVisitPayoutScope({
+      taskId,
+      performerUid,
+      visitId,
+      parentTaskId: params.parentTaskId,
+    });
+    if (recurringScope.recurring && (isQuickCommerce === true || source === 'quick_commerce')) {
+      logger.warn('[payoutService] Quick Commerce flags ignored for a recurring visit payout', {
+        taskId,
+        source,
+        isQuickCommerce,
+      });
+    }
+    const quickCommerceFlagged =
+      !recurringScope.recurring && (isQuickCommerce === true || source === 'quick_commerce');
+    const payoutSource = recurringScope.recurring ? undefined : source;
+    const trimmedVisitId = recurringScope.recurring ? recurringScope.visitId ?? '' : '';
     const duplicateDescription = trimmedVisitId
       ? `Task completion payout for task ${taskId} visit ${trimmedVisitId}`
       : `Task completion payout for task ${taskId}`;
+    // A recurring child may have been paid before its visit id was resolved server-side.
+    const duplicateDescriptions = trimmedVisitId
+      ? [duplicateDescription, `Task completion payout for task ${taskId}`]
+      : [duplicateDescription];
 
     logger.info('[PAYOUT_DEBUG] Checking for existing payout', {
       performerUid,
@@ -947,7 +1030,7 @@ export async function processTaskCompletionPayout(params: {
     const existing = await prisma.payout.findFirst({
       where: {
         performerUid,
-        description: duplicateDescription,
+        description: { in: duplicateDescriptions },
         status: { in: ['processing', 'completed'] },
       },
       orderBy: { createdAt: 'desc' },
@@ -993,6 +1076,10 @@ export async function processTaskCompletionPayout(params: {
         success: true,
         payout: visibility,
       };
+    }
+
+    if (recurringScope.recurring && !recurringScope.ok) {
+      return { success: false, error: recurringScope.error };
     }
 
     // Book Now raise-issue: resume held payout with a fresh partnerVisibleAt instead of creating another.
@@ -1075,7 +1162,14 @@ export async function processTaskCompletionPayout(params: {
         hasPaymentProfile: !!paymentProfile,
       });
       if (enqueueOnMissingBank) {
-        await enqueuePendingTaskCompletionPayout({ taskId, performerUid, amount, taskTitle });
+        await enqueuePendingTaskCompletionPayout({
+          taskId,
+          performerUid,
+          amount,
+          taskTitle,
+          visitId: trimmedVisitId || undefined,
+          parentTaskId: recurringScope.recurring && recurringScope.ok ? recurringScope.parentTaskId : undefined,
+        });
       }
       return {
         success: false,
@@ -1094,7 +1188,14 @@ export async function processTaskCompletionPayout(params: {
         performerUid,
       });
       if (enqueueOnMissingBank) {
-        await enqueuePendingTaskCompletionPayout({ taskId, performerUid, amount, taskTitle });
+        await enqueuePendingTaskCompletionPayout({
+          taskId,
+          performerUid,
+          amount,
+          taskTitle,
+          visitId: trimmedVisitId || undefined,
+          parentTaskId: recurringScope.recurring && recurringScope.ok ? recurringScope.parentTaskId : undefined,
+        });
       }
       return {
         success: false,
@@ -1122,7 +1223,14 @@ export async function processTaskCompletionPayout(params: {
         bankAccountId: selectedBankAccount.id,
       });
       if (enqueueOnMissingBank) {
-        await enqueuePendingTaskCompletionPayout({ taskId, performerUid, amount, taskTitle });
+        await enqueuePendingTaskCompletionPayout({
+          taskId,
+          performerUid,
+          amount,
+          taskTitle,
+          visitId: trimmedVisitId || undefined,
+          parentTaskId: recurringScope.recurring && recurringScope.ok ? recurringScope.parentTaskId : undefined,
+        });
       }
       return {
         success: false,
@@ -1139,35 +1247,40 @@ export async function processTaskCompletionPayout(params: {
       taskId,
       trimmedVisitId: trimmedVisitId || 'none',
     });
-    let taskEscrow = trimmedVisitId
-      ? await prisma.escrow.findFirst({
-          where: {
-            taskId,
-            metadata: {
-              path: ['visitId'],
-              equals: trimmedVisitId,
-            },
-          },
-          orderBy: { createdAt: 'desc' },
-        })
-      : await resolveEscrowRecordForTaskId(taskId);
+    // Recurring visits pay out only from the visit's own held escrow (validated above);
+    // they never fall back to a direct payout without escrow.
+    const taskEscrow =
+      recurringScope.recurring && recurringScope.ok
+        ? recurringScope.escrow
+        : await resolveEscrowRecordForTaskId(taskId);
 
-    if (!taskEscrow && trimmedVisitId) {
-      taskEscrow = await prisma.escrow.findFirst({
-        where: {
+    // User-originated payouts are always backed by a held payment assigned to the caller;
+    // only trusted internal flows may create a direct payout without escrow.
+    if (userOriginated && !recurringScope.recurring) {
+      if (!taskEscrow) {
+        logger.warn('[payoutService] User payout rejected: no held payment for task', { taskId, performerUid });
+        return { success: false, error: 'No held payment found for this task' };
+      }
+      const escrowPerformer = String(taskEscrow.performerUid || '').trim();
+      const assigned =
+        recurringScope.assignees.length > 0
+          ? recurringScope.assignees.includes(performerUid)
+          : escrowPerformer !== '' && escrowPerformer !== 'pending_assignment' && escrowPerformer === performerUid;
+      if (!assigned) {
+        logger.warn('[payoutService] User payout rejected: performer is not assigned to task', {
+          taskId,
           performerUid,
-          metadata: {
-            path: ['visitId'],
-            equals: trimmedVisitId,
-          },
-        },
-        orderBy: { createdAt: 'desc' },
-      });
+          escrowId: taskEscrow.escrowId,
+        });
+        return { success: false, error: 'Performer is not assigned to this task' };
+      }
     }
 
     let grossAmount: Prisma.Decimal;
+    /** Upper bound for this payout: the task amount carried by the held payment being released. */
+    let heldPayoutAmount: Prisma.Decimal | null = null;
     let escrowMeta: Record<string, unknown> = {};
-    let isBookNowPayout = isQuickCommerce === true || source === 'quick_commerce';
+    let isBookNowPayout = quickCommerceFlagged;
     let partnerVisibleAt: Date | null = null;
     let platformCommission = new Prisma.Decimal('0.00');
     let gstOnCommission = new Prisma.Decimal('0.00');
@@ -1203,17 +1316,22 @@ export async function processTaskCompletionPayout(params: {
         };
       }
 
-      grossAmount = resolveEscrowTaskAmountForPayout(taskEscrow, amount).toDecimalPlaces(2);
+      // The requested amount never sets the payout: recurring and user-originated payouts may not
+      // even fall back to it when the escrow carries no amount.
+      heldPayoutAmount = resolveEscrowTaskAmountForPayout(
+        taskEscrow,
+        recurringScope.recurring || userOriginated ? undefined : amount,
+      ).toDecimalPlaces(2);
+      grossAmount = heldPayoutAmount;
       const clientAmount = new Prisma.Decimal(String(amount || '0')).toDecimalPlaces(2);
-      if (trimmedVisitId && clientAmount.gt(0) && clientAmount.gt(grossAmount)) {
-        logger.warn('[payoutService] Recurring visit payout base raised from client visit budget', {
+      if (clientAmount.gt(heldPayoutAmount)) {
+        logger.warn('[payoutService] Requested payout exceeds the held payment; paying the held amount only', {
           taskId,
-          visitId: trimmedVisitId,
-          escrowResolvedAmount: grossAmount.toString(),
+          visitId: trimmedVisitId || undefined,
+          heldPayoutAmount: heldPayoutAmount.toString(),
           clientAmount: clientAmount.toString(),
           escrowId: taskEscrow?.escrowId,
         });
-        grossAmount = clientAmount;
       }
       if (grossAmount.lte(0)) {
         return { success: false, error: 'Invalid payout amount for this task' };
@@ -1300,7 +1418,7 @@ export async function processTaskCompletionPayout(params: {
         taskId,
         performerUid,
         grossAmount: grossAmount.toString(),
-        source: source || 'direct',
+        source: payoutSource || 'direct',
       });
     }
     const coinCaps = await CoinUsageConfigProvider.getCapPercents();
@@ -1325,14 +1443,21 @@ export async function processTaskCompletionPayout(params: {
       redeemedRupees: string;
     }> = [];
 
+    // Coin bonus never lifts the payout above the held payment.
+    const redeemCeilingRupees = heldPayoutAmount
+      ? Prisma.Decimal.min(
+          maxTaskerCoinRedeemRupees,
+          Prisma.Decimal.max(heldPayoutAmount.sub(payoutBaseAmount), new Prisma.Decimal('0.00')),
+        )
+      : maxTaskerCoinRedeemRupees;
     const requestedRedeemRupees = (() => {
       if (!useExtraCoins) return new Prisma.Decimal('0.00');
       const raw = Number(requestedCoinRedeemRupees ?? 0);
-      if (!Number.isFinite(raw) || raw <= 0) return maxTaskerCoinRedeemRupees;
+      if (!Number.isFinite(raw) || raw <= 0) return redeemCeilingRupees;
       const requested = new Prisma.Decimal(raw.toFixed(2));
-      return requested.lessThan(maxTaskerCoinRedeemRupees)
+      return requested.lessThan(redeemCeilingRupees)
         ? requested
-        : maxTaskerCoinRedeemRupees;
+        : redeemCeilingRupees;
     })();
 
     if (useExtraCoins && requestedRedeemRupees.gt(0)) {
@@ -1396,6 +1521,17 @@ export async function processTaskCompletionPayout(params: {
       linkedPerformerUids
     );
     const netAmount = penaltyPlan.netTransfer;
+    if (heldPayoutAmount && (grossAmount.gt(heldPayoutAmount) || netAmount.gt(grossAmount))) {
+      logger.error('[payoutService] Payout rejected: payout would exceed the held payment; nothing released', {
+        taskId,
+        visitId: trimmedVisitId || undefined,
+        escrowId: taskEscrow?.escrowId,
+        heldPayoutAmount: heldPayoutAmount.toString(),
+        grossAmount: grossAmount.toString(),
+        netAmount: netAmount.toString(),
+      });
+      return { success: false, error: 'Payout amount exceeds the held payment' };
+    }
     const totalPenaltyDeducted = penaltyPlan.totalDeducted;
     const tds = new Prisma.Decimal(0);
     const totalDeductions = platformFeeTotal
@@ -1597,7 +1733,7 @@ export async function processTaskCompletionPayout(params: {
             tds,
             bankTransferId: null,
             status,
-            source: source || (isQuickCommerce ? 'quick_commerce' : 'task_completion'),
+            source: payoutSource || (quickCommerceFlagged ? 'quick_commerce' : 'task_completion'),
             type: 'task_completion',
             description: duplicateDescription,
             partnerVisibleAt: partnerVisibleAt ?? undefined,
@@ -1643,11 +1779,13 @@ export async function processTaskCompletionPayout(params: {
         taskId,
         netAmount: netAmount.toString(),
       });
+      const usePaymentTestCredentials = await UserServiceClient.isPaymentTester(performerUid);
       const payoutResponse = await createRazorpayXPayout({
         fundAccountId,
         amountInPaise: Math.round(parseFloat(netAmount.toString()) * 100),
         referenceId: payoutId,
         narration: payoutNarration,
+        usePaymentTestCredentials,
       });
 
       status = mapRazorpayPayoutStatusToInternal(payoutResponse.status);
@@ -1740,6 +1878,7 @@ export async function processTaskCompletionPayout(params: {
         taskTitle,
         taskId,
         email: performerContact?.email || null,
+        emailUid: performerContact?.uid || null,
         userName: performerContact?.name || null,
       }).catch((error) => {
         logger.warn('Failed to send payout initiated notification', { error });
@@ -1852,7 +1991,12 @@ export async function getPayoutStatus(payoutId: string): Promise<{
     ) {
       try {
         const razorpayLookupId = payout.bankTransferId as string;
-        const razorpayStatus = await getRazorpayXPayoutStatus(razorpayLookupId);
+        const usePaymentTestCredentials = await UserServiceClient.isPaymentTester(
+          payout.performerUid,
+        );
+        const razorpayStatus = await getRazorpayXPayoutStatus(razorpayLookupId, {
+          usePaymentTestCredentials,
+        });
         const internalStatus = mapRazorpayPayoutStatusToInternal(razorpayStatus.status);
 
         if (internalStatus !== payout.status) {

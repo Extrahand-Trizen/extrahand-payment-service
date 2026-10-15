@@ -55,12 +55,55 @@ export class EmailServiceClient {
     return true;
   }
 
-  private static async sendRequest(endpoint: string, data: any): Promise<boolean> {
+  /**
+   * Fail-closed check against user-service so a user who turned email off never gets one,
+   * even when the preference can't be verified.
+   */
+  private static async isEmailAllowed(userId: string | undefined, template: string): Promise<boolean> {
+    if (!userId) {
+      logger.warn('EmailServiceClient: Skipping email because recipient userId is missing', { template });
+      return false;
+    }
+    try {
+      const userServiceUrl = (process.env.USER_SERVICE_URL || 'http://localhost:4001').replace(/\/$/, '');
+      const response = await axios.get(
+        `${userServiceUrl}/api/v1/notification-preferences/${encodeURIComponent(userId)}/can-send`,
+        {
+          params: { channel: 'email', category: 'payments' },
+          headers: {
+            'X-Service-Auth': this.serviceAuthToken,
+            'X-Service-Name': this.serviceName,
+          },
+          timeout: 5000,
+        }
+      );
+      const canSend = response.data?.data?.canSend === true;
+      if (!canSend) {
+        logger.info('EmailServiceClient: Skipping email due to user preferences', { userId, template });
+      }
+      return canSend;
+    } catch (error) {
+      const axiosError = error as AxiosError;
+      logger.error('EmailServiceClient: Preference check failed — skipping email', {
+        userId,
+        template,
+        status: axiosError.response?.status,
+        message: axiosError.message,
+      });
+      return false;
+    }
+  }
+
+  private static async sendRequest(endpoint: string, data: any, userId?: string): Promise<boolean> {
     this.ensureInitialized();
 
     const email = data.to || data.email;
     if (!this.isValidEmail(email)) {
       logger.warn('EmailServiceClient: Skipping invalid email', { email, endpoint });
+      return false;
+    }
+
+    if (!(await this.isEmailAllowed(userId, data.template))) {
       return false;
     }
 
@@ -113,7 +156,8 @@ export class EmailServiceClient {
       isEscrow?: boolean;
       receiptUrl?: string;
       taskUrl?: string;
-    }
+    },
+    userId?: string
   ): Promise<boolean> {
     return this.sendRequest('/send', {
       to: email,
@@ -123,7 +167,7 @@ export class EmailServiceClient {
         userName,
         ...paymentDetails
       }
-    });
+    }, userId);
   }
 
   /**
@@ -138,7 +182,8 @@ export class EmailServiceClient {
       failureReason?: string;
       retryUrl?: string;
       taskUrl?: string;
-    }
+    },
+    userId?: string
   ): Promise<boolean> {
     return this.sendRequest('/send', {
       to: email,
@@ -148,7 +193,7 @@ export class EmailServiceClient {
         userName,
         ...paymentDetails
       }
-    });
+    }, userId);
   }
 
   /**
@@ -163,7 +208,8 @@ export class EmailServiceClient {
       requesterName?: string;
       transactionId?: string;
       estimatedArrival?: string;
-    }
+    },
+    userId?: string
   ): Promise<boolean> {
     return this.sendRequest('/send', {
       to: taskerEmail,
@@ -173,7 +219,7 @@ export class EmailServiceClient {
         taskerName,
         ...paymentDetails
       }
-    });
+    }, userId);
   }
 
   /**
@@ -189,7 +235,8 @@ export class EmailServiceClient {
       transactionId?: string;
       originalTransactionId?: string;
       processingTime?: string;
-    }
+    },
+    userId?: string
   ): Promise<boolean> {
     return this.sendRequest('/send', {
       to: email,
@@ -199,7 +246,7 @@ export class EmailServiceClient {
         userName,
         ...refundDetails
       }
-    });
+    }, userId);
   }
 
   /**
@@ -213,7 +260,8 @@ export class EmailServiceClient {
       taskTitle?: string;
       refundReason?: string;
       processingTime?: string;
-    }
+    },
+    userId?: string
   ): Promise<boolean> {
     return this.sendRequest('/send', {
       to: email,
@@ -223,7 +271,7 @@ export class EmailServiceClient {
         userName,
         ...refundDetails,
       },
-    });
+    }, userId);
   }
 
   /**
@@ -236,7 +284,8 @@ export class EmailServiceClient {
       amount: number;
       taskTitle?: string;
       processingTime?: string;
-    }
+    },
+    userId?: string
   ): Promise<boolean> {
     return this.sendRequest('/send', {
       to: email,
@@ -246,7 +295,7 @@ export class EmailServiceClient {
         userName,
         ...payoutDetails,
       },
-    });
+    }, userId);
   }
 
   /**
@@ -267,7 +316,8 @@ export class EmailServiceClient {
       total: number;
       billingPeriod?: string;
       invoiceUrl?: string;
-    }
+    },
+    userId?: string
   ): Promise<boolean> {
     return this.sendRequest('/send', {
       to: email,
@@ -277,7 +327,7 @@ export class EmailServiceClient {
         userName,
         ...invoiceDetails
       }
-    });
+    }, userId);
   }
 
   /**
@@ -293,7 +343,8 @@ export class EmailServiceClient {
       taskerName?: string;
       paymentUrl?: string;
       taskUrl?: string;
-    }
+    },
+    userId?: string
   ): Promise<boolean> {
     return this.sendRequest('/send', {
       to: email,
@@ -303,6 +354,6 @@ export class EmailServiceClient {
         userName,
         ...paymentDetails
       }
-    });
+    }, userId);
   }
 }

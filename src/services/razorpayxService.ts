@@ -65,11 +65,16 @@ type RazorpayXAuth = {
   accountNumber: string;
 };
 
-function getRazorpayXAuth(): RazorpayXAuth {
+function getRazorpayXAuth(options?: { usePaymentTestCredentials?: boolean }): RazorpayXAuth {
   const env = validateEnv();
 
-  const username = env.RAZORPAYX_KEY_ID || env.RAZORPAY_KEY_ID;
-  const password = env.RAZORPAYX_KEY_SECRET || env.RAZORPAY_KEY_SECRET;
+  const usePaymentTestCredentials = options?.usePaymentTestCredentials === true;
+  const username = usePaymentTestCredentials
+    ? env.RAZORPAY_TEST_KEY_ID
+    : env.RAZORPAYX_KEY_ID || env.RAZORPAY_LIVE_KEY_ID;
+  const password = usePaymentTestCredentials
+    ? env.RAZORPAY_TEST_KEY_SECRET
+    : env.RAZORPAYX_KEY_SECRET || env.RAZORPAY_LIVE_KEY_SECRET;
   const accountNumber = env.RAZORPAYX_ACCOUNT_NUMBER || env.RAZORPAY_ACCOUNT_NUMBER;
 
   if (!username || !password || !accountNumber) {
@@ -148,6 +153,7 @@ export async function createRazorpayXPayout(params: {
   referenceId: string;
   narration: string;
   mode?: 'IMPS' | 'NEFT' | 'RTGS' | 'UPI';
+  usePaymentTestCredentials?: boolean;
 }): Promise<{
   id: string;
   status: string;
@@ -155,7 +161,9 @@ export async function createRazorpayXPayout(params: {
   referenceId?: string;
   failureReason?: string;
 }> {
-  const auth = getRazorpayXAuth();
+  const auth = getRazorpayXAuth({
+    usePaymentTestCredentials: params.usePaymentTestCredentials,
+  });
 
   const idempotencyKey = crypto
     .createHash('sha256')
@@ -217,7 +225,10 @@ export async function createRazorpayXPayout(params: {
   };
 }
 
-export async function getRazorpayXPayoutStatus(payoutId: string): Promise<{
+export async function getRazorpayXPayoutStatus(
+  payoutId: string,
+  options?: { usePaymentTestCredentials?: boolean },
+): Promise<{
   id: string;
   status: string;
   amount?: number;
@@ -225,7 +236,9 @@ export async function getRazorpayXPayoutStatus(payoutId: string): Promise<{
   failureReason?: string;
   processedAt?: string;
 }> {
-  const auth = getRazorpayXAuth();
+  const auth = getRazorpayXAuth({
+    usePaymentTestCredentials: options?.usePaymentTestCredentials,
+  });
 
   const response = await axios.get(`https://api.razorpay.com/v1/payouts/${payoutId}`, {
     auth: {

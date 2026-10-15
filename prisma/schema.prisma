@@ -152,6 +152,7 @@ model Refund {
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt
   completedAt      DateTime?
+  expectedDepositAt DateTime? @db.Timestamptz(3)
 
   // Relations
   escrow Escrow? @relation(fields: [escrowId], references: [id], onDelete: SetNull)

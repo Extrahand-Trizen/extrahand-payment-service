@@ -896,6 +896,7 @@ export async function getRefundStatus(refundId: string): Promise<{
         status: refund.status,
         createdAt: refund.createdAt,
         completedAt: refund.completedAt,
+        expectedDepositAt: refund.expectedDepositAt,
       },
     };
   } catch (error: any) {
@@ -952,6 +953,7 @@ export async function getRefundsByEscrowId(escrowId: string): Promise<{
         status: refund.status,
         createdAt: refund.createdAt,
         completedAt: refund.completedAt,
+        expectedDepositAt: refund.expectedDepositAt,
       })),
     };
   } catch (error: any) {

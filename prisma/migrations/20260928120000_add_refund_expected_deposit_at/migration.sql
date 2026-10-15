@@ -1,0 +1,2 @@
+ALTER TABLE "Refund"
+  ADD COLUMN IF NOT EXISTS "expectedDepositAt" TIMESTAMPTZ(3);

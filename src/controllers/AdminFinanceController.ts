@@ -63,6 +63,9 @@ function buildEscrowQuery(
         if (val && typeof val === 'object' && 'contains' in val) {
           orParts.push(`"${col}"::text ILIKE $${idx++}`);
           params.push(`%${val.contains}%`);
+        } else if (val && typeof val === 'object' && Array.isArray(val.in) && val.in.length > 0) {
+          orParts.push(`"${col}"::text = ANY($${idx++}::text[])`);
+          params.push(val.in.map(String));
         }
       }
     }
@@ -83,6 +86,60 @@ function buildEscrowQuery(
   params.push(limit, offset);
 
   return { sql, params };
+}
+
+function buildStandaloneTransactionSearchQuery(
+  search: string,
+  customerUids: string[],
+  taskIds: string[],
+  limit: number,
+  createdAt?: { gte?: Date; lte?: Date },
+): { sql: string; params: any[] } {
+  const params: any[] = [`%${search}%`];
+  const matches = [
+    `t."id" ILIKE $1`,
+    `t."razorpayOrderId" ILIKE $1`,
+    `COALESCE(t."razorpayPaymentId", '') ILIKE $1`,
+    `COALESCE(t."taskId", '') ILIKE $1`,
+    `t."userId" ILIKE $1`,
+  ];
+
+  if (customerUids.length > 0) {
+    params.push(customerUids);
+    matches.push(`t."userId" = ANY($${params.length}::text[])`);
+  }
+  if (taskIds.length > 0) {
+    params.push(taskIds);
+    matches.push(`t."taskId" = ANY($${params.length}::text[])`);
+  }
+
+  const conditions = [
+    `(${matches.join(' OR ')})`,
+    `NOT EXISTS (
+      SELECT 1 FROM "Escrow" e
+      WHERE e."razorpayOrderId" = t."razorpayOrderId"
+    )`,
+  ];
+  if (createdAt?.gte) {
+    params.push(createdAt.gte);
+    conditions.push(`t."createdAt" >= $${params.length}`);
+  }
+  if (createdAt?.lte) {
+    params.push(createdAt.lte);
+    conditions.push(`t."createdAt" <= $${params.length}`);
+  }
+  params.push(limit);
+
+  return {
+    sql: `
+      SELECT t.*, COUNT(*) OVER() AS _total_count
+      FROM "Transaction" t
+      WHERE ${conditions.join(' AND ')}
+      ORDER BY t."createdAt" DESC
+      LIMIT $${params.length} OFFSET 0
+    `,
+    params,
+  };
 }
 
 function toStringValue(value: Prisma.Decimal | string | number | null | undefined): string | null {
@@ -187,6 +244,14 @@ export class AdminFinanceController {
     const limit = parseLimit(req.query.limit);
     const offset = parseOffset(req.query.offset);
     const search = typeof q === 'string' && q.trim() ? q.trim() : undefined;
+    const customerUids =
+      typeof req.query.customerUids === 'string'
+        ? req.query.customerUids.split(',').map((uid) => uid.trim()).filter(Boolean)
+        : [];
+    const taskIds =
+      typeof req.query.taskIds === 'string'
+        ? req.query.taskIds.split(',').map((taskId) => taskId.trim()).filter(Boolean)
+        : [];
 
     const where: Prisma.EscrowWhereInput = {};
     if (status && typeof status === 'string') {
@@ -209,12 +274,21 @@ export class AdminFinanceController {
 
     if (search) {
       where.OR = [
+        { id: { contains: search, mode: 'insensitive' } },
+        { transactionId: { contains: search, mode: 'insensitive' } },
         { escrowId: { contains: search, mode: 'insensitive' } },
         { razorpayOrderId: { contains: search, mode: 'insensitive' } },
         { razorpayPaymentId: { contains: search, mode: 'insensitive' } },
         { taskId: { contains: search, mode: 'insensitive' } },
         { posterUid: { contains: search, mode: 'insensitive' } },
         { performerUid: { contains: search, mode: 'insensitive' } },
+      ];
+    }
+    if (customerUids.length > 0 || taskIds.length > 0) {
+      where.OR = [
+        ...(where.OR ?? []),
+        ...(customerUids.length > 0 ? [{ posterUid: { in: customerUids } }] : []),
+        ...(taskIds.length > 0 ? [{ taskId: { in: taskIds } }] : []),
       ];
     }
 
@@ -229,28 +303,68 @@ export class AdminFinanceController {
     const useDevDb = environment === 'development' && prismaDev != null;
     const targetPrisma = useDevDb ? prismaDev! : prisma;
 
-    // Use COUNT(*) OVER() window function — single round-trip, no separate COUNT query
-    const query = buildEscrowQuery(where, limit, offset);
+    // Search both escrow-backed and standalone payment records before applying pagination.
+    const fetchLimit = search ? offset + limit : limit;
+    const query = buildEscrowQuery(where, fetchLimit, search ? 0 : offset);
     let raw: any[] = await targetPrisma.$queryRawUnsafe(query.sql, ...query.params);
+    let standaloneTransactions: any[] = [];
 
-    // If no transactions found in primary DB when searching specifically, fallback check in secondary DB (prismaDev)
-    if (raw.length === 0 && search && !useDevDb && prismaDev) {
+    const queryStandaloneTransactions = async (db: typeof targetPrisma) => {
+      const standaloneQuery = buildStandaloneTransactionSearchQuery(
+        search!,
+        customerUids,
+        taskIds,
+        fetchLimit,
+        where.createdAt as { gte?: Date; lte?: Date } | undefined,
+      );
+      return db.$queryRawUnsafe<any[]>(standaloneQuery.sql, ...standaloneQuery.params);
+    };
+
+    if (search) {
+      standaloneTransactions = await queryStandaloneTransactions(targetPrisma);
+    }
+
+    // If neither transaction store has a match in production, check the development database.
+    if (raw.length === 0 && standaloneTransactions.length === 0 && search && !useDevDb && prismaDev) {
       try {
         const devRaw: any[] = await prismaDev.$queryRawUnsafe(query.sql, ...query.params);
-        if (devRaw.length > 0) {
+        const devStandaloneTransactions: any[] = await queryStandaloneTransactions(prismaDev);
+        if (devRaw.length > 0 || devStandaloneTransactions.length > 0) {
           raw = devRaw;
+          standaloneTransactions = devStandaloneTransactions;
         }
       } catch (err: any) {
-        logger.warn('Failed fallback search on secondary DB:', { message: err?.message });
+        logger.warn('Failed fallback transaction search on secondary DB:', { message: err?.message });
       }
     }
 
-    total = raw.length > 0 ? Number(raw[0]._total_count) : 0;
+    total =
+      (raw.length > 0 ? Number(raw[0]._total_count) : 0) +
+      (standaloneTransactions.length > 0 ? Number(standaloneTransactions[0]._total_count) : 0);
     // $queryRawUnsafe does not auto-parse JSONB — do it manually
     allRows = raw.map((r: any) => ({
       ...r,
       metadata: typeof r.metadata === 'string' ? JSON.parse(r.metadata) : (r.metadata ?? null),
     }));
+
+    allRows.push(
+      ...standaloneTransactions.map((tx: any) => ({
+        id: tx.id,
+        escrowId: tx.id,
+        razorpayOrderId: tx.razorpayOrderId,
+        razorpayPaymentId: tx.razorpayPaymentId,
+        taskId: tx.taskId,
+        posterUid: tx.userId,
+        performerUid: 'pending_assignment',
+        status: tx.status,
+        paymentStatus: tx.status,
+        amountInRupees: tx.amount,
+        taskAmount: tx.amount,
+        metadata: typeof tx.metadata === 'string' ? JSON.parse(tx.metadata) : (tx.metadata ?? null),
+        createdAt: tx.createdAt,
+        updatedAt: tx.updatedAt,
+      })),
+    );
 
     // Apply transactionType filter in JS (avoids Prisma JSONB NOT null-propagation bug)
     if (transactionType === 'real') {
@@ -258,72 +372,12 @@ export class AdminFinanceController {
     } else if (transactionType === 'team') {
       allRows = allRows.filter((r: any) => isTeamTest(r.metadata));
     }
-    // total is already correct from COUNT(*) OVER() — do NOT overwrite with allRows.length.
-    // SQL already applied LIMIT/OFFSET so allRows is the correct page slice.
-
-    // Fallback: if Escrow table found nothing for a specific taskId search, also check the Transaction table.
-    // Book Now payments may only exist in Transaction (not Escrow) in some configurations.
-    if (allRows.length === 0 && search) {
-      try {
-        const txRows = await targetPrisma.transaction.findMany({
-          where: { taskId: search },
-          orderBy: { createdAt: 'desc' },
-          take: limit,
-        });
-        if (txRows.length === 0 && prismaDev && !useDevDb) {
-          try {
-            const devTxRows = await prismaDev.transaction.findMany({
-              where: { taskId: search },
-              orderBy: { createdAt: 'desc' },
-              take: limit,
-            });
-            if (devTxRows.length > 0) {
-              // Map Transaction rows into Escrow-like shape
-              allRows = devTxRows.map((tx: any) => ({
-                id: tx.id,
-                escrowId: tx.id,
-                razorpayOrderId: tx.razorpayOrderId,
-                razorpayPaymentId: tx.razorpayPaymentId,
-                taskId: tx.taskId,
-                posterUid: tx.userId,
-                performerUid: 'pending_assignment',
-                status: tx.status,
-                paymentStatus: tx.status,
-                amountInRupees: tx.amount,
-                taskAmount: tx.amount,
-                metadata: typeof tx.metadata === 'string' ? JSON.parse(tx.metadata) : (tx.metadata ?? null),
-                createdAt: tx.createdAt,
-                updatedAt: tx.updatedAt,
-                _total_count: devTxRows.length,
-              }));
-              total = devTxRows.length;
-            }
-          } catch (err: any) {
-            logger.warn('Fallback Transaction dev DB lookup failed:', { message: err?.message });
-          }
-        } else if (txRows.length > 0) {
-          allRows = txRows.map((tx: any) => ({
-            id: tx.id,
-            escrowId: tx.id,
-            razorpayOrderId: tx.razorpayOrderId,
-            razorpayPaymentId: tx.razorpayPaymentId,
-            taskId: tx.taskId,
-            posterUid: tx.userId,
-            performerUid: 'pending_assignment',
-            status: tx.status,
-            paymentStatus: tx.status,
-            amountInRupees: tx.amount,
-            taskAmount: tx.amount,
-            metadata: typeof tx.metadata === 'string' ? JSON.parse(tx.metadata) : (tx.metadata ?? null),
-            createdAt: tx.createdAt,
-            updatedAt: tx.updatedAt,
-            _total_count: txRows.length,
-          }));
-          total = txRows.length;
-        }
-      } catch (err: any) {
-        logger.warn('Fallback Transaction table lookup failed:', { message: err?.message });
-      }
+    if (search) {
+      allRows.sort(
+        (a: any, b: any) =>
+          new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+      );
+      allRows = allRows.slice(offset, offset + limit);
     }
 
     // Batch fetch payouts for these escrows (instead of per-row include subquery)
@@ -1682,4 +1736,3 @@ export class AdminFinanceController {
     res.json({ success: true, message: 'Refund deleted successfully' });
   }
 }
-

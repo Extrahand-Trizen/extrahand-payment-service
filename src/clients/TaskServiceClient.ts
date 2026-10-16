@@ -26,7 +26,7 @@ export class TaskServiceClient {
       const response = await axios.post(
         `${this.baseURL()}/api/v1/bookings/internal/payment-captured`,
         params,
-        { headers: this.headers(), timeout: 10000 }
+        { headers: this.headers(), timeout: 4000 }
       );
 
       if (response.data?.success) {

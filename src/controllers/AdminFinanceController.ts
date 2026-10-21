@@ -431,6 +431,9 @@ export class AdminFinanceController {
         status: escrow.status,
         paymentStatus: escrow.paymentStatus,
         amountInRupees: toStringValue(new Prisma.Decimal(Number(escrow.amountInRupees))),
+        taskAmount: escrow.taskAmount == null
+          ? null
+          : toStringValue(new Prisma.Decimal(Number(escrow.taskAmount))),
         payoutAmount: payoutNetAmount,
         createdAt: escrow.createdAt,
         teamTest: metadata.teamTest === true,

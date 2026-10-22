@@ -8,7 +8,7 @@ import { CategoryFeeMode, Prisma } from '@prisma/client';
 export interface FeeStructure {
   // Platform fees (charged to both poster and performer)
   platformFee: {
-    percentage: number; // 10-15% (constant)
+    percentage: number; // Configurable platform commission percentage
     gstPercentage: number; // 18% GST on platform fee
   };
 
@@ -42,7 +42,7 @@ export interface FeeStructure {
  */
 const DEFAULT_FEE_STRUCTURE: FeeStructure = {
   platformFee: {
-    percentage: parseFloat(process.env.PLATFORM_FEE_PERCENTAGE || '0.05'), // 5%
+    percentage: parseFloat(process.env.PLATFORM_FEE_PERCENTAGE || '0.10'), // 10%
     gstPercentage: parseFloat(process.env.GST_PERCENTAGE || '0.18'), // 18%
   },
   processingFees: {
@@ -468,4 +468,3 @@ export async function deleteCategoryFeeConfig(
 
   clearFeeStructureCache();
 }
-

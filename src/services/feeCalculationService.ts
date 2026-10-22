@@ -59,7 +59,7 @@ export interface FeeBreakdown {
  */
 export interface PosterFeeBreakdown {
   taskAmount: Prisma.Decimal; // Original task amount
-  platformFee: Prisma.Decimal; // Platform service fee (10-15%)
+  platformFee: Prisma.Decimal; // Platform service fee at the configured rate
   platformFeeGst: Prisma.Decimal; // GST on platform fee
   platformFeeTotal: Prisma.Decimal; // Platform fee + GST
   
@@ -84,7 +84,7 @@ export interface PosterFeeBreakdown {
  */
 export interface PerformerFeeBreakdown {
   taskAmount: Prisma.Decimal; // Original task amount
-  platformFee: Prisma.Decimal; // Platform service fee (10-15%)
+  platformFee: Prisma.Decimal; // Platform service fee at the configured rate
   platformFeeGst: Prisma.Decimal; // GST on platform fee
   platformFeeTotal: Prisma.Decimal; // Platform fee + GST
   
@@ -134,7 +134,7 @@ export interface CancellationFeeResult {
 function getFeePercentages() {
   return {
     razorpayFee: parseFloat(process.env.RAZORPAY_FEE_PERCENTAGE || '0.02'), // 2%
-    platformCommission: parseFloat(process.env.PLATFORM_COMMISSION_PERCENTAGE || '0.05'), // 5%
+    platformCommission: parseFloat(process.env.PLATFORM_COMMISSION_PERCENTAGE || '0.10'), // 10%
     gst: parseFloat(process.env.GST_PERCENTAGE || '0.18'), // 18%
     tds: parseFloat(process.env.TDS_PERCENTAGE || '0.05'), // 5%
     cancellationFeeEarly: parseFloat(process.env.CANCELLATION_FEE_EARLY || '0.05'), // 5%
@@ -161,7 +161,7 @@ export async function calculatePosterFees(
     : await getFeeStructure();
   const taskAmountDecimal = new Prisma.Decimal(taskAmount.toString());
 
-  // Calculate platform fee (10-15% of task amount)
+  // Calculate platform fee using the configured percentage
   const platformFee = taskAmountDecimal.mul(feeStructure.platformFee.percentage).toDecimalPlaces(2);
   const platformFeeGst = platformFee.mul(feeStructure.platformFee.gstPercentage).toDecimalPlaces(2);
   const platformFeeTotal = platformFee.add(platformFeeGst).toDecimalPlaces(2);
@@ -212,7 +212,7 @@ export async function calculatePerformerFees(
     : await getFeeStructure();
   const taskAmountDecimal = new Prisma.Decimal(taskAmount.toString());
 
-  // Calculate platform fee (10-15% of task amount)
+  // Calculate platform fee using the configured percentage
   const platformFee = taskAmountDecimal.mul(feeStructure.platformFee.percentage).toDecimalPlaces(2);
   const platformFeeGst = platformFee.mul(feeStructure.platformFee.gstPercentage).toDecimalPlaces(2);
   const platformFeeTotal = platformFee.add(platformFeeGst).toDecimalPlaces(2);
@@ -586,6 +586,5 @@ export function getFeeBreakdownForDisplay(amount: number | Prisma.Decimal): {
     netAmount: `₹${breakdown.netAmount.toString()}`,
   };
 }
-
 
 

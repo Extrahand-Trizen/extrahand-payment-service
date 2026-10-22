@@ -153,6 +153,63 @@ function toStringValue(value: Prisma.Decimal | string | number | null | undefine
   return String(value);
 }
 
+function toFiniteNumber(value: unknown): number | null {
+  const parsed =
+    value instanceof Prisma.Decimal
+      ? value.toNumber()
+      : typeof value === 'number'
+        ? value
+        : typeof value === 'string'
+          ? Number(value)
+          : NaN;
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function toPercentageValue(value: unknown): number | null {
+  const rate = toFiniteNumber(value);
+  return rate == null ? null : rate * 100;
+}
+
+function resolveCustomerTaxAmount(escrow: any, metadata: Record<string, unknown>): string | null {
+  const amountBreakdown =
+    metadata.amountBreakdown && typeof metadata.amountBreakdown === 'object'
+      ? (metadata.amountBreakdown as Record<string, unknown>)
+      : {};
+  const recordedTax = toFiniteNumber(amountBreakdown.gst);
+  if (recordedTax != null) {
+    return new Prisma.Decimal(recordedTax).toDecimalPlaces(2).toString();
+  }
+
+  if (Array.isArray(metadata.gstByCategory)) {
+    const gstAmounts = metadata.gstByCategory
+      .map((category) =>
+        category && typeof category === 'object'
+          ? toFiniteNumber((category as Record<string, unknown>).gstAmount)
+          : null,
+      )
+      .filter((amount): amount is number => amount != null);
+    if (gstAmounts.length > 0) {
+      const totalTax = gstAmounts.reduce((sum, amount) => sum + amount, 0);
+      return new Prisma.Decimal(totalTax).toDecimalPlaces(2).toString();
+    }
+  }
+
+  if (metadata.bookingMode === 'book_now') return null;
+
+  const taskAmount = toFiniteNumber(escrow.taskAmount);
+  const platformFeePercent = toFiniteNumber(escrow.appliedPlatformFeePercent);
+  const gstPercent = toFiniteNumber(escrow.appliedGstPercent);
+  if (taskAmount == null || platformFeePercent == null || gstPercent == null) {
+    return null;
+  }
+
+  return new Prisma.Decimal(taskAmount)
+    .mul(platformFeePercent)
+    .mul(gstPercent)
+    .toDecimalPlaces(2)
+    .toString();
+}
+
 /** Returns true only when metadata.teamTest === true. null/undefined/false = real transaction. */
 function isTeamTest(metadata: unknown): boolean {
   if (!metadata || typeof metadata !== 'object') return false;
@@ -391,7 +448,16 @@ export class AdminFinanceController {
       const escrowDbIds = allRows.map((r: any) => r.id);
       const payouts = await prisma.payout.findMany({
         where: { escrowId: { in: escrowDbIds } },
-        select: { escrowId: true, performerUid: true, netAmount: true, amount: true, status: true },
+        select: {
+          escrowId: true,
+          performerUid: true,
+          netAmount: true,
+          amount: true,
+          platformCommission: true,
+          gstOnCommission: true,
+          tds: true,
+          status: true,
+        },
         orderBy: { createdAt: 'desc' },
         // take: 1 per escrow — handled by groupBy in JS
       });
@@ -434,7 +500,13 @@ export class AdminFinanceController {
         taskAmount: escrow.taskAmount == null
           ? null
           : toStringValue(new Prisma.Decimal(Number(escrow.taskAmount))),
+        customerTaxAmount: resolveCustomerTaxAmount(escrow, metadata),
         payoutAmount: payoutNetAmount,
+        platformCommission: toStringValue(linkedPayout?.platformCommission),
+        gstOnCommission: toStringValue(linkedPayout?.gstOnCommission),
+        tds: toStringValue(linkedPayout?.tds),
+        platformFeePercentage: toPercentageValue(escrow.appliedPlatformFeePercent),
+        commissionGstPercentage: toPercentageValue(escrow.appliedGstPercent),
         createdAt: escrow.createdAt,
         teamTest: metadata.teamTest === true,
         teamTestTransferred: metadata.teamTestTransferred === true,
@@ -860,6 +932,19 @@ export class AdminFinanceController {
       CustomerUid: row.escrow?.posterUid || null,
       amount: toStringValue(row.amount),
       netAmount: toStringValue(row.netAmount),
+      platformCommission: toStringValue(row.platformCommission),
+      gstOnCommission: toStringValue(row.gstOnCommission),
+      tds: toStringValue(row.tds),
+      platformFeePercentage:
+        toPercentageValue(row.escrow?.appliedPlatformFeePercent) ??
+        (toFiniteNumber(row.amount) && toFiniteNumber(row.platformCommission)
+          ? (Number(row.platformCommission) / Number(row.amount)) * 100
+          : null),
+      commissionGstPercentage:
+        toPercentageValue(row.escrow?.appliedGstPercent) ??
+        (toFiniteNumber(row.platformCommission) && toFiniteNumber(row.gstOnCommission)
+          ? (Number(row.gstOnCommission) / Number(row.platformCommission)) * 100
+          : null),
       status: row.status,
       source: row.source,
       createdAt: row.createdAt,

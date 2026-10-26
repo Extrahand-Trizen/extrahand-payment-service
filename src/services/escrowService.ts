@@ -589,50 +589,53 @@ export async function createEscrow(params: {
         ? (metadata.amountBreakdown as Record<string, unknown>)
         : {};
 
-    const escrowMetadata = buildEscrowMetadataSnapshot(
-      {
-        ...metadata,
-        ...(taskAmount
-          ? {
-              visitBudgetRupees: Number(taskAmount.toFixed(2)),
-              originalAmountRupees: Number(amount.toFixed(2)),
-            }
-          : {
-              originalAmountRupees: Number(amount.toFixed(2)),
-            }),
-        pendingCustomerCoinDiscountRupees: pendingCoinRupees.toString(),
-        customerCoinDiscountRupees: pendingCoinRupees.toString(),
-        customerCoinDiscountCoins: pendingCoinUnits.toString(),
-        customerCoinDiscountCapRupees: maxCustomerCoinDiscount.toString(),
-        ...(couponRedemptionId
-          ? {
-              couponId,
-              couponCode: couponCodeApplied,
-              couponDiscount: Number(couponDiscountRupees.toString()),
-              couponDiscountRupees: couponDiscountRupees.toString(),
-              couponRedemptionId,
-              totalBeforeCoupon: Number(amount.toFixed(2)),
-              totalAfterCoupon: Number(amountAfterCoupon.toString()),
-            }
-          : {}),
-        amountBreakdown: {
-          ...existingBreakdown,
-          originalAmount: Number(amount.toFixed(2)),
-          ...(adjustedServiceSubtotal != null ? { taskAmount: adjustedServiceSubtotal } : {}),
-          ...(adjustedGstRupees != null ? { gst: adjustedGstRupees } : {}),
-          couponDiscount: Number(couponDiscountRupees.toString()),
-          extraCoinsDiscount: Number(pendingCoinRupees.toString()),
-          totalAfterCoupon: Number(amountAfterCoupon.toString()),
-          finalPayableAmount: Number(finalChargeAmount.toString()),
-          totalPaid: Number(finalChargeAmount.toString()),
-        },
-        ...(String(razorpayOrder.id).startsWith(REVIEW_ORDER_ID_PREFIX)
-          ? { reviewBypass: true }
-          : {}),
-        paymentEnvironment: razorpayOrder.paymentEnvironment || 'live',
-      } as Record<string, unknown>,
-      { taskCategory: taskCategory ?? null }
-    );
+    const escrowMetadata = {
+      ...buildEscrowMetadataSnapshot(
+        {
+          ...metadata,
+          ...(taskAmount
+            ? {
+                visitBudgetRupees: Number(taskAmount.toFixed(2)),
+                originalAmountRupees: Number(amount.toFixed(2)),
+              }
+            : {
+                originalAmountRupees: Number(amount.toFixed(2)),
+              }),
+          pendingCustomerCoinDiscountRupees: pendingCoinRupees.toString(),
+          customerCoinDiscountRupees: pendingCoinRupees.toString(),
+          customerCoinDiscountCoins: pendingCoinUnits.toString(),
+          customerCoinDiscountCapRupees: maxCustomerCoinDiscount.toString(),
+          ...(couponRedemptionId
+            ? {
+                couponId,
+                couponCode: couponCodeApplied,
+                couponDiscount: Number(couponDiscountRupees.toString()),
+                couponDiscountRupees: couponDiscountRupees.toString(),
+                couponRedemptionId,
+                totalBeforeCoupon: Number(amount.toFixed(2)),
+                totalAfterCoupon: Number(amountAfterCoupon.toString()),
+              }
+            : {}),
+          amountBreakdown: {
+            ...existingBreakdown,
+            originalAmount: Number(amount.toFixed(2)),
+            ...(adjustedServiceSubtotal != null ? { taskAmount: adjustedServiceSubtotal } : {}),
+            ...(adjustedGstRupees != null ? { gst: adjustedGstRupees } : {}),
+            couponDiscount: Number(couponDiscountRupees.toString()),
+            extraCoinsDiscount: Number(pendingCoinRupees.toString()),
+            totalAfterCoupon: Number(amountAfterCoupon.toString()),
+            finalPayableAmount: Number(finalChargeAmount.toString()),
+            totalPaid: Number(finalChargeAmount.toString()),
+          },
+          ...(String(razorpayOrder.id).startsWith(REVIEW_ORDER_ID_PREFIX)
+            ? { reviewBypass: true }
+            : {}),
+          paymentEnvironment: razorpayOrder.paymentEnvironment || 'live',
+        } as Record<string, unknown>,
+        { taskCategory: taskCategory ?? null }
+      ),
+      platformCommissionRateVersion: 2,
+    };
 
     // Calculate auto-release date if enabled
     let autoReleaseDate: Date | null = null;
@@ -2378,4 +2381,3 @@ export async function linkRealTaskIdToBookingEscrow(params: {
     return { success: false, error: err.message };
   }
 }
-

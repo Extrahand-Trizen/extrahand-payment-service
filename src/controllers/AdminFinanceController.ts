@@ -14,6 +14,7 @@ import { createLedgerEntry, getEscrowBalance } from '../services/ledgerService';
 import { toAdminBankAccount } from '../services/bankAccountSecrets';
 import { calculateFees } from '../services/feeCalculationService';
 import logger from '../config/logger';
+import { usesCurrentPlatformCommissionPolicy } from '../utils/platformCommissionPolicy';
 
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
@@ -475,13 +476,29 @@ export class AdminFinanceController {
       if (linkedPayout) {
         payoutNetAmount = toStringValue(linkedPayout.netAmount);
       } else if (escrow.taskAmount != null) {
-        try {
-          const taskAmount = new Prisma.Decimal(Number(escrow.taskAmount));
-          const commission = taskAmount.mul(0.05).toDecimalPlaces(2);
-          const gstOnCommission = commission.mul(0.18).toDecimalPlaces(2);
-          const netAmount = taskAmount.sub(commission).sub(gstOnCommission).toDecimalPlaces(2);
-          payoutNetAmount = netAmount.toString();
-        } catch { /* ignore */ }
+        const taskAmount = new Prisma.Decimal(String(escrow.taskAmount));
+        const isCurrentCommissionPolicy = usesCurrentPlatformCommissionPolicy({
+          createdAt: escrow.createdAt,
+          metadata,
+        });
+        const platformFeePercentage = new Prisma.Decimal(
+          String(
+            isCurrentCommissionPolicy
+              ? escrow.appliedPlatformFeePercent ?? process.env.PLATFORM_FEE_PERCENTAGE ?? '0.10'
+              : '0.05',
+          ),
+        );
+        const gstPercentage = new Prisma.Decimal(
+          String(
+            escrow.appliedGstPercent ??
+              process.env.GST_PERCENTAGE ??
+              '0.18',
+          ),
+        );
+        const commission = taskAmount.mul(platformFeePercentage).toDecimalPlaces(2);
+        const gstOnCommission = commission.mul(gstPercentage).toDecimalPlaces(2);
+        const netAmount = taskAmount.sub(commission).sub(gstOnCommission).toDecimalPlaces(2);
+        payoutNetAmount = netAmount.toString();
       }
       const resolvedPerformerUid =
         linkedPayout?.performerUid ||
@@ -505,7 +522,11 @@ export class AdminFinanceController {
         platformCommission: toStringValue(linkedPayout?.platformCommission),
         gstOnCommission: toStringValue(linkedPayout?.gstOnCommission),
         tds: toStringValue(linkedPayout?.tds),
-        platformFeePercentage: toPercentageValue(escrow.appliedPlatformFeePercent),
+        platformFeePercentage: toPercentageValue(
+          usesCurrentPlatformCommissionPolicy({ createdAt: escrow.createdAt, metadata })
+            ? escrow.appliedPlatformFeePercent ?? process.env.PLATFORM_FEE_PERCENTAGE ?? '0.10'
+            : '0.05',
+        ),
         commissionGstPercentage: toPercentageValue(escrow.appliedGstPercent),
         createdAt: escrow.createdAt,
         teamTest: metadata.teamTest === true,
@@ -935,11 +956,17 @@ export class AdminFinanceController {
       platformCommission: toStringValue(row.platformCommission),
       gstOnCommission: toStringValue(row.gstOnCommission),
       tds: toStringValue(row.tds),
-      platformFeePercentage:
-        toPercentageValue(row.escrow?.appliedPlatformFeePercent) ??
-        (toFiniteNumber(row.amount) && toFiniteNumber(row.platformCommission)
-          ? (Number(row.platformCommission) / Number(row.amount)) * 100
-          : null),
+      platformFeePercentage: usesCurrentPlatformCommissionPolicy({
+        createdAt: row.escrow?.createdAt,
+        metadata: row.escrow?.metadata,
+      })
+        ? toPercentageValue(
+            row.escrow?.appliedPlatformFeePercent ??
+              (toFiniteNumber(row.amount) && toFiniteNumber(row.platformCommission)
+                ? Number(row.platformCommission) / Number(row.amount)
+                : process.env.PLATFORM_FEE_PERCENTAGE ?? '0.10'),
+          )
+        : 5,
       commissionGstPercentage:
         toPercentageValue(row.escrow?.appliedGstPercent) ??
         (toFiniteNumber(row.platformCommission) && toFiniteNumber(row.gstOnCommission)

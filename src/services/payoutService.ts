@@ -19,6 +19,7 @@ import { UserServiceClient } from '../clients/UserServiceClient';
 import { applyPenaltyLinesInTx, planPenaltyDeductionsFromGross } from './performerPenaltyService';
 import { notifyPayoutCompleted, notifyPayoutInitiated } from './paymentNotificationService';
 import { getFeeStructureForCategory, resolveBiddingPayoutFeePercents, resolveEscrowCategoryFeeConfigKey } from './feeConfigService';
+import { usesCurrentPlatformCommissionPolicy } from '../utils/platformCommissionPolicy';
 import { applyExtraCoinsForPayout, awardExtraCoinsForCompletedTask } from './extraCoinsService';
 import { paymentRewardsFlags } from '../config/rewardsFlags';
 import { CoinUsageConfigProvider } from '../rewards/config/CoinUsageConfigProvider';
@@ -1384,7 +1385,13 @@ export async function processTaskCompletionPayout(params: {
       });
       feeStructure = {
         platformFee: {
-          percentage: resolvedFees.platformFeePercentage,
+          percentage:
+            usesCurrentPlatformCommissionPolicy({
+              createdAt: taskEscrow?.createdAt,
+              metadata: escrowMeta,
+            })
+              ? resolvedFees.platformFeePercentage
+              : 0.05,
           gstPercentage: resolvedFees.gstPercentage,
         },
       };
@@ -2457,4 +2464,3 @@ export async function holdBookNowTaskPayouts(params: {
     };
   }
 }
-

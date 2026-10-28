@@ -5,6 +5,7 @@ import { getTransactionSummary, getUserTransactions } from './transactionHistory
 import { razorpay } from '../config/razorpay';
 import crypto from 'crypto';
 import { getFeeStructure, listCategoryFeeConfigs, upsertCategoryFeeConfig } from './feeConfigService';
+import { usesCurrentPlatformCommissionPolicy } from '../utils/platformCommissionPolicy';
 
 type DateRange = { from?: Date; to?: Date };
 
@@ -15,119 +16,117 @@ function buildCreatedAtFilter(range: DateRange): { gte?: Date; lte?: Date } | un
   return Object.keys(filter).length > 0 ? filter : undefined;
 }
 
-function decimalToString(value: Prisma.Decimal | null | undefined): string {
-  return (value || new Prisma.Decimal(0)).toString();
-}
-
 export async function getDashboardOverview(range: DateRange) {
-  const createdAt = buildCreatedAtFilter(range);
+  const [overview] = await prisma.$queryRaw<Array<{
+    gmv: Prisma.Decimal;
+    totalPayins: bigint;
+    totalPayouts: Prisma.Decimal;
+    payoutCount: bigint;
+    totalRefunds: Prisma.Decimal;
+    refundCount: bigint;
+    revenue: Prisma.Decimal;
+    totalTax: Prisma.Decimal;
+    paymentSuccessCount: bigint;
+    paymentFailedCount: bigint;
+    payoutSuccessCount: bigint;
+    payoutFailedCount: bigint;
+  }>>`
+    WITH bounds AS (
+      SELECT ${range.from ?? null}::timestamptz AS "from", ${range.to ?? null}::timestamptz AS "to"
+    ),
+    real_escrows AS MATERIALIZED (
+      SELECT e.*
+      FROM "Escrow" e CROSS JOIN bounds b
+      WHERE (b."from" IS NULL OR e."createdAt" >= b."from")
+        AND (b."to" IS NULL OR e."createdAt" <= b."to")
+        AND COALESCE(e.metadata->>'teamTest', 'false') <> 'true'
+    ),
+    real_payouts AS MATERIALIZED (
+      SELECT p.*
+      FROM "Payout" p
+      LEFT JOIN "Escrow" e ON e.id = p."escrowId"
+      CROSS JOIN bounds b
+      WHERE (b."from" IS NULL OR p."createdAt" >= b."from")
+        AND (b."to" IS NULL OR p."createdAt" <= b."to")
+        AND COALESCE(p.metadata->>'teamTest', 'false') <> 'true'
+        AND COALESCE(e.metadata->>'teamTest', 'false') <> 'true'
+    ),
+    real_refunds AS MATERIALIZED (
+      SELECT r.*
+      FROM "Refund" r
+      LEFT JOIN "Escrow" e ON e.id = r."escrowId"
+      CROSS JOIN bounds b
+      WHERE r.status = 'completed'
+        AND (b."from" IS NULL OR r."createdAt" >= b."from")
+        AND (b."to" IS NULL OR r."createdAt" <= b."to")
+        AND COALESCE(e.metadata->>'teamTest', 'false') <> 'true'
+    )
+    SELECT
+      COALESCE((SELECT SUM(e."amountInRupees") FROM real_escrows e), 0) AS gmv,
+      (SELECT COUNT(*) FROM real_escrows) AS "totalPayins",
+      COALESCE((SELECT SUM(p."netAmount") FROM real_payouts p), 0) AS "totalPayouts",
+      (SELECT COUNT(*) FROM real_payouts) AS "payoutCount",
+      COALESCE((SELECT SUM(r."refundAmount") FROM real_refunds r), 0) AS "totalRefunds",
+      (SELECT COUNT(*) FROM real_refunds) AS "refundCount",
+      COALESCE((
+        SELECT SUM(ROUND(
+          e."taskAmount" * CASE
+            WHEN e.metadata->>'platformCommissionRateVersion' = '2'
+              OR e."createdAt" >= TIMESTAMPTZ '2026-10-26 15:15:00+05:30'
+            THEN COALESCE(e."appliedPlatformFeePercent", ${process.env.PLATFORM_FEE_PERCENTAGE ?? '0.10'}::numeric)
+            ELSE 0.05
+          END,
+          2
+        ))
+        FROM real_escrows e
+        WHERE e."taskAmount" IS NOT NULL
+      ), 0) AS revenue,
+      COALESCE((
+        SELECT SUM(COALESCE(
+          NULLIF(e.metadata #>> '{amountBreakdown,gst}', '')::numeric,
+          (
+            SELECT SUM(NULLIF(category->>'gstAmount', '')::numeric)
+            FROM jsonb_array_elements(
+              CASE
+                WHEN jsonb_typeof(e.metadata->'gstByCategory') = 'array'
+                THEN e.metadata->'gstByCategory'
+                ELSE '[]'::jsonb
+              END
+            ) category
+          ),
+          CASE
+            WHEN e.metadata->>'bookingMode' = 'book_now' THEN 0
+            WHEN e."taskAmount" IS NOT NULL
+              AND e."appliedPlatformFeePercent" IS NOT NULL
+              AND e."appliedGstPercent" IS NOT NULL
+            THEN ROUND(e."taskAmount" * e."appliedPlatformFeePercent" * e."appliedGstPercent", 2)
+            ELSE 0
+          END
+        ))
+        FROM real_escrows e
+      ), 0) + COALESCE((SELECT SUM(p."gstOnCommission") FROM real_payouts p), 0) AS "totalTax",
+      (SELECT COUNT(*) FROM real_escrows WHERE "paymentStatus" = 'captured') AS "paymentSuccessCount",
+      (SELECT COUNT(*) FROM real_escrows WHERE "paymentStatus" = 'failed') AS "paymentFailedCount",
+      (SELECT COUNT(*) FROM real_payouts WHERE status = 'completed') AS "payoutSuccessCount",
+      (SELECT COUNT(*) FROM real_payouts WHERE status = 'failed') AS "payoutFailedCount"
+  `;
 
-  // Filter clause to exclude team-test escrows (used for pay-in metrics and counts)
-  const realEscrowWhere = {
-    ...(createdAt ? { createdAt } : {}),
-    NOT: {
-      metadata: {
-        path: ['teamTest'],
-        equals: true,
-      },
-    },
-  };
-
-  // Filter clause to exclude team-test payouts (payout metadata.teamTest)
-  const realPayoutWhere = {
-    ...(createdAt ? { createdAt } : {}),
-    NOT: {
-      metadata: {
-        path: ['teamTest'],
-        equals: true,
-      },
-    },
-  };
-
-  // Refunds are linked to escrows — exclude refunds whose escrow is a team test
-  const realRefundWhere = {
-    ...(createdAt ? { createdAt } : {}),
-    status: 'completed',
-    escrow: {
-      NOT: {
-        metadata: {
-          path: ['teamTest'],
-          equals: true,
-        },
-      },
-    },
-  };
-
-  // Ledger revenue: exclude entries linked to team-test escrows
-  const realLedgerWhere = {
-    ...(createdAt ? { createdAt } : {}),
-    type: 'platform_commission',
-    escrow: {
-      NOT: {
-        metadata: {
-          path: ['teamTest'],
-          equals: true,
-        },
-      },
-    },
-  };
-
-  const [
-    escrowAgg,
-    payoutAgg,
-    refundAgg,
-    ledgerRevenueAgg,
-    paymentSuccessCount,
-    paymentFailedCount,
-    payoutSuccessCount,
-    payoutFailedCount,
-  ] = await Promise.all([
-    prisma.escrow.aggregate({
-      where: realEscrowWhere,
-      _sum: { amountInRupees: true },
-      _count: { id: true },
-    }),
-    prisma.payout.aggregate({
-      where: realPayoutWhere,
-      _sum: { netAmount: true },
-      _count: { id: true },
-    }),
-    prisma.refund.aggregate({
-      where: realRefundWhere,
-      _sum: { refundAmount: true },
-      _count: { id: true },
-    }),
-    prisma.ledger.aggregate({
-      where: realLedgerWhere,
-      _sum: { amount: true },
-    }),
-    // Payment success/fail counts: only real escrows
-    prisma.escrow.count({
-      where: { ...realEscrowWhere, paymentStatus: 'captured' },
-    }),
-    prisma.escrow.count({
-      where: { ...realEscrowWhere, paymentStatus: 'failed' },
-    }),
-    // Payout success/fail counts: only real payouts
-    prisma.payout.count({
-      where: { ...realPayoutWhere, status: 'completed' },
-    }),
-    prisma.payout.count({
-      where: { ...realPayoutWhere, status: 'failed' },
-    }),
-  ]);
-
+  const paymentSuccessCount = Number(overview.paymentSuccessCount);
+  const paymentFailedCount = Number(overview.paymentFailedCount);
+  const payoutSuccessCount = Number(overview.payoutSuccessCount);
+  const payoutFailedCount = Number(overview.payoutFailedCount);
   const paymentTotal = paymentSuccessCount + paymentFailedCount;
   const payoutTotal = payoutSuccessCount + payoutFailedCount;
 
   return {
-    gmv: decimalToString(escrowAgg._sum.amountInRupees),
-    totalPayins: escrowAgg._count.id,
-    totalPayouts: decimalToString(payoutAgg._sum.netAmount),
-    payoutCount: payoutAgg._count.id,
-    totalRefunds: decimalToString(refundAgg._sum.refundAmount),
-    refundCount: refundAgg._count.id,
-    revenue: decimalToString(ledgerRevenueAgg._sum.amount),
+    gmv: overview.gmv.toString(),
+    totalPayins: Number(overview.totalPayins),
+    totalPayouts: overview.totalPayouts.toString(),
+    payoutCount: Number(overview.payoutCount),
+    totalRefunds: overview.totalRefunds.toString(),
+    refundCount: Number(overview.refundCount),
+    revenue: overview.revenue.toString(),
+    totalTax: overview.totalTax.toString(),
     paymentSuccessRate: paymentTotal > 0 ? Number(((paymentSuccessCount / paymentTotal) * 100).toFixed(2)) : 0,
     payoutSuccessRate: payoutTotal > 0 ? Number(((payoutSuccessCount / payoutTotal) * 100).toFixed(2)) : 0,
   };
@@ -1023,4 +1022,3 @@ export async function getDashboardFeeCategories() {
 export async function updateDashboardFeeCategory(categoryKey: string, payload: any, actorId = 'system') {
   return upsertCategoryFeeConfig({ ...payload, categoryKey }, actorId);
 }
-

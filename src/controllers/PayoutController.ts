@@ -1,4 +1,5 @@
-import { Response, Request } from 'express';
+
+import { Request, Response } from 'express';
 import {
   processPayout,
   getPayoutStatus,
@@ -12,6 +13,7 @@ import {
   getPayoutStatusBatch,
 } from '../services/payoutBundleService';
 import { BadRequestError, NotFoundError } from '../errors/AppError';
+import { prisma } from '../config/prisma';
 
 const TRUSTED_TASK_COMPLETION_PAYOUT_SERVICES = new Set(['task-service']);
 
@@ -296,6 +298,53 @@ export class PayoutController {
     res.json({
       success: true,
       payouts: result.payouts ?? [],
+    });
+  }
+
+  /**
+   * POST /api/v1/payouts/tasks/transactions
+   * Body: { taskIds: string[] }
+   * Returns payout transactions for the given task IDs (used by earnings By Period tab).
+   */
+  static async getPayoutsByTaskIds(req: Request, res: Response): Promise<void> {
+    const taskIds: string[] = Array.isArray(req.body?.taskIds)
+      ? req.body.taskIds.map((id: unknown) => String(id)).filter(Boolean)
+      : [];
+
+    if (taskIds.length === 0) {
+      res.json({ success: true, transactions: [] });
+      return;
+    }
+
+    const payouts = await prisma.payout.findMany({
+      where: { taskId: { in: taskIds } },
+      select: {
+        payoutId: true,
+        taskId: true,
+        performerUid: true,
+        amount: true,
+        netAmount: true,
+        platformCommission: true,
+        gstOnCommission: true,
+        tds: true,
+        status: true,
+        completedAt: true,
+        createdAt: true,
+        bankTransferId: true,
+        metadata: true,
+      },
+    });
+
+    res.json({
+      success: true,
+      transactions: payouts.map((p) => ({
+        ...p,
+        amount: p.amount.toString(),
+        netAmount: p.netAmount.toString(),
+        platformCommission: p.platformCommission.toString(),
+        gstOnCommission: p.gstOnCommission.toString(),
+        tds: p.tds?.toString() ?? '0',
+      })),
     });
   }
 }

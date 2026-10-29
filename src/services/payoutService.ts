@@ -1416,15 +1416,27 @@ export async function processTaskCompletionPayout(params: {
       if (grossAmount.lte(0)) {
         return { success: false, error: 'Invalid payout amount for this task' };
       }
-      isBookNowPayout = false;
-      partnerVisibleAt = null; // Immediately visible on partner's earnings page
-      platformCommission = new Prisma.Decimal('0.00');
-      gstOnCommission = new Prisma.Decimal('0.00');
-      platformFeeTotal = new Prisma.Decimal('0.00');
+      isBookNowPayout = Boolean(payoutSource === 'book_now' || params.taskTitle);
+      partnerVisibleAt = isBookNowPayout ? resolvePartnerVisibleAt({ isBookNow: true }) : null;
+
+      if (isBookNowPayout && !isQuickCommerce) {
+        // Book Now direct payout: apply standard platform fee + GST
+        const feeCfg = await getFeeStructureForCategory('default');
+        const feePercent = feeCfg?.platformFee?.percentage ?? 0.10;
+        const gstPercent = feeCfg?.platformFee?.gstPercentage ?? 0.18;
+        platformCommission = grossAmount.mul(new Prisma.Decimal(String(feePercent))).toDecimalPlaces(2);
+        gstOnCommission = platformCommission.mul(new Prisma.Decimal(String(gstPercent))).toDecimalPlaces(2);
+        platformFeeTotal = platformCommission.add(gstOnCommission).toDecimalPlaces(2);
+      } else {
+        platformCommission = new Prisma.Decimal('0.00');
+        gstOnCommission = new Prisma.Decimal('0.00');
+        platformFeeTotal = new Prisma.Decimal('0.00');
+      }
       logger.info('[PAYOUT_DEBUG] Processing direct payout without escrow', {
         taskId,
         performerUid,
         grossAmount: grossAmount.toString(),
+        platformCommission: platformCommission.toString(),
         source: payoutSource || 'direct',
       });
     }

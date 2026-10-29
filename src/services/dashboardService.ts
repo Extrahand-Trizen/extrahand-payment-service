@@ -60,11 +60,45 @@ export async function getDashboardOverview(range: DateRange) {
         AND (b."from" IS NULL OR r."createdAt" >= b."from")
         AND (b."to" IS NULL OR r."createdAt" <= b."to")
         AND COALESCE(e.metadata->>'teamTest', 'false') <> 'true'
+    ),
+    escrow_payout_amounts AS (
+      SELECT
+        e.id,
+        COALESCE(
+          payout."netAmount",
+          CASE
+            WHEN e."taskAmount" IS NULL THEN NULL
+            ELSE e."taskAmount"
+              - ROUND(e."taskAmount" * fee.percentage, 2)
+              - ROUND(
+                  ROUND(e."taskAmount" * fee.percentage, 2)
+                    * COALESCE(e."appliedGstPercent", ${process.env.GST_PERCENTAGE ?? '0.18'}::numeric),
+                  2
+                )
+          END
+        ) AS "payoutAmount"
+      FROM real_escrows e
+      LEFT JOIN LATERAL (
+        SELECT p."netAmount"
+        FROM "Payout" p
+        WHERE p."escrowId" = e.id
+          AND COALESCE(p.metadata->>'teamTest', 'false') <> 'true'
+        ORDER BY p."createdAt" DESC
+        LIMIT 1
+      ) payout ON true
+      CROSS JOIN LATERAL (
+        SELECT CASE
+          WHEN e.metadata->>'platformCommissionRateVersion' = '2'
+            OR e."createdAt" >= TIMESTAMPTZ '2026-10-26 15:15:00+05:30'
+          THEN COALESCE(e."appliedPlatformFeePercent", ${process.env.PLATFORM_FEE_PERCENTAGE ?? '0.10'}::numeric)
+          ELSE 0.05
+        END AS percentage
+      ) fee
     )
     SELECT
       COALESCE((SELECT SUM(e."amountInRupees") FROM real_escrows e), 0) AS gmv,
       (SELECT COUNT(*) FROM real_escrows) AS "totalPayins",
-      COALESCE((SELECT SUM(p."netAmount") FROM real_payouts p), 0) AS "totalPayouts",
+      COALESCE((SELECT SUM(p."payoutAmount") FROM escrow_payout_amounts p), 0) AS "totalPayouts",
       (SELECT COUNT(*) FROM real_payouts) AS "payoutCount",
       COALESCE((SELECT SUM(r."refundAmount") FROM real_refunds r), 0) AS "totalRefunds",
       (SELECT COUNT(*) FROM real_refunds) AS "refundCount",

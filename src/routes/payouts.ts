@@ -60,6 +60,12 @@ router.post(
 router.post('/status/batch', asyncHandler(PayoutController.getPayoutStatusBatch));
 
 /**
+ * POST /api/v1/payouts/tasks/transactions
+ * Get payout transactions for a list of task IDs (earnings By Period tab)
+ */
+router.post('/tasks/transactions', asyncHandler(PayoutController.getPayoutsByTaskIds));
+
+/**
  * GET /api/v1/payouts/ops/manual-queue
  * List payout requests for operations portal (manual bank transfers).
  */

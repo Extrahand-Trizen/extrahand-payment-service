@@ -1804,21 +1804,43 @@ export class AdminFinanceController {
         targetPrisma = prismaDev;
       }
     }
-    if (!escrow) throw new NotFoundError('Transaction not found');
 
-    await targetPrisma.escrow.delete({
-      where: { id: escrow.id },
-    });
+    if (escrow) {
+      await targetPrisma.escrow.delete({
+        where: { id: escrow.id },
+      });
 
-    await targetPrisma.auditLog.create({
-      data: {
-        entityType: 'escrow',
-        entityId: escrow.id,
-        action: 'deleted',
-        actorType: 'admin',
-        newValue: { deleted: true, escrowId: escrow.escrowId } as Prisma.InputJsonValue,
-      },
-    });
+      await targetPrisma.auditLog.create({
+        data: {
+          entityType: 'escrow',
+          entityId: escrow.id,
+          action: 'deleted',
+          actorType: 'admin',
+          newValue: { deleted: true, escrowId: escrow.escrowId } as Prisma.InputJsonValue,
+        },
+      });
+    } else {
+      let transaction = await targetPrisma.transaction.findUnique({ where: { id } });
+      if (!transaction && targetPrisma === prisma && prismaDev) {
+        transaction = await prismaDev.transaction.findUnique({ where: { id } });
+        if (transaction) targetPrisma = prismaDev;
+      }
+      if (!transaction) throw new NotFoundError('Transaction not found');
+
+      await targetPrisma.transaction.delete({
+        where: { id: transaction.id },
+      });
+
+      await targetPrisma.auditLog.create({
+        data: {
+          entityType: 'transaction',
+          entityId: transaction.id,
+          action: 'deleted',
+          actorType: 'admin',
+          newValue: { deleted: true, transactionId: transaction.id } as Prisma.InputJsonValue,
+        },
+      });
+    }
 
     res.json({ success: true, message: 'Transaction deleted successfully' });
   }

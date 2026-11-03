@@ -425,7 +425,10 @@ export async function upsertCategoryFeeConfig(payload: any, updatedBy?: string):
     sacCode: payload.sacCode ?? null,
     sacHeading: payload.sacHeading ?? null,
     gstPercentage: payload.gstPercentage ?? undefined,
-    platformFeePercentage: payload.platformFeePercentage ?? undefined,
+    platformFeePercentage:
+      payload.platformFeePercentage === null
+        ? null
+        : payload.platformFeePercentage ?? undefined,
     razorpayFeeGstPercentage: payload.razorpayFeeGstPercentage ?? undefined,
     minPrice: payload.minPrice ?? undefined,
     maxPrice: payload.maxPrice ?? undefined,

@@ -33,25 +33,12 @@ export const paymentKeys: Record<PaymentEnvironment, string> = {
 export async function resolvePaymentEnvironment(uid?: string | null): Promise<PaymentEnvironment> {
   const normalizedUid = uid?.trim();
   const uidPresent = !!normalizedUid;
+  const isTester = uidPresent
+    ? await UserServiceClient.getPaymentTesterStatus(normalizedUid)
+    : true;
 
-  // Ensure test credentials are available; otherwise we cannot safely run in test mode.
-  if (!testKeyId || !testKeySecret) {
-    console.warn('[PAYMENT DEBUG] Test credentials are not configured; using live environment');
-    return 'live';
-  }
-
-  // If UID is missing, default to test environment to avoid accidental live charges.
-  if (!uidPresent) {
-    console.log('[PAYMENT DEBUG] UID missing, defaulting to test environment');
-    return 'test';
-  }
-
-  // Verify tester status; fallback to live if verification fails.
-  let isTester = false;
-  try {
-    isTester = await UserServiceClient.isPaymentTester(normalizedUid);
-  } catch (err) {
-    console.warn('[PAYMENT DEBUG] User service verification failed, treating as non‑tester', err);
+  if (isTester && (!testKeyId || !testKeySecret)) {
+    throw new Error('Payment test mode is enabled, but Razorpay test credentials are not configured. Payment was not started.');
   }
 
   const environment: PaymentEnvironment = isTester ? 'test' : 'live';

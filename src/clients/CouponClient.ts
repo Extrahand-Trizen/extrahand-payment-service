@@ -8,11 +8,14 @@ export type CouponValidateResult = {
   couponId?: string;
   couponCode?: string;
   discountType?: string;
+  discountValue?: number;
   discountAmount?: number;
   originalAmount?: number;
   amountAfterCoupon?: number;
   eligibleAmount?: number;
   eligibleServiceIds?: string[];
+  eligibleLineKeys?: string[];
+  eligibilityDeferred?: boolean;
   code?: string;
   message?: string;
   error?: string;
@@ -23,6 +26,7 @@ export type CouponLineItem = {
   amount: number;
   skuSlug?: string;
   categorySlug?: string;
+  lineKey?: string;
 };
 
 export type CouponReserveResult = {
@@ -35,6 +39,7 @@ export type CouponReserveResult = {
     amountAfterCoupon: number;
     originalAmount: number;
     eligibleServiceIds?: string[];
+    eligibleLineKeys?: string[];
     status: string;
     expiresAt?: string | null;
   };
@@ -88,6 +93,7 @@ export class CouponClient {
             amount: item.amount,
             skuSlug: item.skuSlug,
             categorySlug: item.categorySlug,
+            lineKey: item.lineKey,
           })),
           city: params.city,
           pinCode: params.pinCode,
@@ -136,6 +142,7 @@ export class CouponClient {
       amountAfterCoupon?: number;
       eligibleAmount?: number;
       eligibleServiceIds?: string[];
+      eligibleLineKeys?: string[];
       code?: string;
     }>;
     message?: string;
@@ -153,6 +160,7 @@ export class CouponClient {
             amount: item.amount,
             skuSlug: item.skuSlug,
             categorySlug: item.categorySlug,
+            lineKey: item.lineKey,
           })),
           city: params.city,
           pinCode: params.pinCode,
@@ -201,6 +209,7 @@ export class CouponClient {
             amount: item.amount,
             skuSlug: item.skuSlug,
             categorySlug: item.categorySlug,
+            lineKey: item.lineKey,
           })),
           city: params.city,
           pinCode: params.pinCode,

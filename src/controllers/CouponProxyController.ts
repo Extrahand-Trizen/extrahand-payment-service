@@ -102,11 +102,13 @@ export async function validateCoupon(req: Request, res: Response): Promise<void>
     couponId: result.couponId,
     couponCode: result.couponCode,
     discountType: result.discountType,
+    discountValue: result.discountValue,
     discountAmount: result.discountAmount,
     originalAmount: result.originalAmount,
     amountAfterCoupon: result.amountAfterCoupon,
     eligibleAmount: result.eligibleAmount,
     eligibleServiceIds: result.eligibleServiceIds,
+    eligibleLineKeys: result.eligibleLineKeys,
   });
 }
 

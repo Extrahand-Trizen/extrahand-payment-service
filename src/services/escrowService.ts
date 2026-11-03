@@ -403,6 +403,7 @@ export async function createEscrow(params: {
               amount: Number(row?.amount) || 0,
               skuSlug: row?.skuSlug ? String(row.skuSlug).trim() : undefined,
               categorySlug: row?.categorySlug ? String(row.categorySlug).trim() : undefined,
+              lineKey: row?.lineKey ? String(row.lineKey).trim() : undefined,
             }))
             .filter((row: { serviceId: string; amount: number }) => row.serviceId && row.amount > 0)
         : [];
@@ -437,6 +438,9 @@ export async function createEscrow(params: {
       const eligibleServiceIds = Array.isArray(reserve.redemption.eligibleServiceIds)
         ? reserve.redemption.eligibleServiceIds.map((s: unknown) => String(s).trim()).filter(Boolean)
         : [];
+      const eligibleLineKeys = Array.isArray(reserve.redemption.eligibleLineKeys)
+        ? reserve.redemption.eligibleLineKeys.map((key: unknown) => String(key).trim()).filter(Boolean)
+        : [];
 
       if (isBookNow && Array.isArray(metadata?.gstByCategory) && metadata.gstByCategory.length > 0) {
         const gstRows = metadata.gstByCategory
@@ -451,12 +455,16 @@ export async function createEscrow(params: {
         if (gstRows.length > 0) {
           const categoryKeysFromEligible = new Set<string>();
           if (Array.isArray(lineItems)) {
+            const eligibleLineKeySet = new Set(eligibleLineKeys);
             const eligibleLower = new Set(eligibleServiceIds.map((s) => s.toLowerCase()));
             for (const item of lineItems) {
-              if (
-                (item.serviceId && eligibleLower.has(item.serviceId.toLowerCase())) ||
-                (item.skuSlug && eligibleLower.has(item.skuSlug.toLowerCase()))
-              ) {
+              const isEligible = eligibleLineKeySet.size > 0
+                ? Boolean(item.lineKey && eligibleLineKeySet.has(item.lineKey))
+                : Boolean(
+                    (item.serviceId && eligibleLower.has(item.serviceId.toLowerCase())) ||
+                    (item.skuSlug && eligibleLower.has(item.skuSlug.toLowerCase()))
+                  );
+              if (isEligible) {
                 if (item.categorySlug) {
                   categoryKeysFromEligible.add(item.categorySlug.toLowerCase());
                 }

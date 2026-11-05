@@ -226,13 +226,14 @@ export class EscrowController {
       taskAmount,
       currency,
       metadata,
+      idempotencyKey,
       taskCategory,
       taskTitle: taskTitleBody,
     } = req.body;
 
-    if (!taskId || !bookingOrderId || !posterUid || !amount) {
+    if (!taskId || !bookingOrderId || !idempotencyKey || !posterUid || !amount) {
       throw new BadRequestError(
-        'Missing required fields: taskId, bookingOrderId, posterUid, amount'
+        'Missing required fields: taskId, bookingOrderId, idempotencyKey, posterUid, amount'
       );
     }
 
@@ -255,6 +256,7 @@ export class EscrowController {
     const result = await createBookingEscrow({
       taskId,
       bookingOrderId,
+      idempotencyKey: String(idempotencyKey).trim(),
       posterUid,
       amount,
       taskAmount,
@@ -524,5 +526,3 @@ export class EscrowController {
     });
   }
 }
-
-

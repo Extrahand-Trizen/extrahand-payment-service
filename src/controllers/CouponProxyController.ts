@@ -23,15 +23,24 @@ export async function hasSuccessfulPayment(req: Request, res: Response): Promise
     return;
   }
 
-  const count = await prisma.escrow.count({
-    where: {
-      posterUid: userId,
-      OR: [
-        { paymentStatus: 'captured' },
-        { status: { in: ['held', 'released', 'completed'] } },
-      ],
-    },
-  });
+  const [successfulEscrowCount, successfulTransactionCount] = await Promise.all([
+    prisma.escrow.count({
+      where: {
+        posterUid: userId,
+        OR: [
+          { paymentStatus: 'captured' },
+          { status: { in: ['held', 'released', 'completed'] } },
+        ],
+      },
+    }),
+    prisma.transaction.count({
+      where: {
+        userId,
+        status: 'captured',
+      },
+    }),
+  ]);
+  const count = successfulEscrowCount + successfulTransactionCount;
 
   res.json({
     success: true,

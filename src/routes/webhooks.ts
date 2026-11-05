@@ -12,8 +12,7 @@ import { updateEscrowOnPaymentCapture } from '../services/escrowService';
 import { handlePaymentFailure } from '../services/paymentFailureService';
 import { completeRefundFromRazorpayWebhook } from '../services/refundService';
 import {
-  getWebhookByEventId,
-  logWebhookReceived,
+  claimWebhookEvent,
   markWebhookProcessed,
 } from '../services/auditLogService';
 import { getWebhookSecret, type PaymentEnvironment } from '../config/paymentEnvironment';
@@ -77,27 +76,27 @@ router.post('/razorpay', express.raw({ type: 'application/json' }), async (req, 
 
     // Parse JSON body
     const event = JSON.parse(rawBody);
-    const eventId = event.id ?? null;
-
-    // Dedup: if we already processed this event (by Razorpay event ID), return 200 and skip business logic
-    if (eventId) {
-      const existing = await getWebhookByEventId(eventId);
-      if (existing) {
-        logger.info('📥 Razorpay webhook already processed (idempotent)', {
-          eventId,
-          event: event.event,
-        });
-        return res.status(200).json({ received: true, message: 'Already processed' });
-      }
+    const eventId = typeof event.id === 'string' ? event.id : '';
+    const eventType = typeof event.event === 'string' ? event.event : '';
+    if (!eventId || !eventType) {
+      return res.status(400).json({ error: 'Invalid webhook event' });
     }
 
-    // Persist webhook receipt for audit (then process)
-    auditLogId = await logWebhookReceived({
+    const claim = await claimWebhookEvent({
       eventId,
-      eventType: event.event,
+      eventType,
       source: 'razorpay',
       payload: event,
     });
+    auditLogId = claim.id;
+
+    if (claim.state === 'processed') {
+      logger.info('Razorpay webhook already processed', { eventId, event: eventType });
+      return res.status(200).json({ received: true, message: 'Already processed' });
+    }
+    if (claim.state === 'in_progress') {
+      return res.status(503).json({ received: false, retryable: true });
+    }
 
     logger.info('📥 Razorpay webhook received', {
       event: event.event,
@@ -107,7 +106,7 @@ router.post('/razorpay', express.raw({ type: 'application/json' }), async (req, 
     });
 
     // Handle different webhook events
-    switch (event.event) {
+    switch (eventType) {
       case 'payment.authorized':
         await handlePaymentAuthorized(event.payload);
         break;
@@ -142,16 +141,17 @@ router.post('/razorpay', express.raw({ type: 'application/json' }), async (req, 
       await markWebhookProcessed(auditLogId, true);
     }
 
-    // Always return 200 to acknowledge receipt
     res.status(200).json({ received: true });
   } catch (error: any) {
     logger.error('❌ Error processing webhook:', error);
-    // Mark webhook as failed in audit log (auditLogId in closure)
     if (auditLogId) {
-      await markWebhookProcessed(auditLogId, false, error?.message ?? 'Unknown error');
+      try {
+        await markWebhookProcessed(auditLogId, false, error?.message ?? 'Unknown error');
+      } catch (auditError) {
+        logger.error('Failed to release webhook processing claim:', auditError);
+      }
     }
-    // Still return 200 to prevent Razorpay from retrying
-    res.status(200).json({ received: true, error: error.message });
+    res.status(503).json({ received: false, retryable: true });
   }
 });
 
@@ -164,8 +164,7 @@ async function handlePaymentAuthorized(payload: any): Promise<void> {
     const order = payload.order?.entity;
 
     if (!payment || !order) {
-      logger.warn('⚠️ Invalid payment.authorized payload');
-      return;
+      throw new Error('Invalid payment.authorized payload');
     }
 
     logger.info('✅ Payment authorized', {
@@ -182,6 +181,7 @@ async function handlePaymentAuthorized(payload: any): Promise<void> {
     );
   } catch (error: any) {
     logger.error('❌ Error handling payment.authorized:', error);
+    throw error;
   }
 }
 
@@ -194,8 +194,7 @@ async function handlePaymentCaptured(payload: any): Promise<void> {
     const order = payload.order?.entity;
 
     if (!payment || !order) {
-      logger.warn('⚠️ Invalid payment.captured payload');
-      return;
+      throw new Error('Invalid payment.captured payload');
     }
 
     logger.info('✅ Payment captured', {
@@ -213,6 +212,7 @@ async function handlePaymentCaptured(payload: any): Promise<void> {
     );
   } catch (error: any) {
     logger.error('❌ Error handling payment.captured:', error);
+    throw error;
   }
 }
 
@@ -225,8 +225,7 @@ async function handlePaymentFailed(payload: any): Promise<void> {
     const order = payload.order?.entity;
 
     if (!payment || !order) {
-      logger.warn('⚠️ Invalid payment.failed payload');
-      return;
+      throw new Error('Invalid payment.failed payload');
     }
 
     const errorDescription = payment.error_description || payment.error_code || 'Payment failed';
@@ -249,6 +248,7 @@ async function handlePaymentFailed(payload: any): Promise<void> {
     });
   } catch (error: any) {
     logger.error('❌ Error handling payment.failed:', error);
+    throw error;
   }
 }
 
@@ -260,8 +260,7 @@ async function handleOrderPaid(payload: any): Promise<void> {
     const order = payload.order?.entity;
 
     if (!order) {
-      logger.warn('⚠️ Invalid order.paid payload');
-      return;
+      throw new Error('Invalid order.paid payload');
     }
 
     logger.info('✅ Order fully paid', {
@@ -274,6 +273,7 @@ async function handleOrderPaid(payload: any): Promise<void> {
     // This is just for logging/confirmation
   } catch (error: any) {
     logger.error('❌ Error handling order.paid:', error);
+    throw error;
   }
 }
 
@@ -297,8 +297,8 @@ async function handlePaymentRefunded(payload: {
     await completeRefundFromRazorpayWebhook(payload);
   } catch (error: any) {
     logger.error('❌ Error handling refund webhook:', error);
+    throw error;
   }
 }
 
 export default router;
-

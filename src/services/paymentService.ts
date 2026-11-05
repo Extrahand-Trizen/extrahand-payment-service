@@ -1,5 +1,6 @@
 import Razorpay from 'razorpay';
 import crypto from 'crypto';
+import { Prisma } from '@prisma/client';
 import { RAZORPAY_CONFIG } from '../config/razorpay';
 import {
   getPaymentClient,
@@ -101,11 +102,12 @@ const findPaymentOrderEnvironment = async (
   }
 };
 
-export const createOrder = async (
+const createOrderWithoutIdempotency = async (
   amount: number,
   currency: string = 'INR',
   metadata: Record<string, any> = {},
   authenticatedUid?: string | null,
+  receipt?: string,
 ): Promise<CreateOrderResult> => {
   try {
     const paymentEnvironment = await resolvePaymentEnvironment(authenticatedUid);
@@ -184,7 +186,7 @@ export const createOrder = async (
     const options = {
       amount: amount, // Convert to paise
       currency,
-      receipt: `receipt_${Date.now()}`,
+      receipt: receipt || `receipt_${Date.now()}`,
       notes: buildRazorpayOrderNotes(paymentMetadata),
     };
 
@@ -218,6 +220,185 @@ export const createOrder = async (
     logger.error('Error creating order:', error);
     return { success: false, error: error.message };
   }
+};
+
+const ORDER_CREATE_MAX_ATTEMPTS = 12;
+const ORDER_CREATE_STALE_MS = 2 * 60 * 1000;
+
+async function createOrderWithIdempotency(
+  amount: number,
+  currency: string,
+  metadata: Record<string, any>,
+  authenticatedUid: string | null | undefined,
+  idempotencyKey: string,
+): Promise<CreateOrderResult> {
+  if (!isPostgresConnected()) {
+    return { success: false, error: 'Payment database is unavailable; order creation is safely blocked' };
+  }
+  const paymentEnvironment = await resolvePaymentEnvironment(authenticatedUid);
+  const fingerprint = crypto
+    .createHash('sha256')
+    .update(JSON.stringify({ amount, currency, metadata, authenticatedUid, paymentEnvironment }))
+    .digest('hex');
+  const keyHash = crypto.createHash('sha256').update(idempotencyKey).digest('hex');
+  const jobId = `razorpay_order_create_${keyHash}`;
+  const receipt = `eh${keyHash.slice(0, 38)}`;
+
+  const existingJob = await prisma.jobQueue.findUnique({ where: { jobId } });
+  const existingPayload = existingJob?.payload as
+    | { fingerprint?: string; orderPayload?: CreateOrderPayload }
+    | null;
+  if (existingPayload?.fingerprint && existingPayload.fingerprint !== fingerprint) {
+    return { success: false, error: 'Idempotency key was already used for a different payment order' };
+  }
+  await prisma.jobQueue.upsert({
+    where: { jobId },
+    create: {
+      jobId,
+      jobType: 'razorpay_order_create',
+      entityType: 'payment_order',
+      entityId: keyHash,
+      payload: { fingerprint, receipt } as Prisma.InputJsonValue,
+      status: 'pending',
+      maxAttempts: ORDER_CREATE_MAX_ATTEMPTS,
+      nextRetryAt: new Date(),
+      priority: 10,
+    },
+    update: {},
+  });
+
+  const latest = await prisma.jobQueue.findUnique({ where: { jobId } });
+  const latestPayload = latest?.payload as
+    | { fingerprint?: string; receipt?: string; orderPayload?: CreateOrderPayload }
+    | null;
+  if (latest?.status === 'completed' && latestPayload?.orderPayload) {
+    return { success: true, order: latestPayload.orderPayload };
+  }
+  if ((latest?.attemptCount ?? 0) >= (latest?.maxAttempts ?? ORDER_CREATE_MAX_ATTEMPTS)) {
+    return { success: false, error: 'Payment order creation needs reconciliation; no new order was created' };
+  }
+
+  const now = new Date();
+  const claim = await prisma.jobQueue.updateMany({
+    where: {
+      jobId,
+      OR: [
+        { status: 'pending', nextRetryAt: { lte: now } },
+        { status: 'processing', updatedAt: { lt: new Date(now.getTime() - ORDER_CREATE_STALE_MS) } },
+      ],
+    },
+    data: { status: 'processing', attemptCount: { increment: 1 } },
+  });
+  if (claim.count === 0) {
+    const mappedOrder = await prisma.paymentOrderIdempotency.findUnique({
+      where: { idempotencyKey },
+    });
+    if (mappedOrder) {
+      return { success: true, order: mappedOrder.orderPayload as CreateOrderPayload };
+    }
+    return { success: false, error: 'Payment order creation is still processing; retry with the same idempotency key' };
+  }
+
+  try {
+    const mappedOrder = await prisma.paymentOrderIdempotency.findUnique({
+      where: { idempotencyKey },
+    });
+    let order: CreateOrderPayload;
+    if (mappedOrder) {
+      if (normalizePaymentEnvironment(mappedOrder.paymentEnvironment) !== paymentEnvironment) {
+        throw new Error('Idempotency key belongs to a different payment environment');
+      }
+      order = mappedOrder.orderPayload as CreateOrderPayload;
+    } else {
+      const client = getPaymentClient(paymentEnvironment);
+      const found = await client.orders.all({ receipt, count: 100 });
+      const providerOrders = Array.isArray(found.items) ? found.items : [];
+      const existingProviderOrder = providerOrders.find(
+        (candidate) => candidate.receipt === receipt,
+      );
+      if (existingProviderOrder) {
+        if (
+          Number(existingProviderOrder.amount) !== amount ||
+          String(existingProviderOrder.currency).toUpperCase() !== currency.toUpperCase()
+        ) {
+          throw new Error('Existing Razorpay order does not match the idempotent request');
+        }
+        order = {
+          ...existingProviderOrder,
+          id: String(existingProviderOrder.id),
+          keyId: paymentKeys[paymentEnvironment],
+          paymentEnvironment,
+        } as CreateOrderPayload;
+      } else {
+        const result = await createOrderWithoutIdempotency(
+          amount,
+          currency,
+          metadata,
+          authenticatedUid,
+          receipt,
+        );
+        if (!result.success) throw new Error(result.error || 'Failed to create Razorpay order');
+        order = result.order;
+      }
+
+      await prisma.paymentOrderIdempotency.create({
+        data: {
+          idempotencyKey,
+          razorpayOrderId: order.id,
+          orderPayload: order as Prisma.InputJsonValue,
+          paymentEnvironment,
+        },
+      }).catch(async (error: unknown) => {
+        const winner = await prisma.paymentOrderIdempotency.findUnique({
+          where: { idempotencyKey },
+        });
+        if (!winner) throw error;
+        order = winner.orderPayload as CreateOrderPayload;
+      });
+    }
+
+    await prisma.jobQueue.update({
+      where: { jobId },
+      data: {
+        status: 'completed',
+        completedAt: new Date(),
+        lastError: null,
+        payload: { fingerprint, receipt, orderPayload: order } as Prisma.InputJsonValue,
+      },
+    });
+    return { success: true, order };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const retryDelay = Math.min(5_000 * 2 ** Math.max(0, (latest?.attemptCount ?? 1) - 1), 300_000);
+    await prisma.jobQueue.update({
+      where: { jobId },
+      data: {
+        status: (latest?.attemptCount ?? 1) >= ORDER_CREATE_MAX_ATTEMPTS ? 'failed' : 'pending',
+        lastError: message.slice(0, 500),
+        nextRetryAt: new Date(Date.now() + retryDelay),
+        ...((latest?.attemptCount ?? 1) >= ORDER_CREATE_MAX_ATTEMPTS ? { completedAt: new Date() } : {}),
+      },
+    });
+    logger.error('Idempotent Razorpay order creation failed', {
+      jobId,
+      attempt: latest?.attemptCount,
+      error: message,
+    });
+    return { success: false, error: message };
+  }
+}
+
+export const createOrder = async (
+  amount: number,
+  currency: string = 'INR',
+  metadata: Record<string, any> = {},
+  authenticatedUid?: string | null,
+  idempotencyKey?: string,
+): Promise<CreateOrderResult> => {
+  const key = String(idempotencyKey || '').trim();
+  return key
+    ? createOrderWithIdempotency(amount, currency, metadata, authenticatedUid, key)
+    : createOrderWithoutIdempotency(amount, currency, metadata, authenticatedUid);
 };
 
 export const verifyPaymentSignature = (

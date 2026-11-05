@@ -146,6 +146,82 @@ export async function getWebhookByEventId(
   }
 }
 
+export async function claimWebhookEvent(params: {
+  eventId: string;
+  eventType: string;
+  source: string;
+  payload: object;
+}): Promise<{ id: string; state: 'claimed' | 'processed' | 'in_progress' }> {
+  if (!isPostgresConnected()) {
+    throw new Error('Webhook idempotency storage is unavailable');
+  }
+
+  try {
+    await prisma.auditLog.create({
+      data: {
+        entityType: 'webhook',
+        action: 'webhook_received',
+        eventId: params.eventId,
+        eventType: params.eventType,
+        source: params.source,
+        payload: params.payload as any,
+        processed: false,
+        processedAt: null,
+      },
+    });
+  } catch (error) {
+    if (
+      typeof error !== 'object' ||
+      error === null ||
+      !('code' in error) ||
+      error.code !== 'P2002'
+    ) {
+      throw error;
+    }
+  }
+
+  const existing = await prisma.auditLog.findUnique({
+    where: { eventId: params.eventId },
+    select: { id: true, processed: true },
+  });
+  if (!existing) {
+    throw new Error('Webhook receipt could not be persisted');
+  }
+  if (existing.processed) {
+    return { id: existing.id, state: 'processed' };
+  }
+
+  const staleClaimBefore = new Date(Date.now() - 5 * 60 * 1000);
+  const claim = await prisma.auditLog.updateMany({
+    where: {
+      id: existing.id,
+      processed: false,
+      OR: [
+        { processedAt: null },
+        { processedAt: { lt: staleClaimBefore } },
+      ],
+    },
+    data: {
+      processedAt: new Date(),
+      retryCount: { increment: 1 },
+      errorMessage: null,
+    },
+  });
+
+  if (claim.count === 1) {
+    return { id: existing.id, state: 'claimed' };
+  }
+
+  const latest = await prisma.auditLog.findUnique({
+    where: { id: existing.id },
+    select: { processed: true },
+  });
+  return {
+    id: existing.id,
+    state: latest?.processed ? 'processed' : 'in_progress',
+  };
+}
+
 /**
  * Persist webhook receipt (before processing). Returns audit log id for later update.
  */
@@ -184,17 +260,16 @@ export async function markWebhookProcessed(
   success: boolean,
   errorMessage?: string | null
 ): Promise<void> {
-  try {
-    if (!isPostgresConnected()) return;
-    await prisma.auditLog.update({
-      where: { id: auditLogId },
-      data: {
-        processed: success,
-        processedAt: new Date(),
-        errorMessage: errorMessage ?? undefined,
-      },
-    });
-  } catch (err: any) {
-    logger.warn('Failed to update webhook audit log (non-critical):', err?.message);
+  if (!isPostgresConnected()) {
+    throw new Error('Webhook idempotency storage is unavailable');
   }
+
+  await prisma.auditLog.update({
+    where: { id: auditLogId },
+    data: {
+      processed: success,
+      processedAt: success ? new Date() : null,
+      errorMessage: success ? null : errorMessage ?? 'Webhook processing failed',
+    },
+  });
 }

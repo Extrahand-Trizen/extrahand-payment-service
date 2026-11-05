@@ -40,6 +40,7 @@ import {
   recurringVisitCaptureScope,
   type DuplicateVisitRefundStatus,
 } from './recurringVisitCaptureService';
+import { enqueueBookNowPaymentCapturedCallback } from './bookNowPaymentCallbackQueue';
 
 /**
  * Generate unique escrow ID
@@ -345,6 +346,7 @@ export async function createEscrow(params: {
   taskCategory?: string;
   metadata?: Record<string, any>;
   authenticatedUid?: string | null;
+  idempotencyKey?: string;
 }): Promise<{ success: boolean; escrow?: any; order?: any; isFree?: boolean; error?: string }> {
   try {
     const {
@@ -359,6 +361,7 @@ export async function createEscrow(params: {
       taskCategory,
       metadata = {},
       authenticatedUid,
+      idempotencyKey,
     } = params;
 
     // Validate amount
@@ -581,7 +584,7 @@ export async function createEscrow(params: {
       couponDiscount: couponDiscountRupees.toString(),
       couponRedemptionId,
       amountAfterCoupon: amountAfterCoupon.toString(),
-    }, authenticatedUid || posterUid);
+    }, authenticatedUid || posterUid, idempotencyKey);
 
     if (!orderResult.success || !orderResult.order) {
       if (couponRedemptionId) {
@@ -800,6 +803,7 @@ export async function createEscrow(params: {
 export async function createBookingEscrow(params: {
   taskId: string;
   bookingOrderId: string;
+  idempotencyKey: string;
   posterUid: string;
   amount: number;
   taskAmount?: number;
@@ -811,6 +815,7 @@ export async function createBookingEscrow(params: {
   const {
     taskId,
     bookingOrderId,
+    idempotencyKey,
     posterUid,
     amount,
     taskAmount,
@@ -822,6 +827,27 @@ export async function createBookingEscrow(params: {
 
   if (!bookingOrderId?.trim()) {
     return { success: false, error: 'bookingOrderId is required' };
+  }
+  if (!idempotencyKey?.trim()) {
+    return { success: false, error: 'idempotencyKey is required' };
+  }
+
+  const existingEscrow = await findEscrowByBookingOrderId(bookingOrderId);
+  if (existingEscrow) {
+    const mappedOrder = await prisma.paymentOrderIdempotency.findFirst({
+      where: { razorpayOrderId: existingEscrow.razorpayOrderId },
+    });
+    if (!mappedOrder) {
+      return {
+        success: false,
+        error: 'Existing booking payment needs reconciliation; no replacement order was created',
+      };
+    }
+    return {
+      success: true,
+      escrow: await convertPostgresEscrowToFrontendFormat(existingEscrow),
+      order: mappedOrder.orderPayload,
+    };
   }
 
   return createEscrow({
@@ -836,8 +862,10 @@ export async function createBookingEscrow(params: {
       ...metadata,
       bookingMode: 'book_now',
       bookingOrderId,
+      idempotencyKey,
     },
     authenticatedUid,
+    idempotencyKey,
   });
 }
 
@@ -1654,102 +1682,14 @@ export async function updateEscrowOnPaymentCapture(
       }
 
         const capturedBookingOrderId = resolveEscrowBookingOrderId(postgresEscrow);
-      const originalTaskId = postgresEscrow.taskId;
-      const originalEscrowId = postgresEscrow.escrowId;
-      if (capturedBookingOrderId) {
-        const { TaskServiceClient } = await import('../clients/TaskServiceClient');
-        try {
-          const notifyResult = await TaskServiceClient.notifyBookingPaymentCaptured({
+        if (capturedBookingOrderId) {
+          await enqueueBookNowPaymentCapturedCallback({
             bookingOrderId: capturedBookingOrderId,
-            escrowId: originalEscrowId,
+            escrowId: postgresEscrow.escrowId,
             razorpayOrderId,
-            taskId: originalTaskId,
-          });
-
-          if (
-            notifyResult.success &&
-            Array.isArray(notifyResult.tasks) &&
-            notifyResult.tasks.length > 0
-          ) {
-            const firstTask = notifyResult.tasks[0];
-            const resolvedTaskId = String(
-              (firstTask && (firstTask._id || firstTask.id || firstTask)) || ''
-            ).trim();
-
-            if (resolvedTaskId && resolvedTaskId !== originalTaskId) {
-              // Build updated line items: replace placeholder taskIds with real ones
-              const oldMeta = (postgresEscrow.metadata || {}) as Record<string, unknown>;
-              const oldLineItems = Array.isArray(oldMeta.bookNowLineItems)
-                ? [...oldMeta.bookNowLineItems]
-                : [];
-              const updatedLineItems = oldLineItems.map(
-                (item: unknown, idx: number) => {
-                  const rowItem = item as Record<string, unknown>;
-                  const materializedTask = notifyResult.tasks?.[idx];
-                  const realTaskId = materializedTask
-                    ? String(
-                        (materializedTask as any)._id ||
-                          (materializedTask as any).id ||
-                          materializedTask
-                      ).trim()
-                    : null;
-                  if (realTaskId && realTaskId !== originalTaskId) {
-                    return { ...rowItem, taskId: realTaskId };
-                  }
-                  return rowItem;
-                },
-              );
-
-              updatedEscrow = await prisma.escrow.update({
-                where: { id: postgresEscrow.id },
-                data: {
-                  taskId: resolvedTaskId,
-                  metadata: {
-                    ...oldMeta,
-                    bookNowLineItems: updatedLineItems,
-                  } as any,
-                },
-              });
-
-              await prisma.transaction.updateMany({
-                where: {
-                  OR: [
-                    { razorpayOrderId },
-                    { taskId: originalTaskId },
-                    ...(razorpayPaymentId ? [{ razorpayPaymentId }] : []),
-                  ],
-                },
-                data: {
-                  taskId: resolvedTaskId,
-                },
-              });
-
-              await prisma.ledger.updateMany({
-                where: {
-                  escrowId: postgresEscrow.id,
-                },
-                data: {
-                  taskId: resolvedTaskId,
-                },
-              });
-
-              postgresEscrow = updatedEscrow;
-              logger.info('Updated Book Now escrow to real task ID after task materialization', {
-                escrowId: updatedEscrow.escrowId,
-                oldTaskId: originalTaskId,
-                taskId: resolvedTaskId,
-                lineItemCount: updatedLineItems.length,
-              });
-            }
-          }
-        } catch (err) {
-          logger.error('Book Now payment-captured callback failed', {
-            bookingOrderId: capturedBookingOrderId,
-            taskId: originalTaskId,
-            error: err instanceof Error ? err.message : String(err),
+            taskId: postgresEscrow.taskId,
           });
         }
-      }
 
       const escrowMetadata = (postgresEscrow.metadata || {}) as Record<string, unknown>;
       const recurringVisitId =

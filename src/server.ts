@@ -14,6 +14,10 @@ import {
   startRefundReconciliationScheduler,
   stopRefundReconciliationScheduler,
 } from './services/refundReconciliationScheduler';
+import {
+  startBookNowPaymentCallbackWorker,
+  stopBookNowPaymentCallbackWorker,
+} from './services/bookNowPaymentCallbackQueue';
 
 const env = validateEnv();
 
@@ -57,6 +61,7 @@ async function startServer() {
     });
 
     startRefundReconciliationScheduler();
+    startBookNowPaymentCallbackWorker();
 
     // Graceful shutdown — only when CapRover/Docker actually stops the container
     let shuttingDown = false;
@@ -68,6 +73,7 @@ async function startServer() {
       });
       try {
         stopRefundReconciliationScheduler();
+        stopBookNowPaymentCallbackWorker();
         await disconnectDatabase();
       } catch (err) {
         logger.error('Error during graceful shutdown disconnect', {
@@ -91,4 +97,3 @@ async function startServer() {
 }
 
 startServer();
-

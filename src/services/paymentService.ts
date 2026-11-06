@@ -108,9 +108,11 @@ const createOrderWithoutIdempotency = async (
   metadata: Record<string, any> = {},
   authenticatedUid?: string | null,
   receipt?: string,
+  resolvedEnvironment?: PaymentEnvironment,
 ): Promise<CreateOrderResult> => {
   try {
-    const paymentEnvironment = await resolvePaymentEnvironment(authenticatedUid);
+    const paymentEnvironment =
+      resolvedEnvironment ?? (await resolvePaymentEnvironment(authenticatedUid));
     const razorpay = getPaymentClient(paymentEnvironment);
     const keyId = paymentKeys[paymentEnvironment];
     logger.info('[PAYMENT DEBUG] Creating Razorpay order', {
@@ -190,12 +192,15 @@ const createOrderWithoutIdempotency = async (
       notes: buildRazorpayOrderNotes(paymentMetadata),
     };
 
+    const providerStartedAt = Date.now();
     const order = await razorpay.orders.create(options);
+    const providerDurationMs = Date.now() - providerStartedAt;
     logger.info('Order created successfully', {
       orderId: order.id,
       amount,
       paymentEnvironment,
       keyPrefix: keyId.slice(0, 8),
+      providerDurationMs,
     });
     // Plain JSON + keyId: Razorpay SDK objects can lose custom fields across axios hops
     // (task-service Book Now path). Checkout must use this same publishable key.
@@ -311,11 +316,15 @@ async function createOrderWithIdempotency(
       order = mappedOrder.orderPayload as CreateOrderPayload;
     } else {
       const client = getPaymentClient(paymentEnvironment);
-      const found = await client.orders.all({ receipt, count: 100 });
-      const providerOrders = Array.isArray(found.items) ? found.items : [];
-      const existingProviderOrder = providerOrders.find(
-        (candidate) => candidate.receipt === receipt,
-      );
+      const mayHaveCreatedProviderOrder = (latest?.attemptCount ?? 0) > 0;
+      let existingProviderOrder;
+      if (mayHaveCreatedProviderOrder) {
+        const found = await client.orders.all({ receipt, count: 100 });
+        const providerOrders = Array.isArray(found.items) ? found.items : [];
+        existingProviderOrder = providerOrders.find(
+          (candidate) => candidate.receipt === receipt,
+        );
+      }
       if (existingProviderOrder) {
         if (
           Number(existingProviderOrder.amount) !== amount ||
@@ -336,6 +345,7 @@ async function createOrderWithIdempotency(
           metadata,
           authenticatedUid,
           receipt,
+          paymentEnvironment,
         );
         if (!result.success) throw new Error(result.error || 'Failed to create Razorpay order');
         order = result.order;

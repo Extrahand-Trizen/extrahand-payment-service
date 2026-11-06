@@ -210,4 +210,3 @@ export async function getEscrowBalance(escrowId: string): Promise<{
     return { success: false, error: error.message || 'Failed to get escrow balance' };
   }
 }
-

@@ -7,7 +7,10 @@ import {
   createRefund,
   createRefundAmountPaise,
 } from '../services/paymentService';
-import { updateEscrowOnPaymentCapture } from '../services/escrowService';
+import {
+  backfillCapturedPaymentDetails,
+  updateEscrowOnPaymentCapture,
+} from '../services/escrowService';
 import {
   cancelPayment as cancelPaymentOrder,
   cancelEscrow,
@@ -172,48 +175,12 @@ export class PaymentController {
       throw new BadRequestError(result.message || result.error || 'Payment verification failed');
     }
 
-    // Update escrow with payment entity so razorpayPaymentData is stored (sanitized).
-    // Use a fast race timeout (1500ms) for external Razorpay API fetch so network latency
-    // does not introduce a noticeable delay in processing the customer transaction.
-    let paymentEntity: any = undefined;
-    try {
-      const paymentPromise = getPaymentDetails(razorpay_payment_id, paymentEnvironment);
-      const timeoutPromise = new Promise<{ success: false; error: string }>((resolve) =>
-        setTimeout(() => resolve({ success: false, error: 'timeout' }), 1500),
-      );
-      const paymentResult = await Promise.race([paymentPromise, timeoutPromise]);
-      if (paymentResult.success) {
-        paymentEntity = paymentResult.payment;
-      } else if (paymentResult.error === 'timeout') {
-        logger.info('getPaymentDetails timed out after 1.5s; continuing capture and backfilling in background', {
-          razorpay_order_id,
-          razorpay_payment_id,
-        });
-        // Backfill payment details in background once Razorpay API completes
-        getPaymentDetails(razorpay_payment_id, paymentEnvironment)
-          .then((bgResult) => {
-            if (bgResult.success && bgResult.payment) {
-              updateEscrowOnPaymentCapture(
-                razorpay_order_id,
-                razorpay_payment_id,
-                'captured',
-                bgResult.payment,
-              ).catch((bgErr) => {
-                logger.warn('Background payment details backfill error:', bgErr);
-              });
-            }
-          })
-          .catch(() => {});
-      }
-    } catch (fetchErr) {
-      logger.warn('Failed or timed out fetching payment details from Razorpay (non-blocking):', fetchErr);
-    }
-
     const captureResult = await updateEscrowOnPaymentCapture(
       razorpay_order_id,
       razorpay_payment_id,
       'captured',
-      paymentEntity,
+      undefined,
+      { fastVerification: true },
     );
 
     if (!captureResult.success) {
@@ -240,6 +207,41 @@ export class PaymentController {
         captureResult.error ||
           'Payment was received but escrow could not be saved. Please contact support with your payment ID.',
       );
+    }
+
+    // Payment details are supplemental audit data; don't make customer confirmation
+    // wait on another Razorpay API call after the signature has been verified.
+    if (captureResult.escrow) {
+      void getPaymentDetails(razorpay_payment_id, paymentEnvironment)
+        .then(async (paymentResult) => {
+          if (!paymentResult.success) {
+            logger.warn('Could not fetch payment details for background backfill', {
+              razorpay_order_id,
+              razorpay_payment_id,
+              error: paymentResult.error,
+            });
+            return;
+          }
+          if (String(paymentResult.payment?.order_id || '') !== razorpay_order_id) {
+            logger.warn('Skipped payment details backfill for a different Razorpay order', {
+              razorpay_order_id,
+              razorpay_payment_id,
+            });
+            return;
+          }
+          await backfillCapturedPaymentDetails(
+            razorpay_order_id,
+            razorpay_payment_id,
+            paymentResult.payment,
+          );
+        })
+        .catch((fetchErr) => {
+          logger.warn('Background payment details backfill failed', {
+            razorpay_order_id,
+            razorpay_payment_id,
+            error: fetchErr instanceof Error ? fetchErr.message : String(fetchErr),
+          });
+        });
     }
 
     res.json({

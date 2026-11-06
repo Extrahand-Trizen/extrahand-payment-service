@@ -49,7 +49,7 @@ export class UserServiceClient {
     }>;
     try {
       response = await axios.get(
-        `${this.baseURL()}/api/v1/profiles/internal/${encodeURIComponent(uid)}`,
+        `${this.baseURL()}/api/v1/profiles/internal/${encodeURIComponent(uid)}/payment-tester-status`,
         { headers: this.headers(), timeout: 5000 },
       );
     } catch (err) {

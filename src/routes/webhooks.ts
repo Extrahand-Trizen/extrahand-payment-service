@@ -16,6 +16,7 @@ import {
   markWebhookProcessed,
 } from '../services/auditLogService';
 import { getWebhookSecret, type PaymentEnvironment } from '../config/paymentEnvironment';
+import { syncRefundSettlementsForDate } from '../services/refundSettlementService';
 
 const router = express.Router();
 
@@ -125,11 +126,15 @@ router.post('/razorpay', express.raw({ type: 'application/json' }), async (req, 
         break;
 
       case 'payment.refunded':
-        await handlePaymentRefunded(event.payload);
+        await handlePaymentRefunded(event.payload, event.created_at);
         break;
 
       case 'refund.processed':
-        await handlePaymentRefunded(event.payload);
+        await handlePaymentRefunded(event.payload, event.created_at);
+        break;
+
+      case 'settlement.processed':
+        await handleSettlementProcessed(event.payload, webhookEnvironment);
         break;
 
       default:
@@ -283,7 +288,7 @@ async function handleOrderPaid(payload: any): Promise<void> {
 async function handlePaymentRefunded(payload: {
   refund?: { entity?: { id?: string; status?: string; payment_id?: string } };
   payment?: { entity?: { id?: string; amount?: number; amount_refunded?: number; status?: string } };
-}): Promise<void> {
+}, eventCreatedAt?: number): Promise<void> {
   try {
     const refund = payload?.refund?.entity;
     const payment = payload?.payment?.entity;
@@ -294,11 +299,22 @@ async function handlePaymentRefunded(payload: {
       razorpayRefundStatus: refund?.status,
     });
 
-    await completeRefundFromRazorpayWebhook(payload);
+    await completeRefundFromRazorpayWebhook({ ...payload, eventCreatedAt });
   } catch (error: any) {
     logger.error('❌ Error handling refund webhook:', error);
     throw error;
   }
+}
+
+async function handleSettlementProcessed(
+  payload: { settlement?: { entity?: { created_at?: number } } },
+  environment: PaymentEnvironment,
+): Promise<void> {
+  const createdAt = Number(payload?.settlement?.entity?.created_at);
+  if (!Number.isFinite(createdAt) || createdAt <= 0) {
+    throw new Error('Invalid settlement.processed payload');
+  }
+  await syncRefundSettlementsForDate(new Date(createdAt * 1000), environment);
 }
 
 export default router;

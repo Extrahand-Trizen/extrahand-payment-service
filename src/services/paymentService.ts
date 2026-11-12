@@ -109,6 +109,7 @@ const createOrderWithoutIdempotency = async (
   authenticatedUid?: string | null,
   receipt?: string,
   resolvedEnvironment?: PaymentEnvironment,
+  persistEnvironment = true,
 ): Promise<CreateOrderResult> => {
   try {
     const paymentEnvironment =
@@ -216,7 +217,9 @@ const createOrderWithoutIdempotency = async (
       keyId,
       paymentEnvironment,
     } as CreateOrderPayload;
-    await savePaymentOrderEnvironment(orderId, paymentEnvironment, authenticatedUid);
+    if (persistEnvironment) {
+      await savePaymentOrderEnvironment(orderId, paymentEnvironment, authenticatedUid);
+    }
     return {
       success: true,
       order: payload,
@@ -237,10 +240,14 @@ async function createOrderWithIdempotency(
   authenticatedUid: string | null | undefined,
   idempotencyKey: string,
 ): Promise<CreateOrderResult> {
+  const startedAt = Date.now();
+  const timings: Record<string, number> = {};
   if (!isPostgresConnected()) {
     return { success: false, error: 'Payment database is unavailable; order creation is safely blocked' };
   }
+  let phaseStartedAt = Date.now();
   const paymentEnvironment = await resolvePaymentEnvironment(authenticatedUid);
+  timings.paymentEnvironmentMs = Date.now() - phaseStartedAt;
   const fingerprint = crypto
     .createHash('sha256')
     .update(JSON.stringify({ amount, currency, metadata, authenticatedUid, paymentEnvironment }))
@@ -249,33 +256,64 @@ async function createOrderWithIdempotency(
   const jobId = `razorpay_order_create_${keyHash}`;
   const receipt = `eh${keyHash.slice(0, 38)}`;
 
-  const existingJob = await prisma.jobQueue.findUnique({ where: { jobId } });
-  const existingPayload = existingJob?.payload as
-    | { fingerprint?: string; orderPayload?: CreateOrderPayload }
-    | null;
-  if (existingPayload?.fingerprint && existingPayload.fingerprint !== fingerprint) {
-    return { success: false, error: 'Idempotency key was already used for a different payment order' };
-  }
-  await prisma.jobQueue.upsert({
-    where: { jobId },
-    create: {
-      jobId,
-      jobType: 'razorpay_order_create',
-      entityType: 'payment_order',
-      entityId: keyHash,
-      payload: { fingerprint, receipt } as Prisma.InputJsonValue,
-      status: 'pending',
-      maxAttempts: ORDER_CREATE_MAX_ATTEMPTS,
-      nextRetryAt: new Date(),
-      priority: 10,
-    },
-    update: {},
-  });
+  type OrderCreateJob = {
+    status: string;
+    attemptCount: number;
+    maxAttempts: number;
+    payload: Prisma.JsonValue | null;
+  };
+  const now = new Date();
+  phaseStartedAt = Date.now();
+  const claimedJobs = await prisma.$queryRaw<OrderCreateJob[]>`
+    INSERT INTO "JobQueue" (
+      "id", "jobId", "jobType", "entityType", "entityId", "payload",
+      "attemptCount", "maxAttempts", "nextRetryAt", "status", "priority",
+      "createdAt", "updatedAt"
+    )
+    VALUES (
+      ${crypto.randomUUID()}, ${jobId}, 'razorpay_order_create', 'payment_order',
+      ${keyHash}, ${JSON.stringify({ fingerprint, receipt })}::jsonb,
+      1, ${ORDER_CREATE_MAX_ATTEMPTS}, ${now}, 'processing', 10, ${now}, ${now}
+    )
+    ON CONFLICT ("jobId") DO UPDATE
+    SET "status" = 'processing',
+        "attemptCount" = "JobQueue"."attemptCount" + 1,
+        "updatedAt" = ${now}
+    WHERE "JobQueue"."attemptCount" < "JobQueue"."maxAttempts"
+      AND (
+        "JobQueue"."payload"->>'fingerprint' IS NULL
+        OR "JobQueue"."payload"->>'fingerprint' = ${fingerprint}
+      )
+      AND (
+        ("JobQueue"."status" = 'pending' AND "JobQueue"."nextRetryAt" <= ${now})
+        OR (
+          "JobQueue"."status" = 'processing'
+          AND "JobQueue"."updatedAt" < ${new Date(now.getTime() - ORDER_CREATE_STALE_MS)}
+        )
+      )
+    RETURNING "status", "attemptCount", "maxAttempts", "payload"
+  `;
+  timings.jobClaimMs = Date.now() - phaseStartedAt;
 
-  const latest = await prisma.jobQueue.findUnique({ where: { jobId } });
-  const latestPayload = latest?.payload as
+  phaseStartedAt = Date.now();
+  const latest =
+    claimedJobs[0] ??
+    (await prisma.jobQueue.findUnique({
+      where: { jobId },
+      select: { status: true, attemptCount: true, maxAttempts: true, payload: true },
+    }));
+  if (!claimedJobs[0]) timings.unclaimedJobLookupMs = Date.now() - phaseStartedAt;
+  if (!latest) {
+    logger.error('Order creation job disappeared after atomic claim', { jobId });
+    return { success: false, error: 'Payment order creation could not claim its idempotency job' };
+  }
+
+  const latestPayload = latest.payload as
     | { fingerprint?: string; receipt?: string; orderPayload?: CreateOrderPayload }
     | null;
+  if (latestPayload?.fingerprint && latestPayload.fingerprint !== fingerprint) {
+    return { success: false, error: 'Idempotency key was already used for a different payment order' };
+  }
   if (latest?.status === 'completed' && latestPayload?.orderPayload) {
     return { success: true, order: latestPayload.orderPayload };
   }
@@ -283,21 +321,12 @@ async function createOrderWithIdempotency(
     return { success: false, error: 'Payment order creation needs reconciliation; no new order was created' };
   }
 
-  const now = new Date();
-  const claim = await prisma.jobQueue.updateMany({
-    where: {
-      jobId,
-      OR: [
-        { status: 'pending', nextRetryAt: { lte: now } },
-        { status: 'processing', updatedAt: { lt: new Date(now.getTime() - ORDER_CREATE_STALE_MS) } },
-      ],
-    },
-    data: { status: 'processing', attemptCount: { increment: 1 } },
-  });
-  if (claim.count === 0) {
+  if (!claimedJobs[0]) {
+    phaseStartedAt = Date.now();
     const mappedOrder = await prisma.paymentOrderIdempotency.findUnique({
       where: { idempotencyKey },
     });
+    timings.racedOrderLookupMs = Date.now() - phaseStartedAt;
     if (mappedOrder) {
       return { success: true, order: mappedOrder.orderPayload as CreateOrderPayload };
     }
@@ -305,9 +334,16 @@ async function createOrderWithIdempotency(
   }
 
   try {
-    const mappedOrder = await prisma.paymentOrderIdempotency.findUnique({
-      where: { idempotencyKey },
-    });
+    let mappedOrder = null;
+    const isRecoveryAttempt = (latest?.attemptCount ?? 0) > 1;
+    if (isRecoveryAttempt) {
+      phaseStartedAt = Date.now();
+      mappedOrder = await prisma.paymentOrderIdempotency.findUnique({
+        where: { idempotencyKey },
+      });
+      timings.recoveryOrderLookupMs = Date.now() - phaseStartedAt;
+    }
+
     let order: CreateOrderPayload;
     if (mappedOrder) {
       if (normalizePaymentEnvironment(mappedOrder.paymentEnvironment) !== paymentEnvironment) {
@@ -316,7 +352,7 @@ async function createOrderWithIdempotency(
       order = mappedOrder.orderPayload as CreateOrderPayload;
     } else {
       const client = getPaymentClient(paymentEnvironment);
-      const mayHaveCreatedProviderOrder = (latest?.attemptCount ?? 0) > 0;
+      const mayHaveCreatedProviderOrder = isRecoveryAttempt;
       let existingProviderOrder;
       if (mayHaveCreatedProviderOrder) {
         const found = await client.orders.all({ receipt, count: 100 });
@@ -346,35 +382,58 @@ async function createOrderWithIdempotency(
           authenticatedUid,
           receipt,
           paymentEnvironment,
+          false,
         );
         if (!result.success) throw new Error(result.error || 'Failed to create Razorpay order');
         order = result.order;
       }
-
-      await prisma.paymentOrderIdempotency.create({
-        data: {
-          idempotencyKey,
-          razorpayOrderId: order.id,
-          orderPayload: order as Prisma.InputJsonValue,
-          paymentEnvironment,
-        },
-      }).catch(async (error: unknown) => {
-        const winner = await prisma.paymentOrderIdempotency.findUnique({
-          where: { idempotencyKey },
-        });
-        if (!winner) throw error;
-        order = winner.orderPayload as CreateOrderPayload;
-      });
     }
 
-    await prisma.jobQueue.update({
-      where: { jobId },
-      data: {
-        status: 'completed',
-        completedAt: new Date(),
-        lastError: null,
-        payload: { fingerprint, receipt, orderPayload: order } as Prisma.InputJsonValue,
-      },
+    phaseStartedAt = Date.now();
+    const persistedOrders = await Promise.all([
+      prisma.$queryRaw<Array<{ orderPayload: CreateOrderPayload }>>`
+        WITH saved_order AS (
+          INSERT INTO "PaymentOrderIdempotency" (
+            "id", "idempotencyKey", "razorpayOrderId", "orderPayload",
+            "paymentEnvironment", "createdAt"
+          )
+          VALUES (
+            ${crypto.randomUUID()}, ${idempotencyKey}, ${order.id},
+            ${JSON.stringify(order)}::jsonb, ${paymentEnvironment}, ${new Date()}
+          )
+          ON CONFLICT ("idempotencyKey")
+          DO UPDATE SET "idempotencyKey" = EXCLUDED."idempotencyKey"
+          RETURNING "orderPayload"
+        ),
+        completed_job AS (
+          UPDATE "JobQueue"
+          SET "status" = 'completed',
+              "completedAt" = ${new Date()},
+              "lastError" = NULL,
+              "payload" = jsonb_build_object(
+                'fingerprint', ${fingerprint}::text,
+                'receipt', ${receipt}::text,
+                'orderPayload', saved_order."orderPayload"
+              ),
+              "updatedAt" = ${new Date()}
+          FROM saved_order
+          WHERE "jobId" = ${jobId}
+          RETURNING saved_order."orderPayload" AS "orderPayload"
+        )
+        SELECT "orderPayload" FROM completed_job
+      `,
+      savePaymentOrderEnvironment(order.id, paymentEnvironment, authenticatedUid),
+    ]);
+    const persistedOrder = persistedOrders[0][0];
+    if (!persistedOrder) {
+      throw new Error('Payment order was saved but its idempotency job could not be completed');
+    }
+    order = persistedOrder.orderPayload;
+    timings.persistenceAndCompletionMs = Date.now() - phaseStartedAt;
+    logger.info('[PAYMENT_ORDER_CREATE_TIMING] Order creation completed', {
+      durationMs: Date.now() - startedAt,
+      paymentEnvironment,
+      timings,
     });
     return { success: true, order };
   } catch (error) {

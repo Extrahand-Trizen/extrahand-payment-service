@@ -789,9 +789,9 @@ export async function createEscrow(params: {
         }
       }
 
-      // Create initial ledger entry (escrow created)
+      // These records depend on the created escrow but not on each other.
       const ledgerStartedAt = Date.now();
-      await createLedgerEntry({
+      const ledgerPromise = createLedgerEntry({
         escrowId: postgresEscrow.id,
         type: 'escrow',
         amount: amountInRupeesDecimal,
@@ -804,7 +804,18 @@ export async function createEscrow(params: {
           taskId,
         },
       });
+      const auditStartedAt = Date.now();
+      const auditPromise = logEscrowCreated({
+        escrowId: postgresEscrow.id,
+        razorpayOrderId: razorpayOrder.id,
+        taskId,
+        posterUid,
+        amountInRupees: amountInRupeesDecimal.toString(),
+        actorId: posterUid,
+      });
+      await Promise.all([ledgerPromise, auditPromise]);
       timings.ledgerCreateMs = Date.now() - ledgerStartedAt;
+      timings.auditLogMs = Date.now() - auditStartedAt;
 
       logger.info('✅ Escrow created (Postgres only)', {
         escrowId,
@@ -814,17 +825,6 @@ export async function createEscrow(params: {
         bookingMode: (metadata as Record<string, unknown>)?.bookingMode,
         amount,
       });
-
-      const auditStartedAt = Date.now();
-      await logEscrowCreated({
-        escrowId: postgresEscrow.id,
-        razorpayOrderId: razorpayOrder.id,
-        taskId,
-        posterUid,
-        amountInRupees: amountInRupeesDecimal.toString(),
-        actorId: posterUid,
-      });
-      timings.auditLogMs = Date.now() - auditStartedAt;
 
       // Convert to frontend format for backward compatibility
       const responseFormatStartedAt = Date.now();

@@ -1,0 +1,3 @@
+ALTER TABLE "Refund"
+  ADD COLUMN IF NOT EXISTS "providerProcessedAt" TIMESTAMPTZ(3),
+  ADD COLUMN IF NOT EXISTS "providerStatus" TEXT;

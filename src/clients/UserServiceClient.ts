@@ -1,10 +1,10 @@
-import axios, { AxiosError } from 'axios';
+import axios, { AxiosError, AxiosResponse } from 'axios';
 import { validateEnv } from '../config/env';
 import logger from '../config/logger';
 
 export class UserServiceClient {
   private static baseURL(): string {
-    return process.env.USER_SERVICE_URL || 'http://localhost:4001';
+    return validateEnv().USER_SERVICE_URL.replace(/\/+$/, '');
   }
 
   private static headers() {
@@ -39,22 +39,43 @@ export class UserServiceClient {
   }
 
   static async getPaymentTesterStatus(uid: string): Promise<boolean> {
-    if (!uid?.trim()) throw new Error('User ID is required to verify payment tester status');
+    if (!uid?.trim()) {
+      throw new Error('User ID is required to verify payment testing status');
+    }
+
+    let response: AxiosResponse<{
+      success?: boolean;
+      profile?: { isPaymentTester?: boolean };
+    }>;
     try {
-      const res = await axios.get(
-        `${this.baseURL()}/api/v1/profiles/internal/${encodeURIComponent(uid)}`,
+      response = await axios.get(
+        `${this.baseURL()}/api/v1/profiles/internal/${encodeURIComponent(uid)}/payment-tester-status`,
         { headers: this.headers(), timeout: 5000 },
       );
-      return res.data?.profile?.isPaymentTester === true;
     } catch (err) {
       const axiosErr = err as AxiosError;
       logger.error('[UserServiceClient] payment tester lookup failed', {
         uid,
+        userServiceUrl: this.baseURL(),
         status: axiosErr.response?.status,
+        code: axiosErr.code,
         message: axiosErr.message,
       });
-      throw new Error('Unable to verify payment tester status');
+      const status = axiosErr.response?.status;
+      const reason = status
+        ? `User service returned HTTP ${status}`
+        : `Could not connect to user service (${axiosErr.code || axiosErr.message})`;
+      throw new Error(
+        `Unable to verify payment testing status: ${reason}. Payment was not started.`,
+      );
     }
+
+    if (response.data?.success !== true || !response.data?.profile) {
+      throw new Error(
+        'User service returned an invalid payment testing status. Payment was not started.',
+      );
+    }
+    return response.data.profile.isPaymentTester === true;
   }
 
   static async isPaymentTester(uid: string): Promise<boolean> {

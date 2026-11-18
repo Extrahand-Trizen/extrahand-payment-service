@@ -36,6 +36,7 @@ const prismaConfig = require('../config/prisma');
 const database = require('../config/database');
 const { CouponClient } = require('../clients/CouponClient');
 const { TaskServiceClient } = require('../clients/TaskServiceClient');
+const { UserServiceClient } = require('../clients/UserServiceClient');
 const feeCalculationService = require('./feeCalculationService');
 const feeConfigService = require('./feeConfigService');
 const { CoinUsageConfigProvider } = require('../rewards/config/CoinUsageConfigProvider');
@@ -326,6 +327,7 @@ function seedChild(childId: string, visitId: string, assigneeUid = HELPER): void
 }
 
 beforeEach(() => {
+  UserServiceClient.getPaymentTesterStatus = async () => false;
   models = {};
   taskDocs = new Map();
   visitDocs = [];

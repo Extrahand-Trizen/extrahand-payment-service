@@ -25,6 +25,12 @@ router.post(
 );
 
 /**
+ * GET /api/v1/refunds/mine
+ * Get refunds for the authenticated customer.
+ */
+router.get('/mine', asyncHandler(RefundController.getMyRefunds));
+
+/**
  * GET /api/v1/refunds/status/:refundId
  * Get refund status
  */

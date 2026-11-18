@@ -73,6 +73,8 @@ const DEFAULT_FEE_STRUCTURE: FeeStructure = {
 let feeStructureCache: FeeStructure | null = null;
 let cacheTimestamp: number = 0;
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+const CATEGORY_FEE_CACHE_TTL = 60 * 1000;
+const categoryFeeCache = new Map<string, { value: FeeStructure; expiresAt: number }>();
 
 const GST_18_PERCENT_CATEGORY_KEYS = new Set([
   'water-tanker-services',
@@ -257,6 +259,7 @@ function isValidFeeStructure(structure: any): structure is FeeStructure {
 export function clearFeeStructureCache(): void {
   feeStructureCache = null;
   cacheTimestamp = 0;
+  categoryFeeCache.clear();
   logger.debug('🗑️ Fee structure cache cleared');
 }
 
@@ -325,40 +328,62 @@ export async function getFeeStructureForCategory(
   categoryKey?: string,
   options?: CategoryFeeLookupOptions,
 ): Promise<FeeStructure> {
-  const base = await getFeeStructure();
   const mode = resolveCategoryFeeMode(options);
-
   const key = categoryKey || 'default';
+  const cacheKey = `${mode}:${key.trim().toLowerCase()}`;
+  const cached = categoryFeeCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.value;
+  }
+  if (cached) categoryFeeCache.delete(cacheKey);
+
+  const base = await getFeeStructure();
   const lookupKeys = getCategoryLookupKeys(key);
 
   try {
     const now = new Date();
 
-    let cfg: any = null;
-    for (const lookupKey of lookupKeys) {
-      cfg = await prisma.categoryFeeConfig.findFirst({
-        where: {
-          categoryKey: lookupKey,
-          mode,
-          OR: [
-            { effectiveFrom: null, effectiveTo: null },
-            { effectiveFrom: { lte: now }, effectiveTo: null },
-            { effectiveFrom: { lte: now }, effectiveTo: { gte: now } },
-          ],
-        },
-        orderBy: { effectiveFrom: 'desc' },
-      }) as any;
+    const configs = await prisma.categoryFeeConfig.findMany({
+      where: {
+        mode,
+        OR: [
+          {
+            categoryKey: { in: lookupKeys },
+            OR: [
+              { effectiveFrom: null, effectiveTo: null },
+              { effectiveFrom: { lte: now }, effectiveTo: null },
+              { effectiveFrom: { lte: now }, effectiveTo: { gte: now } },
+            ],
+          },
+          { categoryKey: 'default' },
+        ],
+      },
+      orderBy: { effectiveFrom: 'desc' },
+    });
 
-      if (cfg) break;
-    }
-
+    const isEffectiveNow = (config: (typeof configs)[number]) =>
+      (!config.effectiveFrom && !config.effectiveTo) ||
+      (!!config.effectiveFrom &&
+        config.effectiveFrom <= now &&
+        (!config.effectiveTo || config.effectiveTo >= now));
     const effectiveCfg =
-      cfg ??
-      (await prisma.categoryFeeConfig.findUnique({
-        where: { categoryKey_mode: { categoryKey: 'default', mode } },
-      }) as any);
+      lookupKeys
+        .map((lookupKey) =>
+          configs.find(
+            (config) => config.categoryKey === lookupKey && isEffectiveNow(config),
+          ),
+        )
+        .find(Boolean) ??
+      configs.find((config) => config.categoryKey === 'default') ??
+      null;
 
-    if (!effectiveCfg) return base;
+    if (!effectiveCfg) {
+      categoryFeeCache.set(cacheKey, {
+        value: base,
+        expiresAt: Date.now() + CATEGORY_FEE_CACHE_TTL,
+      });
+      return base;
+    }
 
     const forcedGstPercentage = GST_18_PERCENT_CATEGORY_KEYS.has(key) ? 0.18 : undefined;
 
@@ -375,7 +400,7 @@ export async function getFeeStructureForCategory(
       ? Number(effectiveCfg.razorpayFeeGstPercentage)
       : undefined;
 
-    return {
+    const feeStructure = {
       ...base,
       platformFee: {
         ...base.platformFee,
@@ -387,6 +412,11 @@ export async function getFeeStructureForCategory(
         razorpayFeeGstPercentage: cfgRazorpayGst ?? base.processingFees.razorpayFeeGstPercentage,
       },
     };
+    categoryFeeCache.set(cacheKey, {
+      value: feeStructure,
+      expiresAt: Date.now() + CATEGORY_FEE_CACHE_TTL,
+    });
+    return feeStructure;
   } catch (error: any) {
     logger.warn(`⚠️ Error loading CategoryFeeConfig for '${categoryKey}': ${error.message}`);
     return base;
@@ -425,7 +455,10 @@ export async function upsertCategoryFeeConfig(payload: any, updatedBy?: string):
     sacCode: payload.sacCode ?? null,
     sacHeading: payload.sacHeading ?? null,
     gstPercentage: payload.gstPercentage ?? undefined,
-    platformFeePercentage: payload.platformFeePercentage ?? undefined,
+    platformFeePercentage:
+      payload.platformFeePercentage === null
+        ? null
+        : payload.platformFeePercentage ?? undefined,
     razorpayFeeGstPercentage: payload.razorpayFeeGstPercentage ?? undefined,
     minPrice: payload.minPrice ?? undefined,
     maxPrice: payload.maxPrice ?? undefined,

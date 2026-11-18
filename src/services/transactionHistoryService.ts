@@ -456,7 +456,13 @@ type RefundHistoryRow = {
   cancelledBy: string | null;
   reason: string | null;
   status: string;
+  providerStatus?: string | null;
   createdAt: Date;
+  providerProcessedAt?: Date | null;
+  expectedDepositAt?: Date | null;
+  settlementId?: string | null;
+  settlementStatus?: string | null;
+  settledAt?: Date | null;
 };
 
 type EscrowFinanceContext = {
@@ -632,6 +638,20 @@ function buildPosterRefundTransaction(
         : {}),
       cancellationFee: feeStr,
       refundAmount: refundAmtStr,
+      refundId: refund.refundId,
+      razorpayRefundStatus: refund.providerStatus,
+      ...(refund.providerProcessedAt
+        ? { refundProcessedAt: refund.providerProcessedAt.toISOString() }
+        : {}),
+      ...(refund.expectedDepositAt
+        ? { refundExpectedCreditAt: refund.expectedDepositAt.toISOString() }
+        : {}),
+      refundSettlement: {
+        status: refund.settlementStatus?.toUpperCase() ?? null,
+        settlementId: refund.settlementId ?? null,
+        expectedSettlementAt: null,
+        settledAt: refund.settledAt?.toISOString() ?? null,
+      },
       toOtherParty: refund.toOtherParty?.toString() || '0',
       toPlatform: refund.toPlatform?.toString() || '0',
       cancelledBy: refund.cancelledBy,
@@ -840,6 +860,24 @@ export async function getUserTransactions(
         },
         refunds: {
           where: statusFilter ? { status: statusFilter } : undefined,
+          select: {
+            id: true,
+            refundId: true,
+            escrowId: true,
+            taskId: true,
+            refundAmount: true,
+            cancellationFee: true,
+            toOtherParty: true,
+            toPlatform: true,
+            cancelledBy: true,
+            reason: true,
+            status: true,
+            createdAt: true,
+            expectedDepositAt: true,
+            settlementId: true,
+            settlementStatus: true,
+            settledAt: true,
+          },
         }
       },
       orderBy: { createdAt: 'desc' },
@@ -862,6 +900,24 @@ export async function getUserTransactions(
             },
             refunds: {
               where: statusFilter ? { status: statusFilter } : undefined,
+              select: {
+                id: true,
+                refundId: true,
+                escrowId: true,
+                taskId: true,
+                refundAmount: true,
+                cancellationFee: true,
+                toOtherParty: true,
+                toPlatform: true,
+                cancelledBy: true,
+                reason: true,
+                status: true,
+                createdAt: true,
+                expectedDepositAt: true,
+                settlementId: true,
+                settlementStatus: true,
+                settledAt: true,
+              },
             }
           },
           orderBy: { createdAt: 'desc' },
@@ -937,6 +993,11 @@ export async function getUserTransactions(
       const isPoster = uidList.includes(escrow.posterUid);
       const isPerformer = escrow.performerUid ? uidList.includes(escrow.performerUid) : false;
       const escrowStatusNormalized = String(escrow.status || '').trim().toLowerCase();
+      const paymentStatusNormalized = String(escrow.paymentStatus || '').trim().toLowerCase();
+      const paymentCaptured =
+        paymentStatusNormalized === 'captured' &&
+        ['pending', 'created'].includes(escrowStatusNormalized);
+      const transactionPaymentStatus = paymentCaptured ? 'held' : escrow.status;
       const escrowMeta =
         escrow.metadata && typeof escrow.metadata === 'object' && !Array.isArray(escrow.metadata)
           ? (escrow.metadata as Record<string, unknown>)
@@ -1040,7 +1101,9 @@ export async function getUserTransactions(
       // Default history should represent successful money movement only. When caller
       // explicitly asks for a status filter, respect it (including cancelled/pending).
       const includePosterEscrowInDefaultList =
-        Boolean(statusFilter) || SUCCESSFUL_ESCROW_PAYMENT_STATUSES.has(escrowStatusNormalized);
+        Boolean(statusFilter) ||
+        SUCCESSFUL_ESCROW_PAYMENT_STATUSES.has(escrowStatusNormalized) ||
+        paymentStatusNormalized === 'captured';
       if (
         (!typeFilter || typeFilter === 'payment' || typeFilter === 'escrow') &&
         isPoster &&
@@ -1102,7 +1165,7 @@ export async function getUserTransactions(
               transactionId: escrow.escrowId,
               type: 'escrow',
               amount: escrow.amountInRupees.toString(),
-              status: escrow.status,
+              status: transactionPaymentStatus,
               description: paymentDisplayTitle
                 ? paymentKind === 'additional'
                   ? `Additional payment — ${truncateTitle(paymentDisplayTitle)}`
@@ -1139,7 +1202,8 @@ export async function getUserTransactions(
                 razorpayOrderId: escrow.razorpayOrderId,
                 razorpayPaymentId: escrow.razorpayPaymentId ?? undefined,
                 amountInRupees: escrow.amountInRupees.toString(),
-                escrowStatus: escrow.status,
+                escrowStatus: transactionPaymentStatus,
+                paymentStatus: paymentStatusNormalized || undefined,
                 heldAt: escrow.heldAt?.toISOString() ?? undefined,
                 // Customer pays work amount only; platform fee + GST are deducted from helper payout.
                 taskAmount: lineTaskAmount,
@@ -1380,7 +1444,25 @@ export async function getUserTransactions(
                 }
               : {}),
           },
-          include: { escrow: true },
+          select: {
+            id: true,
+            refundId: true,
+            escrowId: true,
+            taskId: true,
+            refundAmount: true,
+            cancellationFee: true,
+            toOtherParty: true,
+            toPlatform: true,
+            cancelledBy: true,
+            reason: true,
+            status: true,
+            createdAt: true,
+            expectedDepositAt: true,
+            settlementId: true,
+            settlementStatus: true,
+            settledAt: true,
+            escrow: true,
+          },
           orderBy: { createdAt: 'desc' },
           take: fetchLimit,
         });
@@ -1705,7 +1787,10 @@ export async function getTransactionSummary(
             "amountInRupees"
           FROM "Escrow"
           WHERE "posterUid" IN (${Prisma.join(uidList)})
-            AND "status" IN (${Prisma.join(paymentStatuses)})
+            AND (
+              "status" IN (${Prisma.join(paymentStatuses)})
+              OR ("status" IN ('pending', 'created') AND "paymentStatus" = 'captured')
+            )
             ${paymentDateSql}
           ORDER BY "taskId", "createdAt" DESC
         ) latest
@@ -1761,7 +1846,10 @@ export async function getTransactionSummary(
                 "amountInRupees"
               FROM "Escrow"
               WHERE "posterUid" IN (${Prisma.join(uidList)})
-                AND "status" IN (${Prisma.join(paymentStatuses)})
+                AND (
+                  "status" IN (${Prisma.join(paymentStatuses)})
+                  OR ("status" IN ('pending', 'created') AND "paymentStatus" = 'captured')
+                )
                 ${paymentDateSql}
               ORDER BY "taskId", "createdAt" DESC
             ) latest
@@ -1821,4 +1909,3 @@ export async function getTransactionSummary(
     };
   }
 }
-

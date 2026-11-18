@@ -84,8 +84,10 @@ model Escrow {
   @@index([bookingOrderId])
   @@index([posterUid, status])
   @@index([posterUid, status, createdAt(sort: Desc)])
+  @@index([posterUid, createdAt(sort: Desc)])
   @@index([performerUid, status])
   @@index([performerUid, status, createdAt(sort: Desc)])
+  @@index([performerUid, createdAt(sort: Desc)])
   @@index([status, autoReleaseDate])
   @@index([createdAt])
   @@index([razorpayPaymentId])
@@ -148,11 +150,17 @@ model Refund {
   reason           String?
   cancelledBy      String? // poster or performer
   status           String // pending, processing, completed, failed
+  providerStatus   String?
   errorMessage     String?
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt
   completedAt      DateTime?
+  providerProcessedAt DateTime? @db.Timestamptz(3)
   expectedDepositAt DateTime? @db.Timestamptz(3)
+  settlementId     String?
+  settlementStatus String?
+  settledAt        DateTime? @db.Timestamptz(3)
+  settlementCheckedAt DateTime? @db.Timestamptz(3)
 
   // Relations
   escrow Escrow? @relation(fields: [escrowId], references: [id], onDelete: SetNull)
@@ -232,6 +240,7 @@ model PerformerCancellationPenalty {
   appliedAt       DateTime?
 
   @@index([performerUid, status])
+  @@index([performerUid, status, createdAt(sort: Desc)])
   @@index([taskId])
   @@index([createdAt])
 }

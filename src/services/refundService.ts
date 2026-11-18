@@ -14,7 +14,7 @@ import mongoose from 'mongoose';
 import { createRefundAmountPaise, getPaymentDetails, resolvePaymentEnvironmentForPayment } from './paymentService';
 import { sanitizeRazorpayRefundData } from '../utils/paymentSanitizer';
 import { notifyRefundInitiated } from './paymentNotificationService';
-import { razorpay } from '../config/razorpay';
+import { getPaymentClient } from '../config/paymentEnvironment';
 import { ConflictError } from '../errors/AppError';
 import { taskHoldsRecurringVisitEscrows } from './recurringVisitPayoutScope';
 import {
@@ -23,9 +23,17 @@ import {
   syncRecurringVisitRefundSafely,
   withRecurringEscrowRefundLock,
 } from './recurringVisitRefundSync';
+import { getPaymentTimelineEvents } from './paymentTimelineService';
 
 function generateRefundId(): string {
   return `refund_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+}
+
+function getInternalRefundStatus(providerStatus?: string): 'processing' | 'completed' | 'failed' {
+  const status = String(providerStatus || '').trim().toLowerCase();
+  if (status === 'processed' || status === 'completed' || status === 'success') return 'completed';
+  if (status === 'failed') return 'failed';
+  return 'processing';
 }
 
 async function resolvePaymentIdForRefund(
@@ -41,7 +49,9 @@ async function resolvePaymentIdForRefund(
   try {
     const cleanOrderId = orderId.trim();
     logger.info('Fetching captured payment for Razorpay order:', { orderId: cleanOrderId });
-    const payments = await razorpay.orders.fetchPayments(cleanOrderId);
+    const environment = await resolvePaymentEnvironmentForPayment(undefined, cleanOrderId);
+    const client = getPaymentClient(environment);
+    const payments = await client.orders.fetchPayments(cleanOrderId);
     const items = (payments as { items?: any[] })?.items || [];
     const captured = items.find((p) => p.status === 'captured' && p.id);
     if (captured?.id) {
@@ -661,6 +671,7 @@ async function processRefundUnlocked(params: {
               reason,
               cancelledBy,
               status: 'processing',
+              providerStatus: razorpayRefund.status || null,
             },
           });
 
@@ -806,12 +817,17 @@ async function processRefundUnlocked(params: {
             }
           }
 
-          // Update refund status to 'completed'
+          const internalRefundStatus = getInternalRefundStatus(razorpayRefund.status);
+          const providerProcessedAt =
+            internalRefundStatus === 'completed' ? new Date() : undefined;
           await tx.refund.update({
             where: { id: postgresRefund.id },
             data: {
-              status: 'completed',
-              completedAt: new Date(),
+              status: internalRefundStatus,
+              providerStatus: razorpayRefund.status || null,
+              ...(providerProcessedAt
+                ? { completedAt: providerProcessedAt, providerProcessedAt }
+                : {}),
             },
           });
         }, {
@@ -904,7 +920,7 @@ async function processRefundUnlocked(params: {
           cancellationFee: cancellationFee.toString(),
           toOtherParty: toOtherParty.toString(),
           toPlatform: toPlatform.toString(),
-          status: 'completed',
+          status: razorpayRefund.status || 'processing',
           razorpayData: sanitizedRefundData,
         },
       };
@@ -917,7 +933,8 @@ async function processRefundUnlocked(params: {
           await prisma.refund.update({
             where: { id: postgresRefund.id },
             data: {
-              status: 'failed',
+              status: getInternalRefundStatus(razorpayRefund?.status),
+              providerStatus: razorpayRefund?.status || null,
               errorMessage: error.message,
             },
           });
@@ -942,7 +959,7 @@ async function processRefundUnlocked(params: {
  */
 export async function getRefundStatus(
   refundId: string,
-  options?: { syncRazorpay?: boolean },
+  options?: { syncRazorpay?: boolean; userIds?: string[] },
 ): Promise<{
   success: boolean;
   refund?: any;
@@ -964,24 +981,211 @@ export async function getRefundStatus(
       return { success: false, error: 'Refund not found' };
     }
 
+    if (options?.userIds) {
+      const userIds = options.userIds;
+      const isEscrowParticipant =
+        Boolean(refund.escrow) &&
+        [refund.escrow?.posterUid, refund.escrow?.performerUid].some(
+          (userId) => userId && userIds.includes(userId),
+        );
+      const transaction = isEscrowParticipant
+        ? null
+        : await prisma.transaction.findFirst({
+            where: {
+              razorpayPaymentId: refund.paymentId,
+              userId: { in: userIds },
+            },
+            select: { id: true },
+          });
+      if (!isEscrowParticipant && !transaction) {
+        return { success: false, error: 'Refund not found' };
+      }
+    }
+
     // Get original amount from escrow (not stored in refund table)
     const originalAmount = refund.escrow?.amountInRupees || new Prisma.Decimal('0.00');
 
     let providerRefund: any = null;
-    if (options?.syncRazorpay && refund.razorpayRefundId) {
+    let providerPayment: any = null;
+    let providerRefunds: any[] = [];
+    let providerSyncWarning: string | null = null;
+    let settlement = {
+      status: refund.settlementStatus,
+      settlementId: refund.settlementId,
+      expectedSettlementAt: null,
+      settledAt: refund.settledAt,
+    };
+    if (options?.syncRazorpay) {
       try {
-        providerRefund = await razorpay.refunds.fetch(refund.razorpayRefundId);
+        const environment = await resolvePaymentEnvironmentForPayment(
+          refund.paymentId,
+          refund.escrow?.razorpayOrderId,
+        );
+        const client = getPaymentClient(environment);
+        const [paymentResult, refundsResult, refundResult] = await Promise.allSettled([
+          client.payments.fetch(refund.paymentId),
+          fetchRazorpayRefundsForPayment(client, refund.paymentId),
+          refund.razorpayRefundId
+            ? client.refunds.fetch(refund.razorpayRefundId, { payment_id: refund.paymentId })
+            : Promise.resolve(null),
+        ]);
+        if (paymentResult.status === 'fulfilled') {
+          providerPayment = paymentResult.value;
+        } else {
+          providerSyncWarning = 'Could not refresh payment details from Razorpay.';
+          logger.warn('Failed to fetch payment details from Razorpay', {
+            paymentId: refund.paymentId,
+            error: paymentResult.reason?.message || String(paymentResult.reason),
+          });
+        }
+        if (refundsResult.status === 'fulfilled') {
+          providerRefunds = refundsResult.value;
+        } else {
+          providerSyncWarning = 'Could not refresh all refunds from Razorpay.';
+          logger.warn('Failed to fetch payment refunds from Razorpay', {
+            paymentId: refund.paymentId,
+            error: refundsResult.reason?.message || String(refundsResult.reason),
+          });
+        }
+        if (refundResult.status === 'fulfilled') {
+          providerRefund = refundResult.value;
+        } else {
+          providerSyncWarning = 'Could not refresh refund details from Razorpay.';
+          logger.warn('Failed to fetch specific refund from Razorpay', {
+            refundId,
+            razorpayRefundId: refund.razorpayRefundId,
+            error: refundResult.reason?.message || String(refundResult.reason),
+          });
+        }
       } catch (error: any) {
-        logger.warn('Failed to sync refund status from Razorpay', {
+        providerSyncWarning = 'Could not refresh payment and refund details from Razorpay.';
+        logger.warn('Failed to sync payment and refund details from Razorpay', {
           refundId,
-          razorpayRefundId: refund.razorpayRefundId,
           error: error?.message || String(error),
         });
       }
     }
 
+    const listedRefundById = refund.razorpayRefundId
+      ? providerRefunds.find((item) => item.id === refund.razorpayRefundId)
+      : undefined;
+    let listedRefund = listedRefundById;
+    if (!listedRefund && !refund.razorpayRefundId) {
+      const alreadyLinkedRefunds = await prisma.refund.findMany({
+        where: {
+          paymentId: refund.paymentId,
+          razorpayRefundId: { not: null },
+          refundId: { not: refund.refundId },
+        },
+        select: { razorpayRefundId: true },
+      });
+      const linkedRefundIds = new Set(
+        alreadyLinkedRefunds.map((item) => item.razorpayRefundId),
+      );
+      const expectedAmountPaise = Math.round(Number(refund.refundAmount) * 100);
+      const matchingRefunds = providerRefunds.filter(
+        (item) =>
+          item.id &&
+          !linkedRefundIds.has(item.id) &&
+          Number(item.amount) === expectedAmountPaise,
+      );
+      if (matchingRefunds.length === 1) {
+        [listedRefund] = matchingRefunds;
+      }
+    }
+    providerRefund = providerRefund ?? listedRefund ?? null;
     const providerAmountRupees = Number(providerRefund?.amount) / 100;
     const hasProviderAmount = Number.isFinite(providerAmountRupees) && providerAmountRupees >= 0;
+    const providerStatus = providerRefund?.status || refund.providerStatus || null;
+    if (options?.syncRazorpay && providerRefund?.id && providerRefund?.status) {
+      const normalizedStatus = String(providerRefund.status).trim().toLowerCase();
+      const internalStatus = getInternalRefundStatus(normalizedStatus);
+      await prisma.refund.updateMany({
+        where: { refundId: refund.refundId },
+        data: {
+          ...(refund.razorpayRefundId ? {} : { razorpayRefundId: providerRefund.id }),
+          providerStatus: normalizedStatus,
+          status: internalStatus,
+          ...(internalStatus === 'failed'
+            ? { errorMessage: 'Razorpay reported refund failure' }
+            : {}),
+        },
+      });
+    }
+    const statusUpdatedAt =
+      refund.providerStatus && (!providerRefund || providerRefund.status === refund.providerStatus)
+        ? refund.updatedAt
+        : null;
+    const transaction = await prisma.transaction.findUnique({
+      where: { razorpayPaymentId: refund.paymentId },
+      select: { createdAt: true },
+    });
+    const timeline: Array<{ eventType: string; occurredAt: Date | null }> =
+      await getPaymentTimelineEvents(
+      refund.paymentId,
+      refund.razorpayRefundId,
+    );
+    const paymentCreatedTimestamp = Number(providerPayment?.created_at);
+    const paymentCreatedAt =
+      Number.isFinite(paymentCreatedTimestamp) && paymentCreatedTimestamp > 0
+        ? new Date(paymentCreatedTimestamp * 1000)
+        : transaction?.createdAt ?? refund.escrow?.createdAt;
+    if (paymentCreatedAt) {
+      timeline.unshift({
+        eventType: 'payment.created',
+        occurredAt: paymentCreatedAt,
+      });
+    }
+    const providerRefundCreatedTimestamp = Number(providerRefund?.created_at);
+    const refundCreatedAt =
+      Number.isFinite(providerRefundCreatedTimestamp) && providerRefundCreatedTimestamp > 0
+        ? new Date(providerRefundCreatedTimestamp * 1000)
+        : refund.createdAt;
+    if (!timeline.some((event) => event.eventType === 'refund.created')) {
+      timeline.push({ eventType: 'refund.created', occurredAt: refundCreatedAt });
+    }
+    const normalizedProviderStatus = String(providerStatus || '').toLowerCase();
+    const hasTerminalRefundEvent = timeline.some((event) =>
+      ['refund.processed', 'refund.failed'].includes(event.eventType),
+    );
+    if (!hasTerminalRefundEvent && normalizedProviderStatus === 'failed') {
+      timeline.push({
+        eventType: 'refund.failed',
+        occurredAt:
+          refund.providerProcessedAt ??
+          refund.completedAt ??
+          (providerRefund?.status ? null : refund.updatedAt),
+      });
+    }
+    const paymentStatus = String(providerPayment?.status || '').toLowerCase();
+    const currentPaymentEventType =
+      paymentStatus === 'authorized'
+        ? 'payment.authorized'
+        : paymentStatus === 'captured'
+          ? 'payment.captured'
+          : paymentStatus === 'refunded'
+            ? 'payment.refunded'
+            : null;
+    if (
+      currentPaymentEventType &&
+      !timeline.some((event) => event.eventType === currentPaymentEventType)
+    ) {
+      timeline.push({ eventType: currentPaymentEventType, occurredAt: null });
+    }
+    if (
+      String(settlement.status || '').toLowerCase() === 'settled' &&
+      !timeline.some((event) => event.eventType === 'settlement.processed')
+    ) {
+      timeline.push({
+        eventType: 'settlement.processed',
+        occurredAt: settlement.settledAt,
+      });
+    }
+    timeline.sort(
+      (left, right) =>
+        (left.occurredAt?.getTime() ?? Number.MAX_SAFE_INTEGER) -
+        (right.occurredAt?.getTime() ?? Number.MAX_SAFE_INTEGER),
+    );
 
     return {
       success: true,
@@ -997,19 +1201,206 @@ export async function getRefundStatus(
         toPlatform: refund.toPlatform?.toString(),
         reason: refund.reason,
         cancelledBy: refund.cancelledBy,
-        status: providerRefund?.status || refund.status,
-        razorpayRefundStatus: providerRefund?.status || null,
+        status: providerStatus || refund.status,
+        razorpayRefundStatus: providerStatus,
         razorpaySpeedProcessed:
           providerRefund?.speed_processed || providerRefund?.speed_requested || null,
+        refundBankReference:
+          providerRefund?.acquirer_data?.rrn ??
+          providerRefund?.acquirer_data?.arn ??
+          providerRefund?.acquirer_data?.utr ??
+          null,
+        refundBankReferenceType: providerRefund?.acquirer_data?.rrn
+          ? 'RRN'
+          : providerRefund?.acquirer_data?.arn
+            ? 'ARN'
+            : providerRefund?.acquirer_data?.utr
+              ? 'UTR'
+              : null,
         createdAt: refund.createdAt,
-        completedAt: providerRefund?.created_at
-          ? new Date(Number(providerRefund.created_at) * 1000).toISOString()
-          : refund.completedAt,
+        processedAt: refund.providerProcessedAt,
+        statusUpdatedAt,
+        paymentMethod:
+          providerPayment?.method ??
+          (refund.escrow?.razorpayPaymentData
+            ? (refund.escrow.razorpayPaymentData as Record<string, unknown>).method
+            : null),
+        paymentStatus: providerPayment?.status ?? null,
+        paymentCreatedAt,
+        providerSyncWarning,
+        timeline: timeline.map((event) => ({
+          ...event,
+          source:
+            event.eventType === 'settlement.processed'
+              ? 'razorpay_settlement_report'
+              : event.occurredAt
+                ? 'webhook_or_razorpay'
+                : 'razorpay_current',
+        })),
+        expectedCreditAt: refund.expectedDepositAt,
+        settlement: {
+          ...settlement,
+          status: settlement.status?.toUpperCase() ?? null,
+        },
       },
     };
   } catch (error: any) {
     logger.error('❌ Error getting refund status:', error);
     return { success: false, error: error.message || 'Failed to get refund status' };
+  }
+}
+
+async function fetchRazorpayRefundsForPayment(
+  client: ReturnType<typeof getPaymentClient>,
+  paymentId: string,
+): Promise<any[]> {
+  const pageSize = 100;
+  const refunds: any[] = [];
+  for (let skip = 0; ; skip += pageSize) {
+    const page = await client.payments.fetchMultipleRefund(paymentId, {
+      count: pageSize,
+      skip,
+    });
+    refunds.push(...page.items);
+    if (page.items.length < pageSize) return refunds;
+  }
+}
+
+/**
+ * Get refunds belonging to customer identities supplied by the authenticated API gateway.
+ */
+export async function getCustomerRefunds(userIds: string[]): Promise<{
+  success: boolean;
+  refunds?: any[];
+  error?: string;
+}> {
+  try {
+    if (!isPostgresConnected()) {
+      return { success: false, error: 'Postgres not connected' };
+    }
+    if (userIds.length === 0) {
+      return { success: true, refunds: [] };
+    }
+
+    const identityIds = new Set(userIds);
+    if (mongoose.connection.readyState === 1) {
+      try {
+        const profileObjectIds = userIds
+          .filter((uid) => mongoose.isValidObjectId(uid))
+          .map((uid) => new mongoose.Types.ObjectId(uid));
+        const profiles = await mongoose.connection.collection('profiles')
+          .find({
+            $or: [
+              { uid: { $in: userIds } },
+              ...(profileObjectIds.length > 0
+                ? [{ _id: { $in: profileObjectIds } }]
+                : []),
+            ],
+          })
+          .project({ _id: 1, uid: 1 })
+          .toArray();
+        profiles.forEach((profile) => {
+          if (profile.uid) identityIds.add(String(profile.uid));
+          if (profile._id) identityIds.add(String(profile._id));
+        });
+      } catch (error: any) {
+        logger.warn('Could not expand customer refund identities from profiles', {
+          error: error?.message || String(error),
+        });
+      }
+    }
+
+    const expandedUserIds = Array.from(identityIds);
+    const databases = [prisma, ...(prismaDev ? [prismaDev] : [])];
+    const refundsById = new Map<string, { refund: any; transactionAmount?: string }>();
+    for (const database of databases) {
+      try {
+        const [escrows, transactions] = await Promise.all([
+          database.escrow.findMany({
+            where: {
+              OR: [
+                { posterUid: { in: expandedUserIds } },
+                { performerUid: { in: expandedUserIds } },
+              ],
+            },
+            select: { id: true },
+          }),
+          database.transaction.findMany({
+            where: {
+              userId: { in: expandedUserIds },
+            },
+            select: { id: true, razorpayPaymentId: true, amount: true },
+          }),
+        ]);
+        const escrowIds = escrows.map((escrow) => escrow.id);
+        const transactionIds = transactions.map((transaction) => transaction.id);
+        const paymentIds = transactions
+          .map((transaction) => transaction.razorpayPaymentId)
+          .filter((paymentId): paymentId is string => Boolean(paymentId));
+        const clauses = [
+          ...(escrowIds.length > 0 ? [{ escrowId: { in: escrowIds } }] : []),
+          ...(transactionIds.length > 0 ? [{ transactionId: { in: transactionIds } }] : []),
+          ...(paymentIds.length > 0 ? [{ paymentId: { in: paymentIds } }] : []),
+        ];
+        if (clauses.length === 0) continue;
+
+        const databaseRefunds = await database.refund.findMany({
+          where: { OR: clauses },
+          include: { escrow: true },
+          orderBy: { createdAt: 'desc' },
+        });
+        const transactionAmountByPaymentId = new Map(
+          transactions
+            .filter((transaction) => transaction.razorpayPaymentId)
+            .map((transaction) => [
+              transaction.razorpayPaymentId as string,
+              transaction.amount.toString(),
+            ]),
+        );
+        databaseRefunds.forEach((refund) => {
+          if (!refundsById.has(refund.refundId)) {
+            refundsById.set(refund.refundId, {
+              refund,
+              transactionAmount: transactionAmountByPaymentId.get(refund.paymentId),
+            });
+          }
+        });
+      } catch (error: any) {
+        if (database === prisma) throw error;
+        logger.warn('Could not load customer refunds from secondary payment database', {
+          error: error?.message || String(error),
+        });
+      }
+    }
+
+    return {
+      success: true,
+      refunds: Array.from(refundsById.values())
+        .sort(
+          (left, right) =>
+            right.refund.createdAt.getTime() - left.refund.createdAt.getTime(),
+        )
+        .map(({ refund, transactionAmount }) => ({
+          refundId: refund.refundId,
+          razorpayRefundId: refund.razorpayRefundId,
+          amount:
+            refund.escrow?.amountInRupees?.toString() ??
+            transactionAmount ??
+            '0.00',
+          refundAmount: refund.refundAmount.toString(),
+          cancellationFee: refund.cancellationFee?.toString(),
+          reason: refund.reason,
+          taskId: refund.taskId,
+          status: refund.status,
+          razorpayRefundStatus: refund.providerStatus,
+          createdAt: refund.createdAt,
+          processedAt: refund.providerProcessedAt,
+          expectedCreditAt: refund.expectedDepositAt,
+        })),
+    };
+  } catch (error: any) {
+    logger.error('Failed to get customer refunds:', error);
+    return { success: false, error: error.message || 'Failed to get customer refunds' };
   }
 }
 
@@ -1059,9 +1450,18 @@ export async function getRefundsByEscrowId(escrowId: string): Promise<{
         reason: refund.reason,
         cancelledBy: refund.cancelledBy,
         status: refund.status,
+        razorpayRefundStatus: refund.providerStatus,
         createdAt: refund.createdAt,
-        completedAt: refund.completedAt,
-        expectedDepositAt: (refund as any).expectedDepositAt,
+        processedAt: refund.providerProcessedAt,
+        statusUpdatedAt: refund.providerStatus ? refund.updatedAt : null,
+        expectedDepositAt: refund.expectedDepositAt,
+        expectedCreditAt: refund.expectedDepositAt,
+        settlement: {
+          status: refund.settlementStatus?.toUpperCase() ?? null,
+          settlementId: refund.settlementId,
+          expectedSettlementAt: null,
+          settledAt: refund.settledAt,
+        },
       })),
     };
   } catch (error: any) {
@@ -1327,6 +1727,10 @@ export async function processBookNowLineItemRefund(params: {
       cancelledAt: cancelledAt.toISOString(),
     };
 
+    const internalRefundStatus = getInternalRefundStatus(razorpayRefund.status);
+    const providerProcessedAt =
+      internalRefundStatus === 'completed' ? new Date() : undefined;
+
     await prisma.$transaction(async (tx) => {
       const latestEntry = await tx.ledger.findFirst({
         where: { escrowId: postgresEscrow.id },
@@ -1353,8 +1757,11 @@ export async function processBookNowLineItemRefund(params: {
             ? `Book Now line cancelled: ${resolvedLineTitle}`
             : reason || 'Book Now line cancelled',
           cancelledBy: 'poster',
-          status: 'completed',
-          completedAt: new Date(),
+          status: internalRefundStatus,
+          providerStatus: razorpayRefund.status || null,
+          ...(providerProcessedAt
+            ? { completedAt: providerProcessedAt, providerProcessedAt }
+            : {}),
         },
       });
 
@@ -1413,7 +1820,7 @@ export async function processBookNowLineItemRefund(params: {
         refundId,
         razorpayRefundId: razorpayRefund.id,
         amount: refundAmount.toString(),
-        status: 'completed',
+        status: razorpayRefund.status || 'processing',
       },
     };
   } catch (error: any) {
@@ -1429,11 +1836,11 @@ export async function processBookNowLineItemRefund(params: {
 type RazorpayRefundWebhookPayload = {
   refund?: { entity?: { id?: string; status?: string; payment_id?: string } };
   payment?: { entity?: { id?: string; amount?: number; amount_refunded?: number; status?: string } };
+  eventCreatedAt?: number | string;
 };
 
 /**
- * Mark refund completed (or failed) when Razorpay sends refund webhooks.
- * Idempotent — safe when processRefund already set status to completed.
+ * Sync refund status and the provider-confirmed processing time from Razorpay webhooks.
  */
 export async function completeRefundFromRazorpayWebhook(
   payload: RazorpayRefundWebhookPayload,
@@ -1454,7 +1861,11 @@ export async function completeRefundFromRazorpayWebhook(
     return;
   }
 
-  await updateRefundRecordFromRazorpayWebhook(razorpayRefundId, refundEntity);
+  await updateRefundRecordFromRazorpayWebhook(
+    razorpayRefundId,
+    refundEntity,
+    payload.eventCreatedAt,
+  );
   const razorpayStatus = String(refundEntity?.status || '').trim().toLowerCase();
   if (razorpayStatus && !['processed', 'completed', 'success'].includes(razorpayStatus)) return;
   await syncRecurringEscrowAfterRefundWebhook(razorpayRefundId, paymentEntity, refundEntity?.payment_id);
@@ -1483,15 +1894,23 @@ async function syncRecurringEscrowAfterRefundWebhook(
 async function updateRefundRecordFromRazorpayWebhook(
   razorpayRefundId: string,
   refundEntity: NonNullable<RazorpayRefundWebhookPayload['refund']>['entity'],
+  eventCreatedAt?: number | string,
 ): Promise<void> {
   const razorpayStatus = String(refundEntity?.status || '').trim().toLowerCase();
+  const eventTimestamp = Number(eventCreatedAt);
+  const providerStatusUpdatedAt =
+    Number.isFinite(eventTimestamp) && eventTimestamp > 0
+      ? new Date(eventTimestamp * 1000)
+      : new Date();
 
   if (razorpayStatus === 'failed') {
     await prisma.refund.updateMany({
       where: { razorpayRefundId },
       data: {
         status: 'failed',
+        providerStatus: razorpayStatus,
         errorMessage: 'Razorpay reported refund failure',
+        updatedAt: providerStatusUpdatedAt,
       },
     });
     logger.info('Refund marked failed from Razorpay webhook', { razorpayRefundId });
@@ -1500,6 +1919,17 @@ async function updateRefundRecordFromRazorpayWebhook(
 
   const terminalStatuses = new Set(['processed', 'completed', 'success']);
   if (!terminalStatuses.has(razorpayStatus) && razorpayStatus) {
+    await prisma.refund.updateMany({
+      where: {
+        razorpayRefundId,
+        status: { in: ['pending', 'processing'] },
+      },
+      data: {
+        status: 'processing',
+        providerStatus: razorpayStatus,
+        updatedAt: providerStatusUpdatedAt,
+      },
+    });
     logger.info('Refund webhook received — non-terminal Razorpay status', {
       razorpayRefundId,
       razorpayStatus,
@@ -1510,11 +1940,14 @@ async function updateRefundRecordFromRazorpayWebhook(
   const result = await prisma.refund.updateMany({
     where: {
       razorpayRefundId,
-      status: { in: ['pending', 'processing'] },
+      status: { in: ['pending', 'processing', 'completed'] },
     },
     data: {
       status: 'completed',
-      completedAt: new Date(),
+      providerStatus: razorpayStatus,
+      completedAt: providerStatusUpdatedAt,
+      providerProcessedAt: providerStatusUpdatedAt,
+      updatedAt: providerStatusUpdatedAt,
     },
   });
 
@@ -1528,4 +1961,3 @@ async function updateRefundRecordFromRazorpayWebhook(
     logger.warn('Refund webhook for unknown razorpayRefundId', { razorpayRefundId });
   }
 }
-

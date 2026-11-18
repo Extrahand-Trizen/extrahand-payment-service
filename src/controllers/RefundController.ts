@@ -1,5 +1,10 @@
 import { Response, Request } from 'express';
-import { processRefund, getRefundStatus, getRefundsByEscrowId } from '../services/refundService';
+import {
+  processRefund,
+  getCustomerRefunds,
+  getRefundStatus,
+  getRefundsByEscrowId,
+} from '../services/refundService';
 import { resolveEscrowForCancellation } from '../services/cancellationService';
 import { BadRequestError, ForbiddenError, NotFoundError } from '../errors/AppError';
 import { callerRoleForEscrow, requireCallerIdentity, resolvePaymentCaller } from '../utils/paymentCaller';
@@ -145,7 +150,10 @@ export class RefundController {
     }
 
     const syncRazorpay = String(req.query.syncRazorpay || '').toLowerCase() === 'true';
-    const result = await getRefundStatus(refundId, { syncRazorpay });
+    const caller = resolvePaymentCaller(req);
+    const userIds =
+      caller.kind === 'user' ? requireCallerIdentity(caller) : undefined;
+    const result = await getRefundStatus(refundId, { syncRazorpay, userIds });
 
     if (!result.success) {
       throw new NotFoundError(result.error || 'Refund not found');
@@ -154,6 +162,27 @@ export class RefundController {
     res.json({
       success: true,
       refund: result.refund,
+    });
+  }
+
+  /**
+   * GET /api/v1/refunds/mine
+   * Get refunds for the authenticated customer.
+   */
+  static async getMyRefunds(req: Request, res: Response): Promise<void> {
+    const caller = resolvePaymentCaller(req);
+    if (caller.kind !== 'user') {
+      throw new ForbiddenError('Customer identity is required');
+    }
+
+    const result = await getCustomerRefunds(requireCallerIdentity(caller));
+    if (!result.success) {
+      throw new Error(result.error || 'Failed to fetch refunds');
+    }
+
+    res.json({
+      success: true,
+      refunds: result.refunds,
     });
   }
 

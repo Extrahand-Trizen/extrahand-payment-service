@@ -425,3 +425,17 @@ export function isPrismaConnected(): boolean {
   // We'll use a simple query to check
   return true; // Will be checked via actual queries
 }
+
+export function getPostgresPoolStats(): {
+  total: number;
+  idle: number;
+  waiting: number;
+  max: number;
+} {
+  return {
+    total: pgPool?.totalCount ?? 0,
+    idle: pgPool?.idleCount ?? 0,
+    waiting: pgPool?.waitingCount ?? 0,
+    max: pgPool?.options.max ?? 5,
+  };
+}

@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { prisma, prismaDev } from '../config/prisma';
+import { getRefundWebhookEvents } from '../services/paymentTimelineService';
 import { applyPayoutStatusToProfile } from '../services/userPaymentProfileService';
 import { notifyPayoutCompleted } from '../services/paymentNotificationService';
 import { Prisma } from '@prisma/client';
@@ -1104,6 +1105,14 @@ export class AdminFinanceController {
     const limit = parseLimit(req.query.limit);
     const offset = parseOffset(req.query.offset);
     const search = typeof q === 'string' && q.trim() ? q.trim() : undefined;
+    const userUids =
+      typeof req.query.userUids === 'string'
+        ? req.query.userUids.split(',').map((uid) => uid.trim()).filter(Boolean)
+        : [];
+    const taskIds =
+      typeof req.query.taskIds === 'string'
+        ? req.query.taskIds.split(',').map((taskId) => taskId.trim()).filter(Boolean)
+        : [];
 
     const environment = typeof req.query.environment === 'string' ? req.query.environment : 'production';
     const useDevDb = environment === 'development' && prismaDev != null;
@@ -1127,6 +1136,20 @@ export class AdminFinanceController {
         { taskId: { contains: search, mode: 'insensitive' } },
         { escrow: { taskId: { contains: search, mode: 'insensitive' } } },
         { escrow: { posterUid: { contains: search, mode: 'insensitive' } } },
+      ];
+    }
+    if (userUids.length > 0 || taskIds.length > 0) {
+      where.OR = [
+        ...(where.OR ?? []),
+        ...(userUids.length > 0
+          ? [
+              { escrow: { posterUid: { in: userUids } } },
+              { escrow: { performerUid: { in: userUids } } },
+            ]
+          : []),
+        ...(taskIds.length > 0
+          ? [{ taskId: { in: taskIds } }, { escrow: { taskId: { in: taskIds } } }]
+          : []),
       ];
     }
 
@@ -1308,18 +1331,37 @@ export class AdminFinanceController {
 
   static async getRefundById(req: Request, res: Response): Promise<void> {
     const { id } = req.params;
-    const refund = await prisma.refund.findFirst({
+    const environment = typeof req.query.environment === 'string' ? req.query.environment : 'production';
+    const targetPrisma = environment === 'development' && prismaDev != null ? prismaDev : prisma;
+    const refund = await targetPrisma.refund.findFirst({
       where: { OR: [{ id }, { refundId: id }] },
       include: { escrow: true },
     });
     if (!refund) throw new NotFoundError('Refund not found');
 
-    const ledger = await prisma.ledger.findMany({
-      where: { refundId: refund.id },
-      orderBy: { createdAt: 'asc' },
-    });
+    const timelineDatabases =
+      targetPrisma === prisma || prismaDev == null ? [targetPrisma] : [targetPrisma, prisma];
+    const [ledger, timelineRows] = await Promise.all([
+      targetPrisma.ledger.findMany({
+        where: { refundId: refund.id },
+        orderBy: { createdAt: 'asc' },
+      }),
+      Promise.all(
+        timelineDatabases.map((database) =>
+          getRefundWebhookEvents(refund.razorpayRefundId, database),
+        ),
+      ),
+    ]);
+    const timeline = Array.from(
+      new Map(
+        timelineRows.flat().map((event) => [
+          `${event.eventType}:${event.occurredAt.getTime()}`,
+          event,
+        ]),
+      ).values(),
+    ).sort((left, right) => left.occurredAt.getTime() - right.occurredAt.getTime());
 
-    res.json({ success: true, refund, ledger });
+    res.json({ success: true, refund, ledger, timeline });
   }
 
   static async manualRefund(req: Request, res: Response): Promise<void> {

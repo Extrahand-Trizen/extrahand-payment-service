@@ -129,7 +129,9 @@ router.post('/razorpay', express.raw({ type: 'application/json' }), async (req, 
         await handlePaymentRefunded(event.payload, event.created_at);
         break;
 
+      case 'refund.created':
       case 'refund.processed':
+      case 'refund.failed':
         await handlePaymentRefunded(event.payload, event.created_at);
         break;
 

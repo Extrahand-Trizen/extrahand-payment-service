@@ -50,6 +50,21 @@ function generateEscrowId(): string {
 }
 
 /** Book Now order id — column when migrated, else metadata from createEscrow. */
+export async function findEscrowByRazorpayOrderId(razorpayOrderId: string) {
+  const id = razorpayOrderId?.trim();
+  if (!id) return null;
+
+  const byUnique = await prisma.escrow.findUnique({ where: { razorpayOrderId: id } });
+  if (byUnique) return byUnique;
+
+  if (prismaDev) {
+    const byDev = await prismaDev.escrow.findUnique({ where: { razorpayOrderId: id } });
+    if (byDev) return byDev;
+  }
+
+  return null;
+}
+
 export function resolveEscrowBookingOrderId(escrow: {
   bookingOrderId?: string | null;
   metadata?: unknown;
@@ -744,6 +759,27 @@ export async function createEscrow(params: {
           : null;
       const isFreeOrder = finalChargeAmount.isZero();
 
+      const existingEscrowForOrder = await findEscrowByRazorpayOrderId(razorpayOrder.id);
+      if (existingEscrowForOrder) {
+        logger.warn('[escrowService] duplicate escrow creation skipped for existing razorpay order', {
+          escrowId: existingEscrowForOrder.escrowId,
+          razorpayOrderId: razorpayOrder.id,
+          taskId,
+          posterUid,
+        });
+
+        const mappedOrder = await prisma.paymentOrderIdempotency.findFirst({
+          where: { razorpayOrderId: razorpayOrder.id },
+        });
+
+        return {
+          success: true,
+          escrow: await convertPostgresEscrowToFrontendFormat(existingEscrowForOrder),
+          order: mappedOrder?.orderPayload ?? razorpayOrder,
+          isFree: isFreeOrder,
+        };
+      }
+
       // Create escrow in Postgres (all data - financial + metadata)
       const escrowRecordStartedAt = Date.now();
       const postgresEscrow = await prisma.escrow.create({
@@ -770,6 +806,19 @@ export async function createEscrow(params: {
           appliedPlatformFeePercent: appliedPlatformFeePercent ?? null,
           appliedRazorpayGstPercent: appliedRazorpayGstPercent ?? null,
         },
+      }).catch(async (error: any) => {
+        if (error?.code !== 'P2002') throw error;
+
+        const existing = await findEscrowByRazorpayOrderId(razorpayOrder.id);
+        if (!existing) throw error;
+
+        logger.warn('[escrowService] unique razorpayOrderId conflict resolved by reusing existing escrow', {
+          razorpayOrderId: razorpayOrder.id,
+          taskId,
+          escrowId: existing.escrowId,
+        });
+
+        return existing;
       });
       timings.escrowRecordCreateMs = Date.now() - escrowRecordStartedAt;
 

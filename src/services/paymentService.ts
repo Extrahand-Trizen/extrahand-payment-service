@@ -677,8 +677,15 @@ export const resolvePaymentEnvironmentForPayment = async (
           select: { metadata: true },
         })
       : null;
-  if (escrow?.metadata) {
-    return normalizePaymentEnvironment((escrow.metadata as any)?.paymentEnvironment);
+  const escrowPaymentEnvironment =
+    escrow?.metadata && typeof escrow.metadata === 'object' && !Array.isArray(escrow.metadata)
+      ? (escrow.metadata as Record<string, unknown>).paymentEnvironment
+      : undefined;
+  if (
+    typeof escrowPaymentEnvironment === 'string' &&
+    escrowPaymentEnvironment.trim().length > 0
+  ) {
+    return normalizePaymentEnvironment(escrowPaymentEnvironment);
   }
   if (orderId || paymentId) {
     const order = orderId

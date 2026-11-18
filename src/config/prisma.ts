@@ -1,15 +1,26 @@
 import dns from 'node:dns';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { Pool } from 'pg';
 import { PrismaClient } from '@prisma/client';
 import { PrismaPg } from '@prisma/adapter-pg';
 import logger from './logger';
-import { validateEnv } from './env';
+import { getPostgresUriForEnvironment, type PaymentDatabaseEnvironment, validateEnv } from './env';
 
 const env = validateEnv();
 
 // Prisma Client singleton instance
 let prismaInstance: PrismaClient | null = null;
 let pgPool: Pool | null = null;
+const paymentDatabaseContext = new AsyncLocalStorage<{
+  client: PrismaClient;
+  userId?: string;
+  paymentEnvironment?: 'live' | 'test';
+  allowAnyUser?: boolean;
+}>();
+const environmentDatabaseClients = new Map<
+  PaymentDatabaseEnvironment,
+  Promise<{ client: PrismaClient; pool: Pool }>
+>();
 /** Neon hostname kept for TLS SNI when we connect via resolved IP */
 let neonSslServername: string | undefined;
 
@@ -192,7 +203,7 @@ function getPrismaClient(): PrismaClient {
  */
 export const prisma: PrismaClient = new Proxy({} as PrismaClient, {
   get(_target, prop, receiver) {
-    const client = getPrismaClient();
+    const client = paymentDatabaseContext.getStore()?.client ?? getPrismaClient();
     const value = Reflect.get(client as object, prop, receiver);
     if (typeof value === 'function') {
       return (value as (...args: unknown[]) => unknown).bind(client);
@@ -207,6 +218,99 @@ export const prisma: PrismaClient = new Proxy({} as PrismaClient, {
  * Kept as null so legacy `if (prismaDev)` fallbacks no-op safely.
  */
 export const prismaDev: PrismaClient | null = null;
+
+export function getCurrentPaymentEnvironment(userId?: string): 'live' | 'test' | undefined {
+  const context = paymentDatabaseContext.getStore();
+  if (!context?.paymentEnvironment) return undefined;
+  if (context.allowAnyUser) return context.paymentEnvironment;
+  if (userId && context.userId && userId !== context.userId) return undefined;
+  if (userId && !context.userId) return undefined;
+  return context.paymentEnvironment;
+}
+
+export async function runWithPaymentEnvironment<T>(
+  paymentEnvironment: 'live' | 'test',
+  userId: string | undefined,
+  operation: () => T | Promise<T>,
+  allowAnyUser = false,
+): Promise<T> {
+  const client =
+    paymentEnvironment === 'test'
+      ? await getPrismaClientForEnvironment('development')
+      : getPrismaClient();
+  return paymentDatabaseContext.run(
+    { client, userId, paymentEnvironment, allowAnyUser },
+    operation,
+  );
+}
+
+export async function runWithPaymentDatabase<T>(
+  databaseEnvironment: PaymentDatabaseEnvironment,
+  paymentEnvironment: 'live' | 'test' | undefined,
+  userId: string | undefined,
+  operation: () => T | Promise<T>,
+): Promise<T> {
+  const client = await getPrismaClientForEnvironment(databaseEnvironment);
+  return paymentDatabaseContext.run(
+    { client, userId, paymentEnvironment, allowAnyUser: !userId },
+    operation,
+  );
+}
+
+async function createEnvironmentDatabaseClient(
+  environment: PaymentDatabaseEnvironment,
+): Promise<{ client: PrismaClient; pool: Pool }> {
+  const connectionString = getPostgresUriForEnvironment(environment, env);
+  const resolved = await resolveNeonUriForBrokenLocalDns(connectionString);
+  const normalizedUri = normalizePostgresUri(resolved.connectionString);
+  const pool = new Pool({
+    connectionString: normalizedUri,
+    max: 5,
+    idleTimeoutMillis: 20_000,
+    connectionTimeoutMillis: 30_000,
+    allowExitOnIdle: true,
+    ssl: {
+      rejectUnauthorized: false,
+      ...(resolved.sslServername ? { servername: resolved.sslServername } : {}),
+    },
+  });
+  pool.on('error', (err) => {
+    logger.error(`Unexpected ${environment} Postgres pool error`, formatPgError(err));
+  });
+
+  const client = new PrismaClient({
+    adapter: new PrismaPg(pool),
+    log: env.NODE_ENV === 'development' ? ['error', 'warn'] : ['error'],
+  });
+  try {
+    await pool.query('SELECT 1');
+  } catch (error) {
+    await pool.end();
+    throw error;
+  }
+  logger.info(
+    `✅ Payment database client initialized (${environment}) → ${resolved.sslServername || safeDbHost(normalizedUri)}`,
+  );
+  return { client, pool };
+}
+
+/** Returns a client bound to exactly the selected Postgres environment. */
+export async function getPrismaClientForEnvironment(
+  environment: PaymentDatabaseEnvironment,
+): Promise<PrismaClient> {
+  let clientPromise = environmentDatabaseClients.get(environment);
+  if (!clientPromise) {
+    clientPromise = createEnvironmentDatabaseClient(environment);
+    environmentDatabaseClients.set(environment, clientPromise);
+  }
+
+  try {
+    return (await clientPromise).client;
+  } catch (error) {
+    environmentDatabaseClients.delete(environment);
+    throw error;
+  }
+}
 
 async function rebuildPrismaWithDnsBypass(): Promise<void> {
   const connectionString = env.POSTGRESDB_URI;
@@ -301,6 +405,12 @@ export async function disconnectPrisma(): Promise<void> {
       await pgPool.end();
       pgPool = null;
     }
+    for (const clientPromise of environmentDatabaseClients.values()) {
+      const { client, pool } = await clientPromise;
+      await client.$disconnect();
+      await pool.end();
+    }
+    environmentDatabaseClients.clear();
     logger.info('📦 Prisma disconnected from Postgres');
   } catch (error: unknown) {
     logger.error('❌ Error disconnecting Prisma', formatPgError(error));

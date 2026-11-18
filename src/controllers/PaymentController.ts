@@ -73,7 +73,9 @@ export class PaymentController {
    */
   static async createOrder(req: Request, res: Response): Promise<void> {
     const { amount, currency, metadata } = req.body;
-    const authenticatedUid = String(req.headers['x-user-id'] || '').trim();
+    const authenticatedUid = String(
+      req.headers['x-user-id'] || metadata?.posterUid || '',
+    ).trim();
     const paymentEnvironment = await import('../config/paymentEnvironment').then(({ resolvePaymentEnvironment }) =>
       resolvePaymentEnvironment(authenticatedUid));
     const rawIdempotencyKey =

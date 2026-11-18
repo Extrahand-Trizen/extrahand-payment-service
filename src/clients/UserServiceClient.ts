@@ -38,8 +38,8 @@ export class UserServiceClient {
     }
   }
 
-  static async isPaymentTester(uid: string): Promise<boolean> {
-    if (!uid?.trim()) return false;
+  static async getPaymentTesterStatus(uid: string): Promise<boolean> {
+    if (!uid?.trim()) throw new Error('User ID is required to verify payment tester status');
     try {
       const res = await axios.get(
         `${this.baseURL()}/api/v1/profiles/internal/${encodeURIComponent(uid)}`,
@@ -48,11 +48,20 @@ export class UserServiceClient {
       return res.data?.profile?.isPaymentTester === true;
     } catch (err) {
       const axiosErr = err as AxiosError;
-      logger.warn('[UserServiceClient] payment tester lookup failed; defaulting live', {
+      logger.error('[UserServiceClient] payment tester lookup failed', {
         uid,
         status: axiosErr.response?.status,
         message: axiosErr.message,
       });
+      throw new Error('Unable to verify payment tester status');
+    }
+  }
+
+  static async isPaymentTester(uid: string): Promise<boolean> {
+    if (!uid?.trim()) return false;
+    try {
+      return await this.getPaymentTesterStatus(uid);
+    } catch {
       return false;
     }
   }

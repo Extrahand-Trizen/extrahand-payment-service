@@ -8,6 +8,8 @@ import { getFeeStructure, listCategoryFeeConfigs, upsertCategoryFeeConfig } from
 import { usesCurrentPlatformCommissionPolicy } from '../utils/platformCommissionPolicy';
 
 type DateRange = { from?: Date; to?: Date };
+const overviewCache = new Map<string, { expiresAt: number; value: Awaited<ReturnType<typeof getDashboardOverviewUncached>> }>();
+const OVERVIEW_CACHE_TTL_MS = 30_000;
 
 function buildCreatedAtFilter(range: DateRange): { gte?: Date; lte?: Date } | undefined {
   const filter: { gte?: Date; lte?: Date } = {};
@@ -16,7 +18,7 @@ function buildCreatedAtFilter(range: DateRange): { gte?: Date; lte?: Date } | un
   return Object.keys(filter).length > 0 ? filter : undefined;
 }
 
-export async function getDashboardOverview(range: DateRange) {
+async function getDashboardOverviewUncached(range: DateRange) {
   const [overview] = await prisma.$queryRaw<Array<{
     gmv: Prisma.Decimal;
     totalPayins: bigint;
@@ -40,6 +42,7 @@ export async function getDashboardOverview(range: DateRange) {
       WHERE (b."from" IS NULL OR e."createdAt" >= b."from")
         AND (b."to" IS NULL OR e."createdAt" <= b."to")
         AND COALESCE(e.metadata->>'teamTest', 'false') <> 'true'
+        AND (e."taskId" IS NULL OR e."taskId" NOT LIKE 'booknow-pending-%')
     ),
     real_payouts AS MATERIALIZED (
       SELECT p.*
@@ -164,6 +167,19 @@ export async function getDashboardOverview(range: DateRange) {
     paymentSuccessRate: paymentTotal > 0 ? Number(((paymentSuccessCount / paymentTotal) * 100).toFixed(2)) : 0,
     payoutSuccessRate: payoutTotal > 0 ? Number(((payoutSuccessCount / payoutTotal) * 100).toFixed(2)) : 0,
   };
+}
+
+export async function getDashboardOverview(range: DateRange) {
+  const key = `${range.from?.toISOString() ?? 'all'}:${range.to?.toISOString() ?? 'all'}`;
+  const now = Date.now();
+  const cached = overviewCache.get(key);
+  if (cached && cached.expiresAt > now) {
+    return cached.value;
+  }
+
+  const value = await getDashboardOverviewUncached(range);
+  overviewCache.set(key, { expiresAt: now + OVERVIEW_CACHE_TTL_MS, value });
+  return value;
 }
 
 export async function getDashboardPayouts(params: {
@@ -318,57 +334,62 @@ export async function getDashboardLedger(params: {
   return { items: mappedItems, total };
 }
 
-export async function getDashboardAnomalies() {
+let anomalyCache: { expiresAt: number; value: Awaited<ReturnType<typeof getDashboardAnomaliesUncached>> } | null = null;
+
+async function getDashboardAnomaliesUncached() {
   const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
   const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
 
   const [failedPayoutsNoRetry, pendingJobQueuePayouts, escrowsHeldTooLong, paymentsWithoutEscrow] = await Promise.all([
-    prisma.payout.findMany({
+    prisma.payout.count({
       where: {
         status: 'failed',
         createdAt: { lte: oneDayAgo },
       },
-      orderBy: { createdAt: 'desc' },
-      take: 100,
     }),
-    prisma.jobQueue.findMany({
+    prisma.jobQueue.count({
       where: {
         jobType: 'task_completion_payout',
         status: { in: ['pending', 'processing'] },
       },
-      orderBy: { createdAt: 'desc' },
-      take: 100,
     }),
-    prisma.escrow.findMany({
+    prisma.escrow.count({
       where: {
         status: 'held',
         heldAt: { lte: sevenDaysAgo },
       },
-      orderBy: { heldAt: 'asc' },
-      take: 100,
     }),
-    prisma.ledger.findMany({
+    prisma.ledger.count({
       where: {
         type: 'payment',
         escrowId: null,
       },
-      orderBy: { createdAt: 'desc' },
-      take: 100,
     }),
   ]);
 
   return {
     counts: {
-      failedPayoutsNoRetry: failedPayoutsNoRetry.length,
-      pendingJobQueuePayouts: pendingJobQueuePayouts.length,
-      escrowsHeldTooLong: escrowsHeldTooLong.length,
-      paymentsWithoutEscrow: paymentsWithoutEscrow.length,
+      failedPayoutsNoRetry,
+      pendingJobQueuePayouts,
+      escrowsHeldTooLong,
+      paymentsWithoutEscrow,
     },
     failedPayoutsNoRetry,
     pendingJobQueuePayouts,
     escrowsHeldTooLong,
     paymentsWithoutEscrow,
   };
+}
+
+export async function getDashboardAnomalies() {
+  const now = Date.now();
+  if (anomalyCache && anomalyCache.expiresAt > now) {
+    return anomalyCache.value;
+  }
+
+  const value = await getDashboardAnomaliesUncached();
+  anomalyCache = { expiresAt: now + OVERVIEW_CACHE_TTL_MS, value };
+  return value;
 }
 
 export async function getDashboardTransactions(params: {

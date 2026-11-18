@@ -17,6 +17,7 @@ import {
   markWebhookProcessed,
 } from '../services/auditLogService';
 import { getWebhookSecret, type PaymentEnvironment } from '../config/paymentEnvironment';
+import { runWithPaymentEnvironment } from '../config/prisma';
 
 const router = express.Router();
 
@@ -52,13 +53,33 @@ function resolveWebhookEnvironment(payload: string, signature: string): PaymentE
   return null;
 }
 
+function bindWebhookDatabase(
+  req: express.Request,
+  _res: express.Response,
+  next: express.NextFunction,
+): void {
+  const signature = req.headers['x-razorpay-signature'] as string;
+  const rawBody = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : '';
+  const environment = resolveWebhookEnvironment(rawBody, signature);
+  if (!environment) {
+    next();
+    return;
+  }
+
+  void runWithPaymentEnvironment(environment, undefined, () => next(), true).catch(next);
+}
+
 /**
  * POST /api/v1/webhooks/razorpay
  * Handle Razorpay webhook events
  * 
  * Note: Webhooks need raw body for signature verification
  */
-router.post('/razorpay', express.raw({ type: 'application/json' }), async (req, res) => {
+router.post(
+  '/razorpay',
+  express.raw({ type: 'application/json' }),
+  bindWebhookDatabase,
+  async (req, res) => {
   let auditLogId: string | null = null;
   try {
     const signature = req.headers['x-razorpay-signature'] as string;
@@ -86,7 +107,8 @@ router.post('/razorpay', express.raw({ type: 'application/json' }), async (req, 
         logger.info('📥 Razorpay webhook already processed (idempotent)', {
           eventId,
           event: event.event,
-        });
+          },
+        );
         return res.status(200).json({ received: true, message: 'Already processed' });
       }
     }

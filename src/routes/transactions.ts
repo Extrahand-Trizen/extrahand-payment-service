@@ -8,6 +8,7 @@ import express from 'express';
 import { serviceAuthMiddleware } from '../middleware/serviceAuth';
 import { TransactionController } from '../controllers/TransactionController';
 import { asyncHandler } from '../middleware/errorHandler';
+import { withPaymentDatabaseForUser } from '../middleware/paymentDatabase';
 
 const router = express.Router();
 
@@ -25,20 +26,38 @@ router.post('/issue-grants', asyncHandler(TransactionController.issueGrants));
  * Get all transactions for a user
  * Query params: limit, offset, startDate, endDate, type, status, category
  */
-router.get('/:userId', asyncHandler(TransactionController.getUserTransactions));
+router.get(
+  '/:userId',
+  withPaymentDatabaseForUser(
+    asyncHandler(TransactionController.getUserTransactions),
+    (req) => req.params.userId,
+  ),
+);
 
 /**
  * GET /api/v1/transactions/:userId/wallet
  * Get ExtraCoins wallet details for a user
  */
-router.get('/:userId/wallet', asyncHandler(TransactionController.getExtraCoinsWallet));
+router.get(
+  '/:userId/wallet',
+  withPaymentDatabaseForUser(
+    asyncHandler(TransactionController.getExtraCoinsWallet),
+    (req) => req.params.userId,
+  ),
+);
 
 /**
  * GET /api/v1/transactions/:userId/summary
  * Get transaction summary for a user
  * Query params: startDate, endDate (ISO date strings)
  */
-router.get('/:userId/summary', asyncHandler(TransactionController.getTransactionSummary));
+router.get(
+  '/:userId/summary',
+  withPaymentDatabaseForUser(
+    asyncHandler(TransactionController.getTransactionSummary),
+    (req) => req.params.userId,
+  ),
+);
 
 export default router;
 

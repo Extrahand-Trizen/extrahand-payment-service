@@ -330,18 +330,25 @@ export async function notifyRefundStatusUpdated(params: {
   refundId: string;
   amount: string | number;
   taskId?: string | null;
-  status: 'completed' | 'failed';
+  status: 'initiated' | 'completed' | 'failed';
 }): Promise<void> {
   const { posterUid, refundId, amount, taskId, status } = params;
   const processed = status === 'completed';
-  const eventKey = processed ? 'REFUND_PROCESSED' : 'REFUND_FAILED';
+  const initiated = status === 'initiated';
+  const eventKey = initiated
+    ? 'REFUND_INITIATED'
+    : processed
+      ? 'REFUND_PROCESSED'
+      : 'REFUND_FAILED';
 
   await sendPush({
     userId: posterUid,
-    title: processed ? 'Refund processed' : 'Refund update',
-    body: processed
-      ? `Your refund of ₹${amount} has been processed.`
-      : `We couldn't process your refund of ₹${amount}. Please contact support if you need help.`,
+    title: initiated ? 'Refund initiated' : processed ? 'Refund processed' : 'Refund update',
+    body: initiated
+      ? `Your refund of ₹${amount} has been initiated.`
+      : processed
+        ? `Your refund of ₹${amount} has been processed.`
+        : `We couldn't process your refund of ₹${amount}. Please contact support if you need help.`,
     eventKey,
     skipWhatsApp: true,
     data: {

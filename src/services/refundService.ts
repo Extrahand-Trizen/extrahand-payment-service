@@ -1817,6 +1817,23 @@ export async function processBookNowLineItemRefund(params: {
       userId,
     });
 
+    void notifyRefundStatusUpdated({
+      posterUid: postgresEscrow.posterUid,
+      refundId,
+      amount: refundAmount.toString(),
+      taskId,
+      status: 'initiated',
+    });
+    if (internalRefundStatus === 'completed') {
+      void notifyRefundStatusUpdated({
+        posterUid: postgresEscrow.posterUid,
+        refundId,
+        amount: refundAmount.toString(),
+        taskId,
+        status: 'completed',
+      });
+    }
+
     return {
       success: true,
       refund: {
@@ -1837,7 +1854,15 @@ export async function processBookNowLineItemRefund(params: {
 }
 
 type RazorpayRefundWebhookPayload = {
-  refund?: { entity?: { id?: string; status?: string; payment_id?: string } };
+  refund?: {
+    entity?: {
+      id?: string;
+      status?: string;
+      payment_id?: string;
+      amount?: number;
+      notes?: Record<string, unknown>;
+    };
+  };
   payment?: { entity?: { id?: string; amount?: number; amount_refunded?: number; status?: string } };
   eventCreatedAt?: number | string;
 };
@@ -1848,11 +1873,6 @@ type RazorpayRefundWebhookPayload = {
 export async function completeRefundFromRazorpayWebhook(
   payload: RazorpayRefundWebhookPayload,
 ): Promise<void> {
-  if (!isPostgresConnected()) {
-    logger.warn('Refund webhook skipped — Postgres not connected');
-    return;
-  }
-
   const refundEntity = payload?.refund?.entity;
   const paymentEntity = payload?.payment?.entity;
   const razorpayRefundId = refundEntity?.id;
@@ -1864,6 +1884,12 @@ export async function completeRefundFromRazorpayWebhook(
     return;
   }
 
+  await syncExtraMartRefundFromRazorpayWebhook(refundEntity);
+  if (!isPostgresConnected()) {
+    logger.warn('Refund webhook skipped — Postgres not connected');
+    return;
+  }
+
   await updateRefundRecordFromRazorpayWebhook(
     razorpayRefundId,
     refundEntity,
@@ -1872,6 +1898,41 @@ export async function completeRefundFromRazorpayWebhook(
   const razorpayStatus = String(refundEntity?.status || '').trim().toLowerCase();
   if (razorpayStatus && !['processed', 'completed', 'success'].includes(razorpayStatus)) return;
   await syncRecurringEscrowAfterRefundWebhook(razorpayRefundId, paymentEntity, refundEntity?.payment_id);
+}
+
+async function syncExtraMartRefundFromRazorpayWebhook(
+  refundEntity: NonNullable<RazorpayRefundWebhookPayload['refund']>['entity'],
+): Promise<void> {
+  const notes = refundEntity?.notes;
+  if (notes?.source !== 'extramart') return;
+
+  const baseUrl = process.env.QCOMMERCE_SERVICE_URL?.trim().replace(/\/$/, '');
+  const serviceAuth = process.env.SERVICE_AUTH_TOKEN?.trim();
+  const orderNumber = typeof notes.orderNumber === 'string' ? notes.orderNumber.trim() : '';
+  const razorpayRefundId = String(refundEntity?.id || '').trim();
+  if (!baseUrl || !serviceAuth || !orderNumber || !razorpayRefundId) {
+    throw new Error('ExtraMart refund webhook sync is missing service configuration or refund identifiers');
+  }
+
+  const response = await fetch(`${baseUrl}/api/v1/internal/refunds/razorpay-status`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Service-Auth': serviceAuth,
+      'X-Service-Name': 'payment-service',
+    },
+    body: JSON.stringify({
+      orderNumber,
+      razorpayRefundId,
+      providerStatus: refundEntity?.status || '',
+      reason: typeof notes.reason === 'string' ? notes.reason : '',
+      amountPaise: refundEntity?.amount,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`ExtraMart refund webhook sync failed (HTTP ${response.status})`);
+  }
 }
 
 async function syncRecurringEscrowAfterRefundWebhook(

@@ -45,6 +45,7 @@ const envSchema = z.object({
   SERVICE_AUTH_TOKEN: z.string().min(1, 'SERVICE_AUTH_TOKEN is required').optional(),
 
   TASK_SERVICE_URL: z.string().url(),
+  QCOMMERCE_SERVICE_URL: z.string().url().optional(),
   USER_SERVICE_URL: z.string().url().default(
     process.env.NODE_ENV === 'production'
       ? 'http://srv-captain--extrahand-user-service:4001'

@@ -358,6 +358,7 @@ export class PaymentController {
       razorpay_payment_id,
       amount,
       amountPaise,
+      notes: rawNotes,
     } = req.body;
     const paymentId = rawPaymentId || razorpay_payment_id;
 
@@ -381,12 +382,26 @@ export class PaymentController {
         : amount != null && amount !== ''
         ? Math.round(Number(amount) * 100)
         : null;
+    const refundNotes: Record<string, string> = {};
+    if (rawNotes && typeof rawNotes === 'object' && !Array.isArray(rawNotes)) {
+      for (const key of ['source', 'orderNumber', 'reason']) {
+        const value = rawNotes[key];
+        if (typeof value === 'string' && value.trim()) {
+          refundNotes[key] = value.trim().slice(0, 255);
+        }
+      }
+    }
     const paymentEnvironment = await resolvePaymentEnvironmentForPayment(paymentId);
     const outcome = await issueDirectRefund(
       String(paymentId),
       () =>
         amountPaise != null
-          ? createRefundAmountPaise(paymentId, Number(amountPaise), paymentEnvironment)
+          ? createRefundAmountPaise(
+              paymentId,
+              Number(amountPaise),
+              paymentEnvironment,
+              Object.keys(refundNotes).length > 0 ? refundNotes : undefined,
+            )
           : createRefund(paymentId, amount, paymentEnvironment),
       { requestedPaise },
     );

@@ -703,6 +703,7 @@ export const createRefundAmountPaise = async (
   paymentId: string,
   amountInPaise: number,
   paymentEnvironment: PaymentEnvironment = 'live',
+  notes?: Record<string, string>,
 ) => {
   try {
     const razorpay = getPaymentClient(paymentEnvironment);
@@ -710,7 +711,10 @@ export const createRefundAmountPaise = async (
     if (!Number.isFinite(paise) || paise <= 0) {
       return { success: false as const, error: 'Invalid refund amount (paise)' };
     }
-    const refund = await razorpay.payments.refund(paymentId, { amount: paise });
+    const refund = await razorpay.payments.refund(paymentId, {
+      amount: paise,
+      ...(notes ? { notes } : {}),
+    });
     logger.info('Refund created (paise)', { refundId: refund.id, paymentId, amountPaise: paise });
     return { success: true as const, refund };
   } catch (error: any) {

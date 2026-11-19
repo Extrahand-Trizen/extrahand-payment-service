@@ -65,11 +65,15 @@ export class UserServiceClient {
       const reason = status
         ? `User service returned HTTP ${status}`
         : `Could not connect to user service (${axiosErr.code || axiosErr.message})`;
-      throw new Error(`Unable to verify payment testing status: ${reason}. Payment was not started.`);
+      throw new Error(
+        `Unable to verify payment testing status: ${reason}. Payment was not started.`,
+      );
     }
 
     if (response.data?.success !== true || !response.data?.profile) {
-      throw new Error('User service returned an invalid payment testing status. Payment was not started.');
+      throw new Error(
+        'User service returned an invalid payment testing status. Payment was not started.',
+      );
     }
     return response.data.profile.isPaymentTester === true;
   }
@@ -78,11 +82,7 @@ export class UserServiceClient {
     if (!uid?.trim()) return false;
     try {
       return await this.getPaymentTesterStatus(uid);
-    } catch (err) {
-      logger.warn('[UserServiceClient] payment tester lookup failed; treating as non-tester for payout lookup', {
-        uid,
-        message: err instanceof Error ? err.message : String(err),
-      });
+    } catch {
       return false;
     }
   }

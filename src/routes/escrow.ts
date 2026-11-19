@@ -2,6 +2,11 @@ import express from 'express';
 import { serviceAuthMiddleware } from '../middleware/serviceAuth';
 import { EscrowController } from '../controllers/EscrowController';
 import { asyncHandler } from '../middleware/errorHandler';
+import {
+  requestUserId,
+  withPaymentDatabaseForExistingPayment,
+  withPaymentDatabaseForUser,
+} from '../middleware/paymentDatabase';
 
 const router = express.Router();
 
@@ -12,26 +17,44 @@ router.use(serviceAuthMiddleware);
  * POST /api/v1/escrow/create
  * Create escrow when offer is accepted
  */
-router.post('/create', asyncHandler(EscrowController.createEscrow));
+router.post(
+  '/create',
+  withPaymentDatabaseForUser(asyncHandler(EscrowController.createEscrow), requestUserId),
+);
 
-router.post('/create-booking', asyncHandler(EscrowController.createBookingEscrow));
+router.post(
+  '/create-booking',
+  withPaymentDatabaseForUser(asyncHandler(EscrowController.createBookingEscrow), requestUserId),
+);
 
-router.patch('/:escrowId/attach-performer', asyncHandler(EscrowController.attachPerformer));
+router.patch(
+  '/:escrowId/attach-performer',
+  withPaymentDatabaseForExistingPayment(asyncHandler(EscrowController.attachPerformer)),
+);
 
-router.patch('/:escrowId/reset-performer', asyncHandler(EscrowController.resetPerformer));
+router.patch(
+  '/:escrowId/reset-performer',
+  withPaymentDatabaseForExistingPayment(asyncHandler(EscrowController.resetPerformer)),
+);
 
 router.patch(
   '/:escrowId/reassign-recurring-visit',
-  asyncHandler(EscrowController.reassignRecurringVisit),
+  withPaymentDatabaseForExistingPayment(asyncHandler(EscrowController.reassignRecurringVisit)),
 );
 
-router.patch('/:escrowId/link-task', asyncHandler(EscrowController.linkTask));
+router.patch(
+  '/:escrowId/link-task',
+  withPaymentDatabaseForExistingPayment(asyncHandler(EscrowController.linkTask)),
+);
 
 /**
  * GET /api/v1/escrow/status/:escrowId
  * Get escrow status by escrow ID
  */
-router.get('/status/:escrowId', asyncHandler(EscrowController.getEscrowStatus));
+router.get(
+  '/status/:escrowId',
+  withPaymentDatabaseForExistingPayment(asyncHandler(EscrowController.getEscrowStatus)),
+);
 
 /**
  * GET /api/v1/escrow/booking-order/:bookingOrderId
@@ -39,7 +62,7 @@ router.get('/status/:escrowId', asyncHandler(EscrowController.getEscrowStatus));
  */
 router.get(
   '/booking-order/:bookingOrderId',
-  asyncHandler(EscrowController.getEscrowByBookingOrderId),
+  withPaymentDatabaseForExistingPayment(asyncHandler(EscrowController.getEscrowByBookingOrderId)),
 );
 
 /**
@@ -48,20 +71,26 @@ router.get(
  */
 router.get(
   '/task/:taskId/deletion-safety',
-  asyncHandler(EscrowController.getTaskDeletionSafety),
+  withPaymentDatabaseForExistingPayment(asyncHandler(EscrowController.getTaskDeletionSafety)),
 );
 
 /**
  * GET /api/v1/escrow/task/:taskId
  * Get escrow by task ID
  */
-router.get('/task/:taskId', asyncHandler(EscrowController.getEscrowByTaskId));
+router.get(
+  '/task/:taskId',
+  withPaymentDatabaseForExistingPayment(asyncHandler(EscrowController.getEscrowByTaskId)),
+);
 
 /**
  * GET /api/v1/escrow/booking-order/:bookingOrderId
  * Get escrow by booking order ID
  */
-router.get('/booking-order/:bookingOrderId', asyncHandler(EscrowController.getEscrowByBookingOrderId));
+router.get(
+  '/booking-order/:bookingOrderId',
+  withPaymentDatabaseForExistingPayment(asyncHandler(EscrowController.getEscrowByBookingOrderId)),
+);
 
 /**
  * Escrow release and auto-release disabled - handled elsewhere

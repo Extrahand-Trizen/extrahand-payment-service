@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
-import { prisma, prismaDev } from '../config/prisma';
+import { getPrismaClientForEnvironment, prisma, prismaDev } from '../config/prisma';
+import { type PaymentDatabaseEnvironment } from '../config/env';
 import { getRefundWebhookEvents } from '../services/paymentTimelineService';
 import { applyPayoutStatusToProfile } from '../services/userPaymentProfileService';
 import { notifyPayoutCompleted } from '../services/paymentNotificationService';
@@ -327,7 +328,7 @@ export class AdminFinanceController {
       where.status = holdStatus;
     }
 
-    // NOTE: transactionType filter (real/team) is applied in JS after merging both DBs
+    // NOTE: transactionType filter (real/team) is applied in JS
     // to avoid Prisma JSONB NOT null-propagation bug that drops rows with null/missing teamTest.
 
     if (startDate || endDate) {
@@ -359,13 +360,13 @@ export class AdminFinanceController {
     let allRows: any[] = [];
     let total = 0;
 
-    // Determine which DB to use based on the explicit 'environment' query param.
-    // 'production' (default) → prisma (ep-solitary-frost)
-    // 'development'          → prismaDev (ep-solitary-violet)
-    // Never fetch from both simultaneously.
-    const environment = typeof req.query.environment === 'string' ? req.query.environment : 'production';
-    const useDevDb = environment === 'development' && prismaDev != null;
-    const targetPrisma = useDevDb ? prismaDev! : prisma;
+    const requestedEnvironment =
+      typeof req.query.environment === 'string' ? req.query.environment : 'production';
+    if (requestedEnvironment !== 'production' && requestedEnvironment !== 'development') {
+      throw new BadRequestError('environment must be production or development');
+    }
+    const environment: PaymentDatabaseEnvironment = requestedEnvironment;
+    const targetPrisma = await getPrismaClientForEnvironment(environment);
 
     // Search both escrow-backed and standalone payment records before applying pagination.
     const fetchLimit = search ? offset + limit : limit;
@@ -386,20 +387,6 @@ export class AdminFinanceController {
 
     if (search) {
       standaloneTransactions = await queryStandaloneTransactions(targetPrisma);
-    }
-
-    // If neither transaction store has a match in production, check the development database.
-    if (raw.length === 0 && standaloneTransactions.length === 0 && search && !useDevDb && prismaDev) {
-      try {
-        const devRaw: any[] = await prismaDev.$queryRawUnsafe(query.sql, ...query.params);
-        const devStandaloneTransactions: any[] = await queryStandaloneTransactions(prismaDev);
-        if (devRaw.length > 0 || devStandaloneTransactions.length > 0) {
-          raw = devRaw;
-          standaloneTransactions = devStandaloneTransactions;
-        }
-      } catch (err: any) {
-        logger.warn('Failed fallback transaction search on secondary DB:', { message: err?.message });
-      }
     }
 
     total =
@@ -448,7 +435,7 @@ export class AdminFinanceController {
     let payoutByEscrowId = new Map<string, any>();
     if (allRows.length > 0) {
       const escrowDbIds = allRows.map((r: any) => r.id);
-      const payouts = await prisma.payout.findMany({
+      const payouts = await targetPrisma.payout.findMany({
         where: { escrowId: { in: escrowDbIds } },
         select: {
           escrowId: true,

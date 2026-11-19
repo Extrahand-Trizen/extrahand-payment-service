@@ -163,6 +163,31 @@ export function validateEnv() {
   }
 }
 
+export type PaymentDatabaseEnvironment = 'production' | 'development';
+
+export function getPostgresUriForEnvironment(
+  environment: PaymentDatabaseEnvironment,
+  config: Pick<
+    ReturnType<typeof validateEnv>,
+    'USE_DEV_POSTGRES' | 'POSTGRESDB_URI' | 'PROD_POSTGRESDB_URI' | 'DEV_POSTGRESDB_URI'
+  >,
+): string {
+  const uri =
+    environment === 'development'
+      ? config.DEV_POSTGRESDB_URI
+      : config.PROD_POSTGRESDB_URI || (!config.USE_DEV_POSTGRES ? config.POSTGRESDB_URI : undefined);
+
+  if (!uri) {
+    throw new Error(
+      environment === 'development'
+        ? 'DEV_POSTGRESDB_URI is required to fetch development payment transactions'
+        : 'PROD_POSTGRESDB_URI is required to fetch production payment transactions',
+    );
+  }
+
+  return uri;
+}
+
 export function getCorsConfig(env: z.infer<typeof envSchema>) {
   const allowedOrigins = [
     'https://extrahand.in',

@@ -1,6 +1,7 @@
 import Razorpay from 'razorpay';
 import { validateEnv } from './env';
 import { UserServiceClient } from '../clients/UserServiceClient';
+import { getCurrentPaymentEnvironment } from './prisma';
 
 export type PaymentEnvironment = 'live' | 'test';
 
@@ -33,12 +34,21 @@ export const paymentKeys: Record<PaymentEnvironment, string> = {
 export async function resolvePaymentEnvironment(uid?: string | null): Promise<PaymentEnvironment> {
   const normalizedUid = uid?.trim();
   const uidPresent = !!normalizedUid;
-  const isTester = uidPresent
-    ? await UserServiceClient.getPaymentTesterStatus(normalizedUid)
-    : true;
 
+  const contextEnvironment = getCurrentPaymentEnvironment(normalizedUid);
+  if (contextEnvironment) return contextEnvironment;
+
+  if (!uidPresent) {
+    if (!testKeyId || !testKeySecret) return 'live';
+    console.log('[PAYMENT DEBUG] UID missing, defaulting to test environment');
+    return 'test';
+  }
+
+  const isTester = await UserServiceClient.getPaymentTesterStatus(normalizedUid);
   if (isTester && (!testKeyId || !testKeySecret)) {
-    throw new Error('Payment test mode is enabled, but Razorpay test credentials are not configured. Payment was not started.');
+    throw new Error(
+      'Payment test mode is enabled, but Razorpay test credentials are not configured. Payment was not started.',
+    );
   }
 
   const environment: PaymentEnvironment = isTester ? 'test' : 'live';

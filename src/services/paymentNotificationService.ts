@@ -10,6 +10,7 @@ interface BasePayload {
   body: string;
   eventKey: string;
   data?: Record<string, unknown>;
+  skipWhatsApp?: boolean;
 }
 
 function notificationServiceBaseUrl(): string {
@@ -50,6 +51,7 @@ async function sendPush(payload: BasePayload): Promise<void> {
           type: 'payment',
           id: String(payload.data?.taskId || payload.data?.escrowId || payload.eventKey),
         },
+        skipWhatsApp: payload.skipWhatsApp === true,
       },
       {
         headers: serviceAuthHeaders(),
@@ -317,6 +319,36 @@ export async function notifyRefundProcessed(params: {
       amount,
       reason,
       eventKey: 'REFUND_PROCESSED',
+      entityType: 'refund',
+      category: 'payments',
+    },
+  });
+}
+
+export async function notifyRefundStatusUpdated(params: {
+  posterUid: string;
+  refundId: string;
+  amount: string | number;
+  taskId?: string | null;
+  status: 'completed' | 'failed';
+}): Promise<void> {
+  const { posterUid, refundId, amount, taskId, status } = params;
+  const processed = status === 'completed';
+  const eventKey = processed ? 'REFUND_PROCESSED' : 'REFUND_FAILED';
+
+  await sendPush({
+    userId: posterUid,
+    title: processed ? 'Refund processed' : 'Refund update',
+    body: processed
+      ? `Your refund of ₹${amount} has been processed.`
+      : `We couldn't process your refund of ₹${amount}. Please contact support if you need help.`,
+    eventKey,
+    skipWhatsApp: true,
+    data: {
+      taskId,
+      refundId,
+      status,
+      eventKey,
       entityType: 'refund',
       category: 'payments',
     },

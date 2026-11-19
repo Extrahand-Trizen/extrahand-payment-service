@@ -13,7 +13,10 @@ import { Prisma } from '@prisma/client';
 import mongoose from 'mongoose';
 import { createRefundAmountPaise, getPaymentDetails, resolvePaymentEnvironmentForPayment } from './paymentService';
 import { sanitizeRazorpayRefundData } from '../utils/paymentSanitizer';
-import { notifyRefundInitiated } from './paymentNotificationService';
+import {
+  notifyRefundInitiated,
+  notifyRefundStatusUpdated,
+} from './paymentNotificationService';
 import { getPaymentClient } from '../config/paymentEnvironment';
 import { ConflictError } from '../errors/AppError';
 import { taskHoldsRecurringVisitEscrows } from './recurringVisitPayoutScope';
@@ -1903,17 +1906,49 @@ async function updateRefundRecordFromRazorpayWebhook(
       ? new Date(eventTimestamp * 1000)
       : new Date();
 
-  if (razorpayStatus === 'failed') {
-    await prisma.refund.updateMany({
+  const notificationDetails = async () =>
+    prisma.refund.findUnique({
       where: { razorpayRefundId },
-      data: {
-        status: 'failed',
-        providerStatus: razorpayStatus,
-        errorMessage: 'Razorpay reported refund failure',
-        updatedAt: providerStatusUpdatedAt,
+      select: {
+        refundId: true,
+        refundAmount: true,
+        taskId: true,
+        escrow: { select: { posterUid: true } },
       },
     });
-    logger.info('Refund marked failed from Razorpay webhook', { razorpayRefundId });
+
+  if (razorpayStatus === 'failed') {
+    const refund = await notificationDetails();
+    const data = {
+      status: 'failed',
+      providerStatus: razorpayStatus,
+      errorMessage: 'Razorpay reported refund failure',
+      updatedAt: providerStatusUpdatedAt,
+    };
+    const result = await prisma.refund.updateMany({
+      where: { razorpayRefundId, status: { not: 'failed' } },
+      data,
+    });
+    if (result.count > 0) {
+      logger.info('Refund marked failed from Razorpay webhook', { razorpayRefundId });
+      if (refund?.escrow?.posterUid) {
+        await notifyRefundStatusUpdated({
+          posterUid: refund.escrow.posterUid,
+          refundId: refund.refundId,
+          amount: refund.refundAmount.toString(),
+          taskId: refund.taskId,
+          status: 'failed',
+        });
+      }
+    } else {
+      await prisma.refund.updateMany({
+        where: { razorpayRefundId, status: 'failed' },
+        data,
+      });
+      if (!refund) {
+        logger.warn('Refund webhook for unknown razorpayRefundId', { razorpayRefundId });
+      }
+    }
     return;
   }
 
@@ -1937,27 +1972,41 @@ async function updateRefundRecordFromRazorpayWebhook(
     return;
   }
 
+  const refund = await notificationDetails();
+  const data = {
+    status: 'completed',
+    providerStatus: razorpayStatus,
+    completedAt: providerStatusUpdatedAt,
+    providerProcessedAt: providerStatusUpdatedAt,
+    updatedAt: providerStatusUpdatedAt,
+  };
   const result = await prisma.refund.updateMany({
     where: {
       razorpayRefundId,
-      status: { in: ['pending', 'processing', 'completed'] },
+      status: { in: ['pending', 'processing'] },
     },
-    data: {
-      status: 'completed',
-      providerStatus: razorpayStatus,
-      completedAt: providerStatusUpdatedAt,
-      providerProcessedAt: providerStatusUpdatedAt,
-      updatedAt: providerStatusUpdatedAt,
-    },
+    data,
   });
 
   if (result.count > 0) {
     logger.info('Refund marked completed from Razorpay webhook', { razorpayRefundId });
+    if (refund?.escrow?.posterUid) {
+      await notifyRefundStatusUpdated({
+        posterUid: refund.escrow.posterUid,
+        refundId: refund.refundId,
+        amount: refund.refundAmount.toString(),
+        taskId: refund.taskId,
+        status: 'completed',
+      });
+    }
     return;
   }
 
-  const existing = await prisma.refund.findUnique({ where: { razorpayRefundId } });
-  if (!existing) {
+  await prisma.refund.updateMany({
+    where: { razorpayRefundId, status: 'completed' },
+    data,
+  });
+  if (!refund) {
     logger.warn('Refund webhook for unknown razorpayRefundId', { razorpayRefundId });
   }
 }

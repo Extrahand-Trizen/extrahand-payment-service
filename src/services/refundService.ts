@@ -611,7 +611,7 @@ async function processRefundUnlocked(params: {
           const client = getPaymentClient(paymentEnv);
           const payment = await client.payments.fetch(razorpayPaymentId);
           if (payment && (Number(payment.amount_refunded) > 0 || payment.status === 'refunded')) {
-            const refundsResponse: any = await client.payments.fetchRefunds(razorpayPaymentId);
+            const refundsResponse: any = await (client.payments as any).fetchRefunds(razorpayPaymentId);
             const rzpRefunds = refundsResponse?.items || [];
             if (rzpRefunds.length > 0) {
               razorpayRefund = rzpRefunds[0];
@@ -674,6 +674,7 @@ async function processRefundUnlocked(params: {
 
     // Use transaction to ensure data consistency - ALL operations atomic
     let postgresRefund: any = null;
+    let providerProcessedAt: Date | undefined;
 
     try {
       if (isPostgresConnected()) {
@@ -853,7 +854,7 @@ async function processRefundUnlocked(params: {
           }
 
           const internalRefundStatus = getInternalRefundStatus(razorpayRefund.status);
-          const providerProcessedAt =
+          providerProcessedAt =
             internalRefundStatus === 'completed' ? new Date() : undefined;
           await tx.refund.update({
             where: { id: postgresRefund.id },
@@ -2174,6 +2175,7 @@ async function syncMongoTaskRefundStatus(
   if (mongoose.connection.readyState !== 1) return;
   try {
     const db = mongoose.connection.db;
+    if (!db) return;
     const at = refundedAt || new Date();
     if (taskId) {
       const taskQuery: any = {

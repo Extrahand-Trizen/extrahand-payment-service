@@ -53,13 +53,30 @@ function resolveWebhookEnvironment(payload: string, signature: string): PaymentE
   return null;
 }
 
+function getRawWebhookBody(req: express.Request): string {
+  if (Buffer.isBuffer(req.body)) {
+    return req.body.toString('utf8');
+  }
+  const customRaw = (req as any).rawBody;
+  if (Buffer.isBuffer(customRaw)) {
+    return customRaw.toString('utf8');
+  }
+  if (typeof customRaw === 'string') {
+    return customRaw;
+  }
+  if (typeof req.body === 'string') {
+    return req.body;
+  }
+  return '';
+}
+
 function bindWebhookDatabase(
   req: express.Request,
   _res: express.Response,
   next: express.NextFunction,
 ): void {
   const signature = req.headers['x-razorpay-signature'] as string;
-  const rawBody = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : '';
+  const rawBody = getRawWebhookBody(req);
   const environment = resolveWebhookEnvironment(rawBody, signature);
   if (!environment) {
     next();
@@ -89,7 +106,7 @@ router.post(
       return res.status(400).json({ error: 'Missing signature' });
     }
 
-    const rawBody = req.body.toString('utf8');
+    const rawBody = getRawWebhookBody(req);
     const webhookEnvironment = resolveWebhookEnvironment(rawBody, signature);
     if (!webhookEnvironment) {
       logger.warn('⚠️ WEBHOOK_SECRET not configured - webhook verification disabled');
@@ -97,7 +114,14 @@ router.post(
     }
 
     // Parse JSON body
-    const event = JSON.parse(rawBody);
+    let event: any;
+    if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) {
+      event = req.body;
+    } else if (rawBody) {
+      event = JSON.parse(rawBody);
+    } else {
+      return res.status(400).json({ error: 'Empty webhook payload' });
+    }
     const eventId = typeof event.id === 'string' ? event.id : '';
     const eventType = typeof event.event === 'string' ? event.event : '';
     if (!eventId || !eventType) {

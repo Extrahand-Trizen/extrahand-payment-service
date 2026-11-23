@@ -72,7 +72,8 @@ export class DashboardController {
     const to = parseDate(req.query.to, 'to');
     const status = typeof req.query.status === 'string' ? req.query.status : undefined;
     const cancelledBy = typeof req.query.cancelledBy === 'string' ? req.query.cancelledBy : undefined;
-    const taskId = typeof req.query.taskId === 'string' ? req.query.taskId : undefined;
+    const q = typeof req.query.q === 'string' && req.query.q.trim() ? req.query.q.trim() : undefined;
+    const taskId = typeof req.query.taskId === 'string' && req.query.taskId.trim() ? req.query.taskId.trim() : q;
 
     const result = await getDashboardRefunds({
       limit,
@@ -82,6 +83,7 @@ export class DashboardController {
       status,
       cancelledBy,
       taskId,
+      q,
     });
 
     res.json({ success: true, ...result, limit, offset });

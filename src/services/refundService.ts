@@ -591,26 +591,58 @@ async function processRefundUnlocked(params: {
         cancelledBy,
       });
 
+      const paymentEnv = await resolvePaymentEnvironmentForPayment(razorpayPaymentId, razorpayOrderId);
       const razorpayRefundResult = await createRefundAmountPaise(
         razorpayPaymentId,
         refundAmountInPaise,
-        await resolvePaymentEnvironmentForPayment(razorpayPaymentId, razorpayOrderId),
+        paymentEnv,
       );
 
       if (!razorpayRefundResult.success || !razorpayRefundResult.refund) {
-        logger.error('❌ Failed to create Razorpay refund:', {
+        logger.warn('Failed to create Razorpay refund, checking if already refunded in Razorpay:', {
           razorpayOrderId,
           razorpayPaymentId,
           refundAmountInPaise,
           error: razorpayRefundResult.error,
         });
-        return {
-          success: false,
-          error: razorpayRefundResult.error || 'Failed to create Razorpay refund',
-        };
-      }
 
-      razorpayRefund = razorpayRefundResult.refund;
+        // Check if the payment was already refunded in Razorpay directly
+        try {
+          const client = getPaymentClient(paymentEnv);
+          const payment = await client.payments.fetch(razorpayPaymentId);
+          if (payment && (Number(payment.amount_refunded) > 0 || payment.status === 'refunded')) {
+            const refundsResponse: any = await client.payments.fetchRefunds(razorpayPaymentId);
+            const rzpRefunds = refundsResponse?.items || [];
+            if (rzpRefunds.length > 0) {
+              razorpayRefund = rzpRefunds[0];
+              logger.info('✅ Payment was already refunded in Razorpay, syncing existing refund:', {
+                razorpayOrderId,
+                razorpayPaymentId,
+                razorpayRefundId: razorpayRefund.id,
+                amount: razorpayRefund.amount,
+                status: razorpayRefund.status,
+              });
+            }
+          }
+        } catch (fetchErr: any) {
+          logger.warn('Failed to inspect existing Razorpay refunds on error:', fetchErr?.message);
+        }
+
+        if (!razorpayRefund) {
+          logger.error('❌ Failed to create Razorpay refund:', {
+            razorpayOrderId,
+            razorpayPaymentId,
+            refundAmountInPaise,
+            error: razorpayRefundResult.error,
+          });
+          return {
+            success: false,
+            error: razorpayRefundResult.error || 'Failed to create Razorpay refund',
+          };
+        }
+      } else {
+        razorpayRefund = razorpayRefundResult.refund;
+      }
       logger.info('[RefundService.processRefund] Razorpay refund API success', {
         razorpayOrderId,
         razorpayPaymentId,
@@ -866,6 +898,8 @@ async function processRefundUnlocked(params: {
           });
         }
       }
+
+      await syncMongoTaskRefundStatus(escrow.taskId, razorpayPaymentId, razorpayOrderId, providerProcessedAt);
 
       // Escrow already updated in Postgres above (line ~180)
 
@@ -2068,6 +2102,120 @@ async function updateRefundRecordFromRazorpayWebhook(
     data,
   });
   if (!refund) {
+    const paymentId = refundEntity?.payment_id;
+    if (paymentId) {
+      try {
+        const escrow = await prisma.escrow.findFirst({
+          where: { razorpayPaymentId: paymentId },
+        });
+        if (escrow) {
+          const refundAmountRupees = new Prisma.Decimal(
+            (Number(refundEntity?.amount || escrow.amount) / 100).toFixed(2),
+          );
+          const internalStatus = getInternalRefundStatus(razorpayStatus);
+          const newRefundId = `refund_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+          await prisma.refund.create({
+            data: {
+              refundId: newRefundId,
+              taskId: escrow.taskId,
+              escrowId: escrow.id,
+              paymentId,
+              razorpayRefundId,
+              refundAmount: refundAmountRupees,
+              status: internalStatus,
+              providerStatus: razorpayStatus || null,
+              reason: (refundEntity?.notes as any)?.reason || 'Refund processed directly via Razorpay',
+              cancelledBy: 'performer',
+              completedAt: providerStatusUpdatedAt,
+              providerProcessedAt: providerStatusUpdatedAt,
+              createdAt: providerStatusUpdatedAt,
+            },
+          });
+
+          await prisma.escrow.update({
+            where: { id: escrow.id },
+            data: {
+              status: 'refunded',
+              refundedAt: providerStatusUpdatedAt,
+            },
+          });
+
+          await prisma.transaction.updateMany({
+            where: { razorpayPaymentId: paymentId },
+            data: {
+              status: 'refunded',
+            },
+          });
+
+          await syncMongoTaskRefundStatus(escrow.taskId, paymentId, escrow.razorpayOrderId, providerStatusUpdatedAt);
+
+          logger.info('✅ Auto-created ExtraHand refund from Razorpay webhook for out-of-band refund', {
+            razorpayRefundId,
+            paymentId,
+            taskId: escrow.taskId,
+            refundId: newRefundId,
+          });
+          return;
+        }
+      } catch (autoCreateErr: any) {
+        logger.error('Failed to auto-create refund from webhook for out-of-band refund:', autoCreateErr);
+      }
+    }
     logger.warn('Refund webhook for unknown razorpayRefundId', { razorpayRefundId });
+  }
+}
+
+async function syncMongoTaskRefundStatus(
+  taskId?: string | null,
+  paymentId?: string | null,
+  orderId?: string | null,
+  refundedAt?: Date,
+): Promise<void> {
+  if (mongoose.connection.readyState !== 1) return;
+  try {
+    const db = mongoose.connection.db;
+    const at = refundedAt || new Date();
+    if (taskId) {
+      const taskQuery: any = {
+        $or: [
+          { taskId },
+          ...(mongoose.isValidObjectId(taskId) ? [{ _id: new mongoose.Types.ObjectId(taskId) }] : []),
+        ],
+      };
+      await db.collection('tasks').updateOne(taskQuery, {
+        $set: {
+          escrowStatus: 'refunded',
+          paymentStatus: 'refunded',
+          isRefunded: true,
+          refundedAt: at,
+        },
+      });
+      await db.collection('bookingorders').updateMany(taskQuery, {
+        $set: {
+          status: 'refunded',
+          paymentStatus: 'refunded',
+        },
+      });
+    }
+    if (paymentId || orderId) {
+      const orderQuery: any = {
+        $or: [
+          ...(paymentId ? [{ razorpayPaymentId: paymentId }] : []),
+          ...(orderId ? [{ razorpayOrderId: orderId }] : []),
+        ],
+      };
+      await db.collection('bookingorders').updateMany(orderQuery, {
+        $set: {
+          status: 'refunded',
+          paymentStatus: 'refunded',
+        },
+      });
+    }
+  } catch (err: any) {
+    logger.warn('Failed to sync Mongo task refund status:', {
+      taskId,
+      paymentId,
+      error: err?.message || String(err),
+    });
   }
 }

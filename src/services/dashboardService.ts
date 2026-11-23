@@ -216,16 +216,28 @@ export async function getDashboardRefunds(params: {
   status?: string;
   cancelledBy?: string;
   taskId?: string;
+  q?: string;
   from?: Date;
   to?: Date;
   limit: number;
   offset: number;
 }) {
   const createdAt = buildCreatedAtFilter({ from: params.from, to: params.to });
+  const searchTerm = (params.q || params.taskId || '').trim();
   const where: any = {
     ...(params.status ? { status: params.status } : {}),
     ...(params.cancelledBy ? { cancelledBy: params.cancelledBy } : {}),
-    ...(params.taskId ? { escrow: { taskId: params.taskId } } : {}),
+    ...(searchTerm
+      ? {
+          OR: [
+            { taskId: { contains: searchTerm, mode: 'insensitive' } },
+            { escrow: { taskId: { contains: searchTerm, mode: 'insensitive' } } },
+            { refundId: { contains: searchTerm, mode: 'insensitive' } },
+            { razorpayRefundId: { contains: searchTerm, mode: 'insensitive' } },
+            { paymentId: { contains: searchTerm, mode: 'insensitive' } },
+          ],
+        }
+      : {}),
     ...(createdAt ? { createdAt } : {}),
   };
 

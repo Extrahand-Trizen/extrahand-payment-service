@@ -132,6 +132,7 @@ export async function notifyPaymentReceived(params: {
       eventKey: 'PAYMENT_RECEIVED',
       entityType: 'payment',
       category: 'payments',
+      recipientRole: 'customer',
     },
   });
 
@@ -171,6 +172,7 @@ export async function notifyPayoutCompleted(params: {
       eventKey: 'PAYOUT_COMPLETED',
       entityType: 'payout',
       category: 'payments',
+      recipientRole: 'partner',
     },
   });
 
@@ -222,6 +224,7 @@ export async function notifyRefundInitiated(params: {
       eventKey: 'REFUND_INITIATED',
       entityType: 'refund',
       category: 'payments',
+      recipientRole: 'customer',
     },
   });
 
@@ -268,6 +271,7 @@ export async function notifyPayoutInitiated(params: {
       eventKey: 'PAYOUT_INITIATED',
       entityType: 'payout',
       category: 'payments',
+      recipientRole: 'partner',
     },
   });
 
@@ -321,6 +325,7 @@ export async function notifyRefundProcessed(params: {
       eventKey: 'REFUND_PROCESSED',
       entityType: 'refund',
       category: 'payments',
+      recipientRole: 'customer',
     },
   });
 }
@@ -358,6 +363,7 @@ export async function notifyRefundStatusUpdated(params: {
       eventKey,
       entityType: 'refund',
       category: 'payments',
+      recipientRole: 'customer',
     },
   });
 }
@@ -386,6 +392,7 @@ export async function notifyPenaltyCreated(params: {
       eventKey: 'PAYOUT_PENALTY',
       entityType: 'payout',
       category: 'payments',
+      recipientRole: 'partner',
     },
   });
 }

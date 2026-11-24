@@ -15,6 +15,7 @@ import { createRefundAmountPaise, getPaymentDetails, resolvePaymentEnvironmentFo
 import { sanitizeRazorpayRefundData } from '../utils/paymentSanitizer';
 import {
   notifyRefundInitiated,
+  notifyRefundProcessed,
   notifyRefundStatusUpdated,
 } from './paymentNotificationService';
 import { getPaymentClient } from '../config/paymentEnvironment';
@@ -932,6 +933,7 @@ async function processRefundUnlocked(params: {
         category: 'payments',
       });
 
+      // Always notify that ExtraHand has initiated the refund
       notifyRefundInitiated({
         posterUid: posterContact?.uid || escrow.posterUid,
         amount: refundAmount.toString(),
@@ -948,6 +950,26 @@ async function processRefundUnlocked(params: {
           error: error instanceof Error ? error.message : String(error),
         });
       });
+
+      // If Razorpay marked the refund processed immediately, follow up with the bank processing notification
+      const isCompleted = getInternalRefundStatus(razorpayRefund.status) === 'completed';
+      if (isCompleted) {
+        setTimeout(() => {
+          notifyRefundProcessed({
+            posterUid: posterContact?.uid || escrow.posterUid,
+            amount: refundAmount.toString(),
+            taskId: escrow.taskId,
+            taskTitle,
+            reason,
+          }).catch((error) => {
+            logger.warn('[RefundService.processRefund] Failed to send refund processed notification', {
+              posterUid: escrow.posterUid,
+              taskId: escrow.taskId,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          });
+        }, 1500);
+      }
 
       return {
         success: true,
@@ -1855,6 +1877,7 @@ export async function processBookNowLineItemRefund(params: {
     const posterContact = await getProfileContact(postgresEscrow.posterUid);
     const resolvedPosterUid = posterContact?.uid || postgresEscrow.posterUid;
 
+    // Always notify that ExtraHand has initiated the refund
     void notifyRefundStatusUpdated({
       posterUid: resolvedPosterUid,
       refundId,
@@ -1862,14 +1885,18 @@ export async function processBookNowLineItemRefund(params: {
       taskId,
       status: 'initiated',
     });
+
+    // If Razorpay marked the refund processed immediately, follow up with the bank processing notification
     if (internalRefundStatus === 'completed') {
-      void notifyRefundStatusUpdated({
-        posterUid: resolvedPosterUid,
-        refundId,
-        amount: refundAmount.toString(),
-        taskId,
-        status: 'completed',
-      });
+      setTimeout(() => {
+        void notifyRefundStatusUpdated({
+          posterUid: resolvedPosterUid,
+          refundId,
+          amount: refundAmount.toString(),
+          taskId,
+          status: 'completed',
+        });
+      }, 1500);
     }
 
     return {

@@ -65,6 +65,7 @@ async function sendPush(payload: BasePayload): Promise<void> {
   if (!payload.userId || !payload.title || !payload.body) return;
 
   const targetUid = await resolveFirebaseUid(payload.userId);
+  const explicitRole = (payload.data?.recipientRole as string) || (payload.data?.role as string);
 
   try {
     await axios.post(
@@ -73,12 +74,15 @@ async function sendPush(payload: BasePayload): Promise<void> {
         recipients: [targetUid],
         eventKey: payload.eventKey,
         category: 'payments',
+        recipientRole: explicitRole,
+        role: explicitRole,
         title: payload.title,
         body: payload.body,
         data: {
           ...(payload.data || {}),
           eventKey: payload.eventKey,
           category: 'payments',
+          ...(explicitRole ? { recipientRole: explicitRole, role: explicitRole } : {}),
         },
         entity: {
           type: 'payment',
@@ -250,8 +254,8 @@ export async function notifyRefundInitiated(params: {
 
   await sendInAppAndPush({
     userId: posterUid,
-    title: 'Task cancelled',
-    body: `The task${taskTitle ? ` "${taskTitle}"` : ''} has been cancelled. Your amount will be refunded within 5-7 days.`,
+    title: 'Refund initiated',
+    body: `ExtraHand has initiated your refund of ₹${amount}. It will be credited within 5-7 business days.`,
     eventKey: 'REFUND_INITIATED',
     data: {
       taskId,
@@ -352,8 +356,8 @@ export async function notifyRefundProcessed(params: {
   });
   await sendInAppAndPush({
     userId: posterUid,
-    title: 'Refund processed',
-    body: `We processed your refund of ₹${amount}${taskTitle ? ` for ${taskTitle}` : ''}.`,
+    title: 'Bank processing refund',
+    body: `Your bank is processing your refund of ₹${amount}. It should reflect in your account shortly.`,
     eventKey: 'REFUND_PROCESSED',
     data: {
       taskId,
@@ -385,11 +389,15 @@ export async function notifyRefundStatusUpdated(params: {
 
   await sendInAppAndPush({
     userId: posterUid,
-    title: initiated ? 'Refund initiated' : processed ? 'Refund processed' : 'Refund update',
-    body: initiated
-      ? `Your refund of ₹${amount} has been initiated.`
+    title: initiated
+      ? 'Refund initiated'
       : processed
-        ? `Your refund of ₹${amount} has been processed.`
+        ? 'Bank processing refund'
+        : 'Refund failed',
+    body: initiated
+      ? `ExtraHand has initiated your refund of ₹${amount}. It will be credited within 5-7 business days.`
+      : processed
+        ? `Your bank is processing your refund of ₹${amount}. It should reflect in your account shortly.`
         : `We couldn't process your refund of ₹${amount}. Please contact support if you need help.`,
     eventKey,
     skipWhatsApp: true,

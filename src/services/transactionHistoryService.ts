@@ -681,6 +681,10 @@ function buildPosterRefundTransaction(
             platformFee: finalPlatformFee.toString(),
             gstAmount: finalGst.toString(),
             totalPaid: totalPaid.toString(),
+            ...(bookNowLineItemsSnapshot.length > 0
+              ? { bookNowLineItems: bookNowLineItemsSnapshot }
+              : {}),
+            ...(bookNowItemCount > 0 ? { itemCount: bookNowItemCount } : {}),
             ...(parseFloat(feeStr) > 0
               ? {
                   amountBreakdown: {

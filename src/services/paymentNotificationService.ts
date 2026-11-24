@@ -1,4 +1,5 @@
 import axios from 'axios';
+import mongoose from 'mongoose';
 import { InAppNotificationClient } from '../clients/InAppNotificationClient';
 import { EmailServiceClient } from '../clients/EmailServiceClient';
 import { fireWhatsAppNotify } from '../clients/WhatsAppClient';
@@ -30,14 +31,46 @@ function serviceAuthHeaders(): Record<string, string> {
   };
 }
 
+async function resolveFirebaseUid(userId: string): Promise<string> {
+  if (!userId) return userId;
+  if (!mongoose.isValidObjectId(userId)) {
+    return userId;
+  }
+  if (mongoose.connection.readyState !== 1) {
+    return userId;
+  }
+  try {
+    const Profile = mongoose.connection.collection('profiles');
+    const doc = await Profile.findOne(
+      { _id: new mongoose.Types.ObjectId(userId) },
+      { projection: { uid: 1 } },
+    );
+    if (doc?.uid) {
+      logger.info('[paymentNotificationService] Resolved Mongo ObjectId to Firebase UID', {
+        objectId: userId,
+        uid: doc.uid,
+      });
+      return String(doc.uid);
+    }
+  } catch (err: any) {
+    logger.warn('[paymentNotificationService] Failed to resolve Firebase UID from Mongo ID', {
+      userId,
+      err: err?.message,
+    });
+  }
+  return userId;
+}
+
 async function sendPush(payload: BasePayload): Promise<void> {
   if (!payload.userId || !payload.title || !payload.body) return;
+
+  const targetUid = await resolveFirebaseUid(payload.userId);
 
   try {
     await axios.post(
       `${notificationServiceBaseUrl()}/api/v1/notifications/send`,
       {
-        recipients: [payload.userId],
+        recipients: [targetUid],
         eventKey: payload.eventKey,
         category: 'payments',
         title: payload.title,
@@ -59,12 +92,12 @@ async function sendPush(payload: BasePayload): Promise<void> {
       },
     );
     logger.info('[paymentNotificationService] Push notification sent', {
-      userId: payload.userId,
+      userId: targetUid,
       eventKey: payload.eventKey,
     });
   } catch (error: any) {
     logger.warn('[paymentNotificationService] Push notification failed', {
-      userId: payload.userId,
+      userId: targetUid,
       eventKey: payload.eventKey,
       status: error?.response?.status,
       message: error?.message,
@@ -73,39 +106,43 @@ async function sendPush(payload: BasePayload): Promise<void> {
 }
 
 async function sendInAppAndPush(payload: BasePayload): Promise<void> {
+  const targetUid = await resolveFirebaseUid(payload.userId);
+  const normalizedPayload =
+    targetUid !== payload.userId ? { ...payload, userId: targetUid } : payload;
+
   logger.info('[paymentNotificationService] Sending in-app + push notification', {
-    userId: payload.userId,
-    title: payload.title,
-    eventKey: payload.eventKey,
-    hasTaskId: !!payload.data?.taskId,
+    userId: normalizedPayload.userId,
+    title: normalizedPayload.title,
+    eventKey: normalizedPayload.eventKey,
+    hasTaskId: !!normalizedPayload.data?.taskId,
   });
 
   const ok = await InAppNotificationClient.send({
-    userId: payload.userId,
-    title: payload.title,
-    body: payload.body,
+    userId: normalizedPayload.userId,
+    title: normalizedPayload.title,
+    body: normalizedPayload.body,
     category: 'payments',
     type: 'success',
     data: {
-      ...(payload.data || {}),
-      eventKey: payload.eventKey,
+      ...(normalizedPayload.data || {}),
+      eventKey: normalizedPayload.eventKey,
       category: 'payments',
     },
   });
 
   if (!ok) {
     logger.warn('[paymentNotificationService] In-app notification skipped/failed', {
-      userId: payload.userId,
-      title: payload.title,
+      userId: normalizedPayload.userId,
+      title: normalizedPayload.title,
     });
   } else {
     logger.info('[paymentNotificationService] In-app notification delivered', {
-      userId: payload.userId,
-      title: payload.title,
+      userId: normalizedPayload.userId,
+      title: normalizedPayload.title,
     });
   }
 
-  await sendPush(payload);
+  await sendPush(normalizedPayload);
 }
 
 export async function notifyPaymentReceived(params: {
@@ -346,7 +383,7 @@ export async function notifyRefundStatusUpdated(params: {
       ? 'REFUND_PROCESSED'
       : 'REFUND_FAILED';
 
-  await sendPush({
+  await sendInAppAndPush({
     userId: posterUid,
     title: initiated ? 'Refund initiated' : processed ? 'Refund processed' : 'Refund update',
     body: initiated

@@ -933,7 +933,7 @@ async function processRefundUnlocked(params: {
       });
 
       notifyRefundInitiated({
-        posterUid: escrow.posterUid,
+        posterUid: posterContact?.uid || escrow.posterUid,
         amount: refundAmount.toString(),
         taskId: escrow.taskId,
         taskTitle,
@@ -1852,8 +1852,11 @@ export async function processBookNowLineItemRefund(params: {
       userId,
     });
 
+    const posterContact = await getProfileContact(postgresEscrow.posterUid);
+    const resolvedPosterUid = posterContact?.uid || postgresEscrow.posterUid;
+
     void notifyRefundStatusUpdated({
-      posterUid: postgresEscrow.posterUid,
+      posterUid: resolvedPosterUid,
       refundId,
       amount: refundAmount.toString(),
       taskId,
@@ -1861,7 +1864,7 @@ export async function processBookNowLineItemRefund(params: {
     });
     if (internalRefundStatus === 'completed') {
       void notifyRefundStatusUpdated({
-        posterUid: postgresEscrow.posterUid,
+        posterUid: resolvedPosterUid,
         refundId,
         amount: refundAmount.toString(),
         taskId,
@@ -2028,8 +2031,9 @@ async function updateRefundRecordFromRazorpayWebhook(
     if (result.count > 0) {
       logger.info('Refund marked failed from Razorpay webhook', { razorpayRefundId });
       if (refund?.escrow?.posterUid) {
+        const posterContact = await getProfileContact(refund.escrow.posterUid);
         await notifyRefundStatusUpdated({
-          posterUid: refund.escrow.posterUid,
+          posterUid: posterContact?.uid || refund.escrow.posterUid,
           refundId: refund.refundId,
           amount: refund.refundAmount.toString(),
           taskId: refund.taskId,
@@ -2087,8 +2091,9 @@ async function updateRefundRecordFromRazorpayWebhook(
   if (result.count > 0) {
     logger.info('Refund marked completed from Razorpay webhook', { razorpayRefundId });
     if (refund?.escrow?.posterUid) {
+      const posterContact = await getProfileContact(refund.escrow.posterUid);
       await notifyRefundStatusUpdated({
-        posterUid: refund.escrow.posterUid,
+        posterUid: posterContact?.uid || refund.escrow.posterUid,
         refundId: refund.refundId,
         amount: refund.refundAmount.toString(),
         taskId: refund.taskId,

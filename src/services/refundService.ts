@@ -961,6 +961,7 @@ async function processRefundUnlocked(params: {
             taskId: escrow.taskId,
             taskTitle,
             reason,
+            processedAt: new Date(),
           }).catch((error) => {
             logger.warn('[RefundService.processRefund] Failed to send refund processed notification', {
               posterUid: escrow.posterUid,
@@ -1895,6 +1896,7 @@ export async function processBookNowLineItemRefund(params: {
           amount: refundAmount.toString(),
           taskId,
           status: 'completed',
+          processedAt: providerProcessedAt || new Date(),
         });
       }, 1500);
     }
@@ -2125,6 +2127,7 @@ async function updateRefundRecordFromRazorpayWebhook(
         amount: refund.refundAmount.toString(),
         taskId: refund.taskId,
         status: 'completed',
+        processedAt: providerStatusUpdatedAt,
       });
     }
     return;

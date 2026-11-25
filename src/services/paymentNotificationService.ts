@@ -339,14 +339,26 @@ export async function notifyPayoutInitiated(params: {
   });
 }
 
+function formatExpectedRefundDate(baseDate?: Date | string | null): string {
+  const d = baseDate ? new Date(baseDate) : new Date();
+  const validDate = isNaN(d.getTime()) ? new Date() : d;
+  validDate.setDate(validDate.getDate() + 6);
+  return validDate.toLocaleDateString('en-IN', {
+    day: 'numeric',
+    month: 'short',
+    timeZone: 'Asia/Kolkata',
+  });
+}
+
 export async function notifyRefundProcessed(params: {
   posterUid: string;
   amount: string | number;
   taskTitle?: string | null;
   taskId?: string | null;
   reason?: string | null;
+  processedAt?: Date | string | null;
 }): Promise<void> {
-  const { posterUid, amount, taskTitle, taskId, reason } = params;
+  const { posterUid, amount, taskTitle, taskId, reason, processedAt } = params;
   logger.info('[paymentNotificationService] notifyRefundProcessed', {
     posterUid,
     amount,
@@ -354,15 +366,17 @@ export async function notifyRefundProcessed(params: {
     hasTaskTitle: !!taskTitle,
     hasReason: !!reason,
   });
+  const expectedDate = formatExpectedRefundDate(processedAt);
   await sendInAppAndPush({
     userId: posterUid,
     title: 'Bank processing refund',
-    body: `Your bank is processing your refund of ₹${amount}. It should reflect in your account shortly.`,
+    body: `Your bank is processing your refund of ₹${amount}. Expected by ${expectedDate}.`,
     eventKey: 'REFUND_PROCESSED',
     data: {
       taskId,
       amount,
       reason,
+      expectedDate,
       eventKey: 'REFUND_PROCESSED',
       entityType: 'refund',
       category: 'payments',
@@ -377,8 +391,9 @@ export async function notifyRefundStatusUpdated(params: {
   amount: string | number;
   taskId?: string | null;
   status: 'initiated' | 'completed' | 'failed';
+  processedAt?: Date | string | null;
 }): Promise<void> {
-  const { posterUid, refundId, amount, taskId, status } = params;
+  const { posterUid, refundId, amount, taskId, status, processedAt } = params;
   const processed = status === 'completed';
   const initiated = status === 'initiated';
   const eventKey = initiated
@@ -386,6 +401,8 @@ export async function notifyRefundStatusUpdated(params: {
     : processed
       ? 'REFUND_PROCESSED'
       : 'REFUND_FAILED';
+
+  const expectedDate = processed ? formatExpectedRefundDate(processedAt) : undefined;
 
   await sendInAppAndPush({
     userId: posterUid,
@@ -397,7 +414,7 @@ export async function notifyRefundStatusUpdated(params: {
     body: initiated
       ? `ExtraHand has initiated your refund of ₹${amount}. It will be credited within 5-7 business days.`
       : processed
-        ? `Your bank is processing your refund of ₹${amount}. It should reflect in your account shortly.`
+        ? `Your bank is processing your refund of ₹${amount}. Expected by ${expectedDate}.`
         : `We couldn't process your refund of ₹${amount}. Please contact support if you need help.`,
     eventKey,
     skipWhatsApp: true,
@@ -405,6 +422,7 @@ export async function notifyRefundStatusUpdated(params: {
       taskId,
       refundId,
       status,
+      ...(expectedDate ? { expectedDate } : {}),
       eventKey,
       entityType: 'refund',
       category: 'payments',
